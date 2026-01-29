@@ -176,6 +176,7 @@ class TestDataParallelVsContextParallel:
             bf16=transformer_config.bf16,
             context_parallel_size=2,
             no_rope_freq=transformer_config.no_rope_freq,
+            cp_comm_type="a2a",
         )
 
         cp_block = (
