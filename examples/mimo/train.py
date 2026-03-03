@@ -4,10 +4,17 @@
 This script provides a basic training loop for MIMO models.
 """
 
+import logging
 import os
 import sys
 from functools import partial
 from typing import Any, Dict, Iterator
+
+# Enable debug logging for MIMO modules when MIMO_DEBUG is set.
+if os.environ.get("MIMO_DEBUG"):
+    logging.basicConfig(level=logging.DEBUG, format="%(name)s:%(levelname)s: %(message)s")
+    for _mod in ("megatron.core.models.mimo",):
+        logging.getLogger(_mod).setLevel(logging.DEBUG)
 
 import torch
 
@@ -22,6 +29,12 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
+try:
+    from data.energon_multimodal_provider import (
+        train_valid_test_dataloaders_provider as energon_multimodal_dataloader_provider,
+    )
+except ImportError:
+    energon_multimodal_dataloader_provider = None
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
 from data.mock import (
     train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
@@ -29,6 +42,10 @@ from data.mock import (
 from model_providers.llava_avlm import model_provider_llava_avlm
 from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
+from model_providers.nemotron_moe_vlm import (
+    add_nemotron_moe_vlm_args,
+    model_provider_nemotron_moe_vlm,
+)
 from utils.data_helpers import broadcast_nested_data_batch
 
 from megatron.core.enums import ModelType
@@ -39,6 +56,7 @@ _MODEL_PROVIDERS = {
     "llava_vlm": model_provider_llava_vlm,
     "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
     "llava_avlm": model_provider_llava_avlm,
+    "nemotron_moe_vlm": model_provider_nemotron_moe_vlm,
 }
 
 _DATASET_PROVIDERS = {
@@ -47,6 +65,16 @@ _DATASET_PROVIDERS = {
     "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
     "llava_avlm": llava_avlm_dataloader_provider,
 }
+if energon_multimodal_dataloader_provider is not None:
+    _DATASET_PROVIDERS["energon_multimodal"] = energon_multimodal_dataloader_provider
+
+# Model-provider-specific extra args.  Each provider can optionally export an
+# ``add_<name>_args(parser)`` function that registers CLI flags specific to
+# that provider.  All registered functions are called unconditionally at parse
+# time (argparse ignores unused flags).
+_MODEL_PROVIDER_EXTRA_ARGS = {
+    "nemotron_moe_vlm": add_nemotron_moe_vlm_args,
+}
 
 def add_mimo_args(parser):
     """Add MIMO-specific arguments to the parser."""
@@ -54,7 +82,7 @@ def add_mimo_args(parser):
 
     # MIMO-specific parameters
     group.add_argument('--dataset-provider', type=str, default='mock', help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
-    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
+    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm, nemotron_moe_vlm]')
 
     # mock dataloader related args
     # can control mock samples with total seq length and image seq length
@@ -75,8 +103,14 @@ def add_mimo_args(parser):
     )
     # checkpoint related args
     group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
+    group.add_argument('--vision-encoder-checkpoint', type=str, default=None, help='Path to vision encoder checkpoint to load')
     # energon dataloader related args
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
+
+    # Register model-provider-specific args
+    for add_args_fn in _MODEL_PROVIDER_EXTRA_ARGS.values():
+        add_args_fn(parser)
+
     return parser
 
 
@@ -199,6 +233,7 @@ def model_provider(
     add_decoder: bool = True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
+    **extra_kwargs,
 ):
     """Model provider for MIMO model training.
 
@@ -220,7 +255,13 @@ def model_provider(
             f"Available providers: {list(_MODEL_PROVIDERS.keys())}"
         ) from e
 
-    if runtime_args.model_provider == "llava_vlm":
+    # Build provider-specific kwargs.
+    # nemotron_moe_vlm reads --image-token-id from args directly (no wrapper).
+    if runtime_args.model_provider == "mock":
+        kwargs = {
+            "special_token_id": image_special_token_id,
+        }
+    elif runtime_args.model_provider in ("llava_vlm", "video_llava_vlm"):
         kwargs = {
             "image_special_token_id": image_special_token_id,
         }
@@ -229,8 +270,13 @@ def model_provider(
             "image_special_token_id": image_special_token_id,
             "audio_special_token_id": audio_special_token_id,
         }
+    elif runtime_args.model_provider == "nemotron_moe_vlm":
+        kwargs = {}
     else:
-        raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
+        raise ValueError(
+            f"Unknown model provider: {runtime_args.model_provider}. "
+            f"Must be one of {list(_MODEL_PROVIDERS.keys())}"
+        )
 
     return builder_fn(
         pre_process,
