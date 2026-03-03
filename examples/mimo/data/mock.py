@@ -12,17 +12,20 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-def create_mock_image(image_size: int = 336) -> torch.Tensor:
+def create_mock_image(img_h: int = 336, img_w: int = None) -> torch.Tensor:
     """
     Create a simple mock image (all zeros).
 
     Args:
-        image_size: Size of the square image
+        img_h: Image height
+        img_w: Image width (defaults to img_h for square images)
 
     Returns:
         Tensor of shape [3, H, W] with all zeros
     """
-    return torch.zeros(3, image_size, image_size)
+    if img_w is None:
+        img_w = img_h
+    return torch.zeros(3, img_h, img_w)
 
 
 def create_mock_caption() -> str:
@@ -48,26 +51,38 @@ class MockVLMDataset(Dataset):
         tokenizer: Optional[Callable] = None,
         pad_token_id: int = 0,
         image_token_id: int = 32000,
+        img_h: int = None,
+        img_w: int = None,
+        encoder_name: str = "clip_encoder",
+        encoder_input_key: str = "x",
     ):
         """
         Initialize the mock VLM dataset.
 
         Args:
             size: Number of examples in the dataset
-            image_size: Size of the square images
+            image_size: Size of the square images (used when img_h/img_w not set)
             seq_len: Total length of the token sequence (image + text)
             image_seq_length: Number of image tokens to pad
             vocab_size: Size of the vocabulary for tokenization
             tokenizer: Optional tokenizer function
             pad_token_id: ID for padding token
             image_token_id: ID for image placeholder token
+            img_h: Image height (overrides image_size)
+            img_w: Image width (overrides image_size)
+            encoder_name: Name of the encoder (must match model spec key)
+            encoder_input_key: Kwarg name for the encoder forward() call
         """
         self.size = size
-        self.image_size = image_size
+        self.img_h = img_h if img_h is not None else image_size
+        self.img_w = img_w if img_w is not None else image_size
+        self.image_size = image_size  # kept for backward compat
         self.seq_len = seq_len
         self.image_seq_length = image_seq_length
         self.vocab_size = vocab_size
         self.tokenizer = tokenizer
+        self.encoder_name = encoder_name
+        self.encoder_input_key = encoder_input_key
 
         # Special token IDs
         self.pad_token_id = pad_token_id
@@ -98,7 +113,7 @@ class MockVLMDataset(Dataset):
             - position_ids: Position IDs for the tokens
         """
         # Create a zero image
-        image = create_mock_image(self.image_size)
+        image = create_mock_image(self.img_h, self.img_w)
 
         # Generate random token sequence for this sample.
         input_ids = self._mock_tokenize()
@@ -125,8 +140,10 @@ class MockVLMDataset(Dataset):
             "loss_mask": loss_mask,
             "position_ids": position_ids,
             "modality_inputs": {
-                "clip_encoder": {
-                    "images": image,
+                "images": {
+                    self.encoder_name: {
+                        self.encoder_input_key: image,
+                    }
                 }
             },
         }
@@ -218,23 +235,58 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     Returns:
         Dictionary of batched tensors
     """
-    images = torch.stack([item["images"] for item in batch])
     input_ids = torch.stack([item["input_ids"] for item in batch])
     labels = torch.stack([item["labels"] for item in batch])
     loss_mask = torch.stack([item["loss_mask"] for item in batch])
     position_ids = torch.stack([item["position_ids"] for item in batch])
+
+    # Reconstruct modality_inputs by stacking images from nested structure.
+    # Each item has modality_inputs["images"][encoder_name][input_key] = [C,H,W]
+    first_modality = batch[0]["modality_inputs"]
+    modality_inputs = {}
+    for modality_name, encoder_dict in first_modality.items():
+        modality_inputs[modality_name] = {}
+        for encoder_name, input_dict in encoder_dict.items():
+            modality_inputs[modality_name][encoder_name] = {}
+            for input_key in input_dict:
+                stacked = torch.stack(
+                    [item["modality_inputs"][modality_name][encoder_name][input_key]
+                     for item in batch]
+                )
+                modality_inputs[modality_name][encoder_name][input_key] = stacked
 
     return {
         "input_ids": input_ids,
         "labels": labels,
         "loss_mask": loss_mask,
         "position_ids": position_ids,
-        "modality_inputs": {
-            "clip_encoder": {
-                "images": images,
-            }
-        },
+        "modality_inputs": modality_inputs,
     }
+
+
+def _get_mock_dataset_kwargs(args):
+    """Build kwargs for MockVLMDataset from runtime args."""
+    kwargs = {
+        "image_size": args.image_size,
+        "seq_len": args.total_seq_length,
+        "image_seq_length": args.image_seq_length,
+        "pad_token_id": args.pad_token_id,
+        "image_token_id": args.image_token_id,
+    }
+    # Use img_h/img_w when available (RADIO / nemotron_moe_vlm)
+    img_h = getattr(args, "img_h", None)
+    img_w = getattr(args, "img_w", None)
+    if img_h is not None:
+        kwargs["img_h"] = img_h
+    if img_w is not None:
+        kwargs["img_w"] = img_w
+
+    # Set encoder name and input key based on model provider
+    model_provider = getattr(args, "model_provider", "mock")
+    if model_provider == "nemotron_moe_vlm":
+        kwargs["encoder_name"] = "radio_encoder"
+        kwargs["encoder_input_key"] = "x"
+    return kwargs
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -255,23 +307,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
         from examples.mimo.data.mock import MockVLMDataset
 
+        dataset_kwargs = _get_mock_dataset_kwargs(args)
+
         train_dataset = MockVLMDataset(
             size=train_val_test_num_samples[0],
-            image_size=args.image_size,
-            seq_len=args.total_seq_length,
-            image_seq_length=args.image_seq_length,
-            pad_token_id=args.pad_token_id,
-            image_token_id=args.image_token_id,
+            **dataset_kwargs,
         )
 
         # Use the same dataset type for validation
         valid_dataset = MockVLMDataset(
             size=train_val_test_num_samples[1] if train_val_test_num_samples[1] > 0 else 100,
-            image_size=args.image_size,
-            seq_len=args.total_seq_length,
-            image_seq_length=args.image_seq_length,
-            pad_token_id=args.pad_token_id,
-            image_token_id=args.image_token_id,
+            **dataset_kwargs,
         )
 
         # No test dataset for now
