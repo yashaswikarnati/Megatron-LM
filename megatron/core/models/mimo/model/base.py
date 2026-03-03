@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from megatron.core import tensor_parallel
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
@@ -276,6 +277,15 @@ class MimoModel(MegatronModule):
             special_token_ids=self.special_token_ids,
         )  # [s, b, h]
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
+
+        # The language model embedding was created with
+        # scatter_embedding_sequence_parallel=False so that we can combine
+        # modality embeddings at full sequence length first, then scatter here.
+        if self.config.sequence_parallel:
+            combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                combined_embeddings
+            )
+            logger.debug(f"Scattered embeddings to SP region: {combined_embeddings.shape}")
 
         # 3. Forward pass through language model
         lm_output = self.language_model(
