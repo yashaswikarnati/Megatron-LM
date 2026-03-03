@@ -1,0 +1,349 @@
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2013-20
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2013-48
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2014-10
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2014-15
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2014-23
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2014-35
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2014-41
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2014-42
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2014-49
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2014-52
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-06
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-11
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-14
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-18
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-22
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-27
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-32
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-35
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-40
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2015-48
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-07
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-18
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-22
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-26
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-30
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-36
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-40
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-44
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2016-50
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-04
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-09
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-13
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-17
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-22
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-26
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-30
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-34
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-39
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-43
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-47
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2017-51
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-05
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-09
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-13
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-17
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-26
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-30
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-34
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-39
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-43
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-47
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2018-51
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-04
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-09
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-13
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-18
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-22
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-26
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-30
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-35
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-39
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-43
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-47
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2019-51
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-05
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-10
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-16
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-24
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-29
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-34
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-40
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-45
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2020-50
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-04
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-10
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-17
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-21
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-25
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-31
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-39
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-43
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2021-49
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2022-05
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2022-21
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2022-27
+        subflavors:
+          cook: omnicorpus
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2022-33
+        subflavors:
+          cook: omnicorpus

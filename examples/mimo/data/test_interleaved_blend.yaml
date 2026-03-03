@@ -1,0 +1,25 @@
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - weight: 0.25
+        path: /lustre/fsw/portfolios/adlr/projects/adlr_nlp_llmnext/users/sasatheesh/data/interleaved_bench/subset/arxiv
+        subset: {range: [0%, 10%]}
+        subflavors:
+          cook: interleaved
+      - weight: 0.25
+        path: /lustre/fsw/portfolios/adlr/projects/adlr_nlp_llmnext/users/sasatheesh/data/interleaved_bench/subset/mint1t_pdf
+        subset: {range: [0%, 10%]}
+        subflavors:
+          cook: interleaved
+      - weight: 0.25
+        path: /lustre/fsw/portfolios/adlr/projects/adlr_nlp_llmnext/users/sasatheesh/data/interleaved_bench/subset/vjawa_nvmint
+        subset: {range: [0%, 10%]}
+        subflavors:
+          cook: nvmint_segments
+      - weight: 0.25
+        path: /lustre/fsw/portfolios/adlr/projects/adlr_nlp_llmnext/users/sasatheesh/data/interleaved_bench/subset/nvmint_5M
+        subset: {range: [0%, 10%]}
+        subflavors:
+          cook: nvmint_imgcaption
