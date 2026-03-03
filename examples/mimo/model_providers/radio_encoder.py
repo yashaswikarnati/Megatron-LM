@@ -9,40 +9,10 @@ with optional class-token dropping and pixel-shuffle post-processing.
 import torch
 import torch.nn as nn
 
+from megatron.core.models.multimodal.llava_model import pixel_shuffle
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-
-
-# ---------------------------------------------------------------------------
-# Pixel shuffle (adapted from InternVL via megatron/core/models/multimodal/llava_model.py)
-# ---------------------------------------------------------------------------
-def pixel_shuffle(x, scale_factor=0.5, version=2):
-    """Pixel shuffle that reduces spatial tokens and increases hidden dim.
-
-    Args:
-        x (torch.Tensor): [num_tiles, img_seq_len, h_vision]
-        scale_factor (float): Spatial scaling factor (0.5 → 4x token reduction).
-        version (int): Layout variant.
-
-    Returns:
-        Tensor of shape [num_tiles, reduced_seq, h_vision * 4]
-    """
-    h = w = int(x.shape[1] ** 0.5)
-    x = x.reshape(x.shape[0], h, w, -1)
-
-    n, w, h, c = x.size()
-    x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
-    x = x.permute(0, 2, 1, 3).contiguous()
-    x = x.view(
-        n, int(h * scale_factor), int(w * scale_factor), int(c / (scale_factor * scale_factor))
-    )
-
-    if version == 2:
-        x = x.permute(0, 2, 1, 3).contiguous()
-
-    x = x.reshape(x.shape[0], -1, x.shape[-1])
-    return x
 
 
 class RADIOEncoderWrapper(nn.Module):
