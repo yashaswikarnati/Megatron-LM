@@ -21,7 +21,7 @@ from configs.nemotron_moe_vlm import (
 
 from examples.mimo.model_providers.radio_encoder import RADIOEncoderWrapper
 from examples.mimo.utils.logging import print_mimo_structure
-from examples.mimo.utils.model_helpers import load_submodule_ckpt
+from examples.mimo.utils.model_helpers import load_nemotron_vlm_ckpt, load_submodule_ckpt
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -52,10 +52,25 @@ def add_nemotron_moe_vlm_args(parser):
                        help='Freeze language model parameters')
     group.add_argument('--freeze-vit', action='store_true', default=False,
                        help='Freeze vision encoder parameters')
+    group.add_argument('--freeze-projection', action='store_true', default=False,
+                       help='Freeze vision-to-language projection MLP parameters')
     group.add_argument('--vision-model-type', type=str, default='radio',
                        help='Vision model type (e.g. radio)')
     group.add_argument('--class-token-len', type=int, default=None,
                        help='Number of class tokens in vision encoder')
+    group.add_argument('--nemotron-checkpoint', type=str, default=None,
+                       help='Path to a non-MIMO Nemotron VLM checkpoint directory. '
+                            'Loads vision_model/vision_projection/language_model with key remapping.')
+
+    # MultimodalTokenizer args (required by megatron/training/tokenizer/tokenizer.py)
+    group.add_argument('--special-tokens', nargs='*', default=['<image>'],
+                       help='Special tokens for the multimodal tokenizer')
+    group.add_argument('--tokenizer-prompt-format', type=str, default='nemotron6-moe',
+                       help='Prompt format for MultimodalTokenizer')
+    group.add_argument('--image-tag-type', type=str, default='',
+                       help='Image tag type (e.g. nvlm, internvl, or empty)')
+    group.add_argument('--force-system-message', action='store_true', default=False,
+                       help='Force a specific system message in the tokenizer')
     return parser
 
 
@@ -81,19 +96,20 @@ def model_provider_nemotron_moe_vlm(
     data provider) to keep both sides in sync.
     """
     from megatron.training import get_args
+    from megatron.training.global_vars import get_tokenizer
 
     args = get_args()
 
-    # Read image_token_id directly from CLI args — single source of truth
-    # shared with the data provider (energon_multimodal_provider).
-    image_special_token_id = args.image_token_id
+    # Derive image_token_id from the tokenizer (matches remote reference).
+    tokenizer = get_tokenizer()
+    image_special_token_id = tokenizer.convert_tokens_to_ids("<image>")
 
     # ── Configs ──────────────────────────────────────────────────────────
     # Language config: Nemotron defaults + CLI overrides (parallelism,
     # precision, and any explicitly-set arch fields) — all handled inside.
     language_config = get_nemotron_moe_language_model_config(args)
 
-    # Vision / projection: fixed architectures, only sync precision.
+    # Vision / projection: fixed architectures, sync precision and parallelism.
     vision_config = get_radio_vision_config()
     projection_config = get_vlm_projection_config(
         hidden_size=language_config.hidden_size,
@@ -104,6 +120,10 @@ def model_provider_nemotron_moe_vlm(
         cfg.fp16 = language_config.fp16
         cfg.use_cpu_initialization = language_config.use_cpu_initialization
         cfg.perform_initialization = language_config.perform_initialization
+        # TP group is global — vision/projection layers already use the global
+        # TP=2 process group at init time.  Sync the config so that
+        # sharded_state_dict() computes matching global shapes.
+        cfg.tensor_model_parallel_size = language_config.tensor_model_parallel_size
 
     # ── Vision encoder (RADIO) ───────────────────────────────────────────
     # Image args from CLI
@@ -185,6 +205,16 @@ def model_provider_nemotron_moe_vlm(
     print("*" * 100)
 
     # ── Load pre-trained checkpoints ──────────────────────────────────────
+    if getattr(args, "nemotron_checkpoint", None) is not None:
+        if getattr(args, "load", None) is not None:
+            raise ValueError(
+                "--nemotron-checkpoint and --load cannot both be set. "
+                "Use --nemotron-checkpoint for initial loading of a non-MIMO checkpoint, "
+                "or --load for resuming from a MIMO-native checkpoint."
+            )
+        load_nemotron_vlm_ckpt(mimo_model, args.nemotron_checkpoint)
+        print(f"Successfully loaded nemotron checkpoint from {args.nemotron_checkpoint}")
+
     if getattr(args, "language_model_checkpoint", None) is not None:
         load_submodule_ckpt(mimo_model.language_model, args.language_model_checkpoint)
         print(f"Successfully loaded language model from {args.language_model_checkpoint}")
@@ -206,4 +236,36 @@ def model_provider_nemotron_moe_vlm(
         for p in mimo_model.language_model.parameters():
             p.requires_grad = False
 
+    if getattr(args, "freeze_projection", False):
+        for proj in mimo_model.modality_submodules.images.input_projections:
+            for p in proj.parameters():
+                p.requires_grad = False
+
+    # Log trainable vs frozen parameter counts.
+    _log_freeze_summary(mimo_model)
+
     return mimo_model
+
+
+def _log_freeze_summary(model: MimoModel):
+    """Print trainable/frozen parameter counts per component."""
+    components = {
+        "vision_encoder": model.modality_submodules.images.encoders.radio_encoder,
+        "projection": model.modality_submodules.images.input_projections,
+        "language_model": model.language_model,
+    }
+    total_trainable = 0
+    total_frozen = 0
+    print("=" * 60)
+    print("Freeze summary:")
+    for name, module in components.items():
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in module.parameters() if not p.requires_grad)
+        total_trainable += trainable
+        total_frozen += frozen
+        status = "FROZEN" if trainable == 0 else ("TRAINABLE" if frozen == 0 else "PARTIAL")
+        print(f"  {name:20s}: {status:10s} "
+              f"(trainable={trainable:>12,}, frozen={frozen:>12,})")
+    print(f"  {'TOTAL':20s}:            "
+          f"(trainable={total_trainable:>12,}, frozen={total_frozen:>12,})")
+    print("=" * 60)

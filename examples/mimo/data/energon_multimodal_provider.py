@@ -13,6 +13,7 @@ Usage from train.py::
 
 import os
 import sys
+import warnings
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -32,13 +33,20 @@ from megatron.energon.task_encoder.multimodal.vision_tokens import (
 # Tokenizer adapter: Megatron tokenizer → energon TokenizerProtocol
 # ---------------------------------------------------------------------------
 class _TokenizerAdapter:
-    """Wraps a Megatron tokenizer to satisfy energon's ``TokenizerProtocol``."""
+    """Wraps a Megatron tokenizer to satisfy energon's ``TokenizerProtocol``.
+
+    Handles both HuggingFaceTokenizer (single wrapper) and MultimodalTokenizer
+    (double wrapper) by walking the ``_tokenizer`` / ``tokenizer`` chain.
+    """
 
     def __init__(self, megatron_tokenizer):
         self._tok = megatron_tokenizer
-        # Use the HF PreTrainedTokenizerFast wrapper (not the raw Rust tokenizer)
-        # so that encode() returns list[int], not tokenizers.Encoding.
-        self._hf = megatron_tokenizer._tokenizer
+        # Walk the wrapper chain to reach the HF PreTrainedTokenizerFast.
+        # MultimodalTokenizer._tokenizer → HF AutoTokenizer (PreTrainedTokenizerFast)
+        # HuggingFaceTokenizer._tokenizer → HF AutoTokenizer (PreTrainedTokenizerFast)
+        # IMPORTANT: Do NOT drill into PreTrainedTokenizerFast.tokenizer — that's
+        # the raw Rust tokenizer whose encode() returns tokenizers.Encoding, not list[int].
+        self._hf = getattr(megatron_tokenizer, '_tokenizer', megatron_tokenizer)
 
     @property
     def pad_token_id(self) -> int:
@@ -53,6 +61,9 @@ class _TokenizerAdapter:
 
     def decode(self, token_ids, skip_special_tokens: bool = False) -> str:
         return self._hf.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+    def convert_tokens_to_ids(self, tokens):
+        return self._tok.convert_tokens_to_ids(tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +111,10 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
         Energon's token stream has 1 placeholder per image.
         MIMO needs ``num_tiles * embeddings_per_tile`` placeholders per image.
 
-        Raises RuntimeError if a sample's expanded length exceeds
-        ``target_seq_length`` — increase ``--total-seq-length`` or reduce
-        ``--max-num-tiles`` to fix.
+        When ``target_seq_length`` is set, samples whose expanded length would
+        exceed the limit are **right-truncated** at image boundaries: each image
+        is kept whole (all tiles) or dropped entirely to maintain 1:1 alignment
+        with ``masked_scatter_``.
 
         Returns dict with keys: input_ids, labels, loss_mask, position_ids,
         modality_inputs.
@@ -121,35 +133,52 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
             labels = sample.labels
             num_tiles = sample.num_tiles  # e.g. [5, 3, 1] for 3 images
 
-            all_images.extend(sample.images)
+            budget = self._target_seq_length  # None means unlimited
 
-            # Expand each single image placeholder → N copies
+            # Expand each single image placeholder → N copies, respecting budget.
             new_tokens = []
             new_labels = []
             img_idx = 0
+            truncated = False
+            # sample.images is a flat list of tiles across all images.
+            # Track how many tiles are kept so we can slice it correctly.
+            kept_tile_count = 0
+
             for i, tok in enumerate(tokens.tolist()):
                 if tok == image_token_id:
                     n_tiles = num_tiles[img_idx] if img_idx < len(num_tiles) else 1
                     n_tokens = n_tiles * emb_per_tile
+                    if budget is not None and len(new_tokens) + n_tokens > budget:
+                        # This image doesn't fit — stop here.
+                        truncated = True
+                        break
                     new_tokens.extend([image_token_id] * n_tokens)
                     new_labels.extend([ignore_index] * n_tokens)
+                    kept_tile_count += n_tiles
                     img_idx += 1
                 else:
+                    if budget is not None and len(new_tokens) + 1 > budget:
+                        truncated = True
+                        break
                     new_tokens.append(tok)
                     new_labels.append(labels[i].item())
 
-            expanded_len = len(new_tokens)
-            if self._target_seq_length is not None and expanded_len > self._target_seq_length:
-                raise RuntimeError(
-                    f"Sample expanded length ({expanded_len}) exceeds "
-                    f"total_seq_length ({self._target_seq_length}). "
-                    f"Original tokens: {tokens.shape[0]}, "
-                    f"num_images: {len(num_tiles)}, "
-                    f"num_tiles: {num_tiles}, "
-                    f"image_tokens: {sum(n * emb_per_tile for n in num_tiles)}, "
-                    f"text_tokens: {expanded_len - sum(n * emb_per_tile for n in num_tiles)}. "
-                    f"Increase --total-seq-length or reduce --max-num-tiles."
+            if truncated:
+                orig_len = len(tokens)
+                total_images = len(num_tiles)
+                kept_images = img_idx
+                warnings.warn(
+                    f"Sample truncated to fit target_seq_length "
+                    f"({self._target_seq_length}): kept {len(new_tokens)} of "
+                    f"~{orig_len} original tokens, {kept_images}/{total_images} "
+                    f"images ({kept_tile_count} tiles). "
+                    f"Consider increasing --total-seq-length or reducing "
+                    f"--max-num-tiles.",
+                    stacklevel=2,
                 )
+
+            # Collect only the tiles for images that survived truncation.
+            all_images.extend(sample.images[:kept_tile_count])
 
             expanded_tokens_list.append(torch.tensor(new_tokens, dtype=torch.long))
             expanded_labels_list.append(torch.tensor(new_labels, dtype=torch.long))
@@ -237,25 +266,33 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
     tokenizer = get_tokenizer()
     tok_adapter = _TokenizerAdapter(tokenizer)
 
-    image_token_id = args.image_token_id
+    # Derive image_token_id and pad_id from the tokenizer (matches remote reference).
+    image_token_id = tokenizer.convert_tokens_to_ids("<image>")
+    pad_id = tokenizer.pad
 
     vision_config = VisionConfig(
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
-        vision_model_type="radio",
+        vision_model_type=getattr(args, "vision_model_type", "radio"),
         disable_vision_class_token=getattr(args, "disable_vision_class_token", False),
         pixel_shuffle=getattr(args, "pixel_shuffle", False),
         max_num_tiles=getattr(args, "max_num_tiles", 1),
         use_tiling=getattr(args, "use_tiling", False),
         use_thumbnail=getattr(args, "use_thumbnail", False),
+        class_token_len=getattr(args, "class_token_len", None) or 1,
+        conv_merging=getattr(args, "conv_merging", False),
+        use_tile_tags=getattr(args, "use_tile_tags", False),
+        use_image_break_token=getattr(args, "image_break_token", None) is not None,
+        use_area_weighted_aspect_ratio=getattr(args, "use_area_weighted_aspect_ratio", False),
+        dynamic_resolution=getattr(args, "dynamic_resolution", False),
     )
 
     target_seq_length = args.total_seq_length
 
     packing_config = PackingConfig(
         seq_length=target_seq_length,
-        pad_id=args.pad_token_id,
+        pad_id=pad_id,
         image_token_id=image_token_id,
     )
 
@@ -276,8 +313,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
     )
 
     dname = args.data_path[0] if isinstance(args.data_path, list) else args.data_path
-    # packing_buffer_size=None disables packing (individual sequences).
-    # Set --packing-buffer-size >0 in the script to enable packing.
+    # Packing disabled — MIMO model does not support packing yet.
     packing_buffer_size = getattr(args, "packing_buffer_size", None)
 
     train_ds = get_train_dataset(
@@ -309,7 +345,7 @@ def _test_standalone(blend_yaml: str, batch_size: int = 2, num_batches: int = 3)
 
     tokenizer_model = os.environ.get(
         "TOKENIZER_MODEL",
-        "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+        "/home/sasatheesh/data/huggingface/hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16-multimodal-pretraining/snapshots/7344a79074e20d9ab548e14c25b0492345394f67",
     )
     print(f"Loading tokenizer: {tokenizer_model}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)

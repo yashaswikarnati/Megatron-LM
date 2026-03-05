@@ -91,10 +91,15 @@ class MultimodalTokenizer(MegatronLegacyTokenizer):
         """
         self._vocab_size = len(tokenizer)
 
-        num_added_tokens = tokenizer.add_tokens(special_tokens, special_tokens=True)
-        assert num_added_tokens == len(
-            special_tokens
-        ), f"failed to add {len(special_tokens)} special tokens; only added {num_added_tokens}"
+        # Add special tokens that aren't already in the vocabulary.
+        # Some tokenizers (e.g. nemotron6-moe) ship with <image> pre-defined,
+        # so add_tokens returns 0 — that's fine as long as each token resolves.
+        tokenizer.add_tokens(special_tokens, special_tokens=True)
+        for tok in special_tokens:
+            tok_id = tokenizer.convert_tokens_to_ids(tok)
+            assert tok_id is not None and tok_id != tokenizer.unk_token_id, (
+                f"special token {tok!r} could not be resolved (got id={tok_id})"
+            )
 
         self._tokenizer = tokenizer
 
@@ -181,6 +186,14 @@ class MultimodalTokenizer(MegatronLegacyTokenizer):
                 pad_token_id=tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>"),
                 custom_chat_template=llama3p1_chat_template,
                 has_bos=True,
+                has_system_role=True,
+            )
+        elif prompt_format == "nemotron6-moe":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=None,  # Not used for pre-training.
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=None,
+                has_bos=False,
                 has_system_role=True,
             )
         else:

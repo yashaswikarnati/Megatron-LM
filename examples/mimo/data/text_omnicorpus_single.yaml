@@ -1,0 +1,9 @@
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      - weight: 1.0
+        path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/multimodal/datasets/OmniCorpus-CC-210M/webdataset/CC-MAIN-2013-20
+        subflavors:
+          cook: omnicorpus

@@ -1,0 +1,20 @@
+# 50/50 blend of text-only (Nemotron-6 pretraining data) and
+# OmniCorpus multimodal (interleaved image+text).
+#
+# Energon handles both data types through the same MultiModalPackingEncoder:
+# - text_only_blend.yaml: bin_idx shards → text-only samples (no images)
+# - omnicorpus_blend.yaml: omnicorpus shards → interleaved image+text samples
+#
+# Adjust weights to change the text/multimodal ratio.
+# Usage: DATA_PATH=examples/mimo/data/text_omnicorpus_blend.yaml
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+      # Text-only (Nemotron-6 pretraining data, bin-idx format)
+      - weight: 0.5
+        path: examples/mimo/data/text_only_blend.yaml
+      # OmniCorpus multimodal (interleaved image+text)
+      - weight: 0.5
+        path: examples/mimo/data/omnicorpus_blend.yaml

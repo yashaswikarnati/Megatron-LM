@@ -50,7 +50,7 @@ def add_multimodal_extra_args(parser):
         "--tokenizer-prompt-format",
         type=str,
         choices=["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5", "llama3p1", "nemotron5",
-                 "nemotron5-aligned"],
+                 "nemotron5-aligned", "nemotron6-moe"],
         required=True,
         help="Prompt format to use with the tokenizer.",
     )

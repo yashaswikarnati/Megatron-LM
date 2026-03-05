@@ -188,9 +188,9 @@ def get_vlm_projection_config(
         hidden_size=hidden_size,
         num_attention_heads=1,
     )
-    cfg.ffn_hidden_size = hidden_size
-    cfg.bias_activation_fusion = True
-    cfg.add_bias_linear = True
+    cfg.ffn_hidden_size = 4 * 5120
+    cfg.bias_activation_fusion = False
+    cfg.add_bias_linear = False
     cfg.activation_func = torch.nn.functional.gelu
 
     if config is not None:

@@ -131,6 +131,11 @@ class MimoModel(MegatronModule):
                 mask.unsqueeze(-1).expand_as(combined_embeddings).to(combined_embeddings.device)
             )
             combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())
+
+        # Keep backward active on all ranks to avoid MoE alltoall desync.
+        if not combined_embeddings.requires_grad:
+            combined_embeddings.requires_grad_(True)
+
         return combined_embeddings.transpose(
             0, 1
         ).contiguous()  # Shape: [seq_length, batch_size, hidden_dim]

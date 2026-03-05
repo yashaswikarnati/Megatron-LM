@@ -33,7 +33,9 @@ try:
     from data.energon_multimodal_provider import (
         train_valid_test_dataloaders_provider as energon_multimodal_dataloader_provider,
     )
-except ImportError:
+except ImportError as e:
+    import warnings
+    warnings.warn(f"energon_multimodal_provider not available: {e}")
     energon_multimodal_dataloader_provider = None
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
 from data.mock import (
