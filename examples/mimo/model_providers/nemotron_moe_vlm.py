@@ -61,6 +61,9 @@ def add_nemotron_moe_vlm_args(parser):
     group.add_argument('--nemotron-checkpoint', type=str, default=None,
                        help='Path to a non-MIMO Nemotron VLM checkpoint directory. '
                             'Loads vision_model/vision_projection/language_model with key remapping.')
+    group.add_argument('--skip-projection-checkpoint', action='store_true', default=False,
+                       help='When loading --nemotron-checkpoint, skip vision_projection weights '
+                            '(projection stays randomly initialized). Use for adapter-only training.')
 
     # MultimodalTokenizer args (required by megatron/training/tokenizer/tokenizer.py)
     group.add_argument('--special-tokens', nargs='*', default=['<image>'],
@@ -212,7 +215,11 @@ def model_provider_nemotron_moe_vlm(
                 "Use --nemotron-checkpoint for initial loading of a non-MIMO checkpoint, "
                 "or --load for resuming from a MIMO-native checkpoint."
             )
-        load_nemotron_vlm_ckpt(mimo_model, args.nemotron_checkpoint)
+        load_nemotron_vlm_ckpt(
+            mimo_model,
+            args.nemotron_checkpoint,
+            skip_projection=getattr(args, "skip_projection_checkpoint", False),
+        )
         print(f"Successfully loaded nemotron checkpoint from {args.nemotron_checkpoint}")
 
     if getattr(args, "language_model_checkpoint", None) is not None:

@@ -141,7 +141,11 @@ def _load_submodule_from_ckpt(
     print(f"    [{ckpt_prefix}] Loaded {n_loaded}/{n_total} parameter tensors.")
 
 
-def load_nemotron_vlm_ckpt(mimo_model: torch.nn.Module, ckpt_dir: str):
+def load_nemotron_vlm_ckpt(
+    mimo_model: torch.nn.Module,
+    ckpt_dir: str,
+    skip_projection: bool = False,
+):
     """Load a non-MIMO Nemotron VLM checkpoint into *mimo_model*.
 
     The checkpoint uses flat prefixes (``vision_model.*``,
@@ -152,6 +156,10 @@ def load_nemotron_vlm_ckpt(mimo_model: torch.nn.Module, ckpt_dir: str):
     separately so that each one produces correctly TP-sharded
     ``ShardedTensor`` metadata via its own ``sharded_state_dict``.
 
+    If *skip_projection* is True, the vision_projection weights are not
+    loaded (projection stays randomly initialized). Use for adapter-only
+    training where the projection is trained from scratch.
+
     *ckpt_dir* may be either the parent ``checkpoints/`` directory
     (containing ``latest_checkpointed_iteration.txt``) or a specific
     ``iter_NNNNNNN`` dir.
@@ -160,6 +168,9 @@ def load_nemotron_vlm_ckpt(mimo_model: torch.nn.Module, ckpt_dir: str):
     print(f"  Resolved checkpoint dir: {ckpt_dir}")
 
     for attr_path, ckpt_prefix in _NEMOTRON_SUBMODULE_MAP:
+        if skip_projection and ckpt_prefix == "vision_projection.":
+            print(f"  Skipping '{ckpt_prefix}*' (--skip-projection-checkpoint)")
+            continue
         submodule = _get_nested_attr(mimo_model, attr_path)
         _load_submodule_from_ckpt(submodule, ckpt_dir, ckpt_prefix)
         print(f"  Loaded '{ckpt_prefix}*' → {attr_path}")
