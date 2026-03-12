@@ -6,6 +6,9 @@ from unittest import mock
 
 import torch
 
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -154,7 +157,6 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.consumed_train_samples = 0
     args.skipped_train_samples = 0
     args.consumed_valid_samples = 0
-    args.retro_add_retriever = False
     args.no_load_optim = False
     args.no_load_rng = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
@@ -168,6 +170,9 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
+    # Clear the metadata cache to avoid contamination between tests
+
+    CachedMetadataFileSystemReader.clear_metadata_cache()
 
 
 def setup_model_and_optimizer(
@@ -225,7 +230,7 @@ def setup_model_and_optimizer(
             opt.init_state_fn(opt)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
 
 
@@ -323,5 +328,5 @@ def setup_moe_model_and_optimizer(
             opt.init_state_fn(opt)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
