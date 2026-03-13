@@ -14,7 +14,7 @@ splits:
     blend:
       # Text-only (Nemotron-6 pretraining data, bin-idx format)
       - weight: 0.5
-        path: examples/mimo/data/text_only_blend.yaml
+        path: text_only_blend.yaml
       # OmniCorpus multimodal (interleaved image+text)
       - weight: 0.5
-        path: examples/mimo/data/omnicorpus_blend.yaml
+        path: omnicorpus_blend.yaml

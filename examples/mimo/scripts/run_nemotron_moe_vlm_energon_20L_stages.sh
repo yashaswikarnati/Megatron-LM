@@ -47,7 +47,7 @@ CHECKPOINT_PATH="$LOG_DIR/checkpoints"
 mkdir -p "$CHECKPOINT_PATH"
 
 # ── Data path (OmniCorpus blend — same as reference) ─────────────────
-DATA_PATH="${DATA_PATH:-examples/mimo/data/omnicorpus_blend.yaml}"
+DATA_PATH="${DATA_PATH:-/lustre/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/kshih/workspace/blends/eagle_recipe_online_packing/final_recipe/pretrain_base_non_sft_cw_dfw.yaml}"
 
 # ── Tokenizer ─────────────────────────────────────────────────────────
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/checkpoints/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16-multimodal-pretraining/snapshots/7344a79074e20d9ab548e14c25b0492345394f67}"
@@ -111,6 +111,8 @@ HYBRID_ARGS=(
     --moe-token-dispatcher-type alltoall
     --moe-shared-expert-overlap
     --moe-permute-fusion
+    --use-fused-weighted-squared-relu
+    --enable-experimental
     --is-hybrid-model
     --hybrid-override-pattern "MEMEM*EMEMEM*EMEMEM*"
     --mamba-num-heads 64

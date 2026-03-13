@@ -145,6 +145,9 @@ class PartitionAdapter:
             shard_factor = None
             seq_dim = None  # which dimension holds the token sequence
 
+            # NOTE: MimoModel.forward() always passes embeddings in batch-first
+            # layout [B, S, H] (transposed before calling shard()), so seq_dim
+            # is always 1 regardless of whether CP or SP is active.
             if self.cfg.use_cp and self.cfg.seq_parallel:
                 shard_factor = get_pg_size(self.cfg.tp_group) * get_pg_size(self.cfg.cp_group) * 2
                 seq_dim = 1  # embeddings shape: [B, S, H]
@@ -153,7 +156,7 @@ class PartitionAdapter:
                 seq_dim = 1
             elif self.cfg.seq_parallel:
                 shard_factor = get_pg_size(self.cfg.tp_group)
-                seq_dim = 0  # embeddings shape: [S, B, H]
+                seq_dim = 1  # embeddings shape: [B, S, H] (caller transposes)
 
             if shard_factor is not None and (
                 packed_seq_params is None
@@ -178,7 +181,11 @@ class PartitionAdapter:
             )
 
         if self.cfg.seq_parallel and embeddings is not None:
+            # scatter_to_sequence_parallel_region splits along dim 0,
+            # so transpose [B, S, H] → [S, B, H] first, scatter, then back.
+            embeddings = embeddings.transpose(0, 1).contiguous()
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            embeddings = embeddings.transpose(0, 1).contiguous()
 
         return embeddings, labels, loss_mask, attention_mask, packed_seq_params
 

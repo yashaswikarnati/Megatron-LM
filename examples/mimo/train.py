@@ -23,8 +23,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
-    get_context_parallel_group,
-    get_data_parallel_group,
 )
 
 sys.path.append(
@@ -51,6 +49,7 @@ from model_providers.nemotron_moe_vlm import (
     model_provider_nemotron_moe_vlm,
 )
 from utils.data_helpers import broadcast_nested_data_batch
+from utils.loss_utils import loss_func, scaled_loss_func
 
 from megatron.core.enums import ModelType
 
@@ -109,6 +108,9 @@ def add_mimo_args(parser):
     group.add_argument('--vision-encoder-checkpoint', type=str, default=None, help='Path to vision encoder checkpoint to load')
     # energon dataloader related args
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
+    # loss scaling
+    group.add_argument('--use-loss-scaling', action='store_true', default=False,
+                       help='Use per-conversation-turn sqrt-weighted loss scaling')
 
     # Register model-provider-specific args
     for add_args_fn in _MODEL_PROVIDER_EXTRA_ARGS.values():
@@ -171,42 +173,6 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
 
     return batch
 
-def loss_func(loss_mask, output_tensor):
-    """Simple loss function for MIMO model training.
-
-    Args:
-        loss_mask: mask indicating which tokens contribute to the loss
-        output_tensor: model output tensor
-    Returns:
-        tuple: (loss, num_tokens, metrics_dict)
-    """
-    args = get_args()
-    losses = output_tensor.float()
-
-    loss_mask = loss_mask.contiguous().view(-1).float()
-
-    
-
-    total_tokens = loss_mask.sum().clone().detach().to(torch.int)
-    total_loss = torch.sum(losses.view(-1) * loss_mask)
-
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
-
-    loss_for_backward = loss[0].clone()
-    # If CP is active, reduce the loss across all CP ranks 
-    # as they have loss calculated for their own sequence shards.
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=get_context_parallel_group())
-        loss_for_backward = loss[0].clone()
-    # For reporting, clone and detach the loss. This creates a new tensor 
-    # that doesn't require gradients and is independent of the computation graph.
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    return (loss_for_backward, local_num_tokens, {'lm loss': (reporting_loss)})
-
 
 def forward_step(data_iterator, model):
     """Forward step for MIMO model training.
@@ -220,9 +186,13 @@ def forward_step(data_iterator, model):
     """
     data_batch = get_batch(data_iterator)
     output_tensor, loss_mask = model(**data_batch)
-    
-    # Return output and loss function
-    return output_tensor, partial(loss_func, loss_mask)
+
+    args = get_args()
+    if getattr(args, 'use_loss_scaling', False):
+        loss_function = partial(scaled_loss_func, loss_mask)
+    else:
+        loss_function = partial(loss_func, loss_mask)
+    return output_tensor, loss_function
 
 
 def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):

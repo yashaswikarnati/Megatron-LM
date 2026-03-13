@@ -42,11 +42,18 @@ class _TokenizerAdapter:
     def __init__(self, megatron_tokenizer):
         self._tok = megatron_tokenizer
         # Walk the wrapper chain to reach the HF PreTrainedTokenizerFast.
-        # MultimodalTokenizer._tokenizer → HF AutoTokenizer (PreTrainedTokenizerFast)
-        # HuggingFaceTokenizer._tokenizer → HF AutoTokenizer (PreTrainedTokenizerFast)
+        # Chain: DefaultTokenizerVision._tokenizer → MegatronMultimodalTokenizer
+        #        MegatronMultimodalTokenizer.tokenizer → HF AutoTokenizer
         # IMPORTANT: Do NOT drill into PreTrainedTokenizerFast.tokenizer — that's
         # the raw Rust tokenizer whose encode() returns tokenizers.Encoding, not list[int].
-        self._hf = getattr(megatron_tokenizer, '_tokenizer', megatron_tokenizer)
+        inner = megatron_tokenizer
+        # Unwrap DefaultTokenizerVision → MegatronMultimodalTokenizer
+        if hasattr(inner, '_tokenizer'):
+            inner = inner._tokenizer
+        # Unwrap MegatronMultimodalTokenizer → HF AutoTokenizer
+        if hasattr(inner, 'tokenizer'):
+            inner = inner.tokenizer
+        self._hf = inner
 
     @property
     def pad_token_id(self) -> int:
@@ -106,18 +113,21 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
         )
 
     def batch(self, samples: List[PackedSample]) -> dict:
-        """Override to expand image placeholders and remap to MIMO format.
+        """Override to expand image placeholders, build packing_kwargs, and remap to MIMO format.
 
         Energon's token stream has 1 placeholder per image.
-        MIMO needs ``num_tiles * embeddings_per_tile`` placeholders per image.
+        MIMO needs ``num_tiles * embeddings_per_tile`` placeholders per image
+        for 1:1 ``masked_scatter_`` alignment.
+
+        The base class pipeline (preencode → pack_selected_samples) already
+        computes ``cu_lengths`` using expanded ``total_len`` values, so the
+        cumulative lengths are correct for the MIMO-expanded token stream.
 
         When ``target_seq_length`` is set, samples whose expanded length would
-        exceed the limit are **right-truncated** at image boundaries: each image
-        is kept whole (all tiles) or dropped entirely to maintain 1:1 alignment
-        with ``masked_scatter_``.
+        exceed the limit are **right-truncated** at image boundaries.
 
         Returns dict with keys: input_ids, labels, loss_mask, position_ids,
-        modality_inputs.
+        modality_inputs, and optionally packing_kwargs.
         """
         image_token_id = self.packing_config.image_token_id
         ignore_index = self.packing_config.ignore_index
@@ -140,8 +150,6 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
             new_labels = []
             img_idx = 0
             truncated = False
-            # sample.images is a flat list of tiles across all images.
-            # Track how many tiles are kept so we can slice it correctly.
             kept_tile_count = 0
 
             for i, tok in enumerate(tokens.tolist()):
@@ -149,7 +157,6 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
                     n_tiles = num_tiles[img_idx] if img_idx < len(num_tiles) else 1
                     n_tokens = n_tiles * emb_per_tile
                     if budget is not None and len(new_tokens) + n_tokens > budget:
-                        # This image doesn't fit — stop here.
                         truncated = True
                         break
                     new_tokens.extend([image_token_id] * n_tokens)
@@ -164,22 +171,17 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
                     new_labels.append(labels[i].item())
 
             if truncated:
-                orig_len = len(tokens)
-                total_images = len(num_tiles)
-                kept_images = img_idx
                 warnings.warn(
                     f"Sample truncated to fit target_seq_length "
                     f"({self._target_seq_length}): kept {len(new_tokens)} of "
-                    f"~{orig_len} original tokens, {kept_images}/{total_images} "
+                    f"~{len(tokens)} original tokens, {img_idx}/{len(num_tiles)} "
                     f"images ({kept_tile_count} tiles). "
                     f"Consider increasing --total-seq-length or reducing "
                     f"--max-num-tiles.",
                     stacklevel=2,
                 )
 
-            # Collect only the tiles for images that survived truncation.
             all_images.extend(sample.images[:kept_tile_count])
-
             expanded_tokens_list.append(torch.tensor(new_tokens, dtype=torch.long))
             expanded_labels_list.append(torch.tensor(new_labels, dtype=torch.long))
 
@@ -193,8 +195,8 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
         labels_batch = torch.full((B, max_len), ignore_index, dtype=torch.long)
 
         for i, (t, l) in enumerate(zip(expanded_tokens_list, expanded_labels_list)):
-            tokens_batch[i, :len(t)] = t
-            labels_batch[i, :len(l)] = l
+            tokens_batch[i, : len(t)] = t
+            labels_batch[i, : len(l)] = l
 
         loss_mask = (labels_batch != ignore_index).float()
         position_ids = torch.arange(max_len).unsqueeze(0).expand(B, -1).contiguous()
@@ -207,13 +209,52 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
         }
 
         # Only include modality_inputs when there are actual images.
-        # Text-only batches skip the vision path entirely.
         if all_images:
             imgs = self.tiling_strategy.stack(all_images)[0]  # (total_tiles, C, H, W)
             result["modality_inputs"] = {
                 "images": {
                     self.encoder_name: {self.encoder_input_key: imgs},
                 }
+            }
+
+        # Build packing_kwargs from base class cu_lengths when packing is active.
+        # The base class pipeline computes cu_lengths using expanded total_len,
+        # so they match our MIMO-expanded token stream.
+        is_packed = any(len(s.cu_lengths) > 2 for s in samples)
+        if is_packed:
+            # Build per-sample cu_seqlens from PackedSample.cu_lengths.
+            # With micro_batch_size=1 (required for packing), B==1.
+            assert B == 1, (
+                f"Packing requires micro_batch_size=1, got B={B}"
+            )
+            sample = samples[0]
+            cu_seqlens = sample.cu_lengths.to(dtype=torch.int32)
+
+            # Clamp to actual sequence length (cu_lengths are based on expanded
+            # total_len which should match, but clamp for safety).
+            cu_seqlens = cu_seqlens.clamp(max=max_len)
+
+            # Ensure starts at 0 and ends at max_len.
+            if cu_seqlens[0] != 0:
+                cu_seqlens = torch.cat(
+                    [torch.tensor([0], dtype=torch.int32), cu_seqlens]
+                )
+            if cu_seqlens[-1] != max_len:
+                cu_seqlens = torch.cat(
+                    [cu_seqlens, torch.tensor([max_len], dtype=torch.int32)]
+                )
+
+            # Compute per-segment lengths and max segment length.
+            segment_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = segment_lens.max()
+
+            result["packing_kwargs"] = {
+                "cu_seqlens_q": cu_seqlens,
+                "cu_seqlens_kv": cu_seqlens,
+                "cu_seqlens_q_padded": cu_seqlens,
+                "cu_seqlens_kv_padded": cu_seqlens,
+                "max_seqlen_q": max_seqlen,
+                "max_seqlen_kv": max_seqlen,
             }
 
         return result
@@ -246,7 +287,7 @@ class EnergonDataloader:
 # ---------------------------------------------------------------------------
 # Factory: train_valid_test_dataloaders_provider
 # ---------------------------------------------------------------------------
-def train_valid_test_dataloaders_provider(train_val_test_num_samples):
+def train_valid_test_dataloaders_provider(train_val_test_num_samples, **kwargs):
     """Build energon multimodal dataloader for MIMO training.
 
     Registered in train.py as ``_DATASET_PROVIDERS["energon_multimodal"]``.
@@ -333,12 +374,18 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
 # ---------------------------------------------------------------------------
 # Standalone test
 # ---------------------------------------------------------------------------
-def _test_standalone(blend_yaml: str, batch_size: int = 2, num_batches: int = 3):
-    """Test the data pipeline without Megatron (no GPUs needed).
+def _test_standalone(
+    blend_yaml: str,
+    batch_size: int = 1,
+    num_batches: int = 5,
+    seq_length: int = 4096,
+    packing_buffer_size: int = 32,
+):
+    """Test the data pipeline with packing verification.
 
     Usage::
 
-        python energon_multimodal_provider.py <path-to-blend.yaml> [batch_size] [num_batches]
+        python energon_multimodal_provider.py <path-to-blend.yaml> [batch_size] [num_batches] [seq_length]
     """
     from megatron.energon import WorkerConfig, get_loader, get_train_dataset
     from transformers import AutoTokenizer
@@ -350,10 +397,8 @@ def _test_standalone(blend_yaml: str, batch_size: int = 2, num_batches: int = 3)
     print(f"Loading tokenizer: {tokenizer_model}")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
 
-    # Resolve image token id
     image_token_id = tokenizer.convert_tokens_to_ids("<image>")
     if image_token_id is None or image_token_id == tokenizer.unk_token_id:
-        # Fallback: use a high token id
         image_token_id = 128256
         print(f"WARNING: <image> token not in vocab, using fallback id {image_token_id}")
     print(f"image_token_id = {image_token_id}")
@@ -371,7 +416,7 @@ def _test_standalone(blend_yaml: str, batch_size: int = 2, num_batches: int = 3)
     )
 
     packing_config = PackingConfig(
-        seq_length=4096,
+        seq_length=seq_length,
         pad_id=tokenizer.pad_token_id or 0,
         image_token_id=image_token_id,
     )
@@ -382,10 +427,12 @@ def _test_standalone(blend_yaml: str, batch_size: int = 2, num_batches: int = 3)
         tokenizer=tokenizer,
         encoder_name="radio_encoder",
         encoder_input_key="x",
-        target_seq_length=None,  # dynamic padding for testing
+        target_seq_length=seq_length,
     )
 
     print(f"Embeddings per tile: {encoder._embeddings_per_tile}")
+    print(f"Sequence length: {seq_length}")
+    print(f"Packing buffer size: {packing_buffer_size}")
 
     worker_config = WorkerConfig.default_worker_config(0)
     dataset = get_train_dataset(
@@ -393,7 +440,7 @@ def _test_standalone(blend_yaml: str, batch_size: int = 2, num_batches: int = 3)
         batch_size=batch_size,
         task_encoder=encoder,
         worker_config=worker_config,
-        packing_buffer_size=32,
+        packing_buffer_size=packing_buffer_size,
         shuffle_buffer_size=100,
         max_samples_per_sequence=100,
     )
@@ -403,6 +450,7 @@ def _test_standalone(blend_yaml: str, batch_size: int = 2, num_batches: int = 3)
     print(f"Loading batches from: {blend_yaml}")
     print(f"{'='*60}\n")
 
+    errors = []
     for i, batch in enumerate(loader):
         if i >= num_batches:
             break
@@ -410,44 +458,113 @@ def _test_standalone(blend_yaml: str, batch_size: int = 2, num_batches: int = 3)
         input_ids = batch["input_ids"]
         labels = batch["labels"]
         loss_mask = batch["loss_mask"]
-        position_ids = batch["position_ids"]
-        imgs = batch["modality_inputs"]["images"]["radio_encoder"]["x"]
+        has_images = "modality_inputs" in batch
 
         B, S = input_ids.shape
         n_image_tokens = (input_ids == image_token_id).sum(dim=1)
         n_loss_tokens = loss_mask.sum(dim=1)
+        n_pad_tokens = (input_ids == (tokenizer.pad_token_id or 0)).sum(dim=1)
 
         print(f"--- Batch {i} ---")
-        print(f"  input_ids:    {input_ids.shape}  dtype={input_ids.dtype}")
-        print(f"  labels:       {labels.shape}  dtype={labels.dtype}")
-        print(f"  loss_mask:    {loss_mask.shape}  dtype={loss_mask.dtype}")
-        print(f"  position_ids: {position_ids.shape}  dtype={position_ids.dtype}")
-        print(f"  images:       {imgs.shape}  dtype={imgs.dtype}")
+        print(f"  shape: B={B}, S={S}")
         print(f"  image tokens per sample: {n_image_tokens.tolist()}")
         print(f"  loss tokens per sample:  {n_loss_tokens.int().tolist()}")
+        print(f"  pad tokens per sample:   {n_pad_tokens.tolist()}")
 
-        # Verify contract: total image tokens == total_tiles * emb_per_tile
-        total_image_toks = n_image_tokens.sum().item()
-        total_tiles = imgs.shape[0]
-        expected_image_toks = total_tiles * encoder._embeddings_per_tile
-        match = "OK" if total_image_toks == expected_image_toks else "MISMATCH"
-        print(
-            f"  tiles={total_tiles}  expected_img_tokens={expected_image_toks}  "
-            f"actual_img_tokens={total_image_toks}  [{match}]"
-        )
+        # 1. Verify image token / tile consistency
+        if has_images:
+            imgs = batch["modality_inputs"]["images"]["radio_encoder"]["x"]
+            total_tiles = imgs.shape[0]
+            total_image_toks = n_image_tokens.sum().item()
+            expected_image_toks = total_tiles * encoder._embeddings_per_tile
+            ok = total_image_toks == expected_image_toks
+            status = "OK" if ok else "MISMATCH"
+            print(f"  images: {imgs.shape}  tiles={total_tiles}  "
+                  f"img_tokens={total_image_toks}  expected={expected_image_toks}  [{status}]")
+            if not ok:
+                errors.append(f"Batch {i}: image token mismatch")
+        else:
+            print(f"  images: text-only batch")
+
+        # 2. Verify packing_kwargs
+        if "packing_kwargs" in batch:
+            pk = batch["packing_kwargs"]
+            cu_q = pk["cu_seqlens_q"]
+            cu_kv = pk["cu_seqlens_kv"]
+            max_q = pk["max_seqlen_q"]
+            max_kv = pk["max_seqlen_kv"]
+
+            num_segments = len(cu_q) - 1
+            segment_lens = cu_q[1:] - cu_q[:-1]
+
+            print(f"  packing_kwargs:")
+            print(f"    cu_seqlens_q:  {cu_q.tolist()}")
+            print(f"    num_segments:  {num_segments}")
+            print(f"    segment_lens:  {segment_lens.tolist()}")
+            print(f"    max_seqlen_q:  {max_q.item()}")
+
+            # Verify cu_seqlens starts at 0
+            if cu_q[0].item() != 0:
+                errors.append(f"Batch {i}: cu_seqlens_q doesn't start at 0")
+                print(f"    ERROR: cu_seqlens_q doesn't start at 0!")
+
+            # Verify cu_seqlens ends at S
+            if cu_q[-1].item() != S:
+                errors.append(f"Batch {i}: cu_seqlens_q doesn't end at S={S}, got {cu_q[-1].item()}")
+                print(f"    ERROR: cu_seqlens_q ends at {cu_q[-1].item()}, expected {S}!")
+
+            # Verify monotonically increasing
+            if not torch.all(segment_lens > 0):
+                errors.append(f"Batch {i}: cu_seqlens_q not strictly increasing")
+                print(f"    ERROR: cu_seqlens_q not strictly increasing!")
+
+            # Verify max_seqlen matches
+            actual_max = segment_lens.max().item()
+            if max_q.item() != actual_max:
+                errors.append(f"Batch {i}: max_seqlen_q mismatch: {max_q.item()} vs {actual_max}")
+                print(f"    ERROR: max_seqlen_q={max_q.item()} but max segment={actual_max}!")
+
+            # Verify q == kv
+            if not torch.equal(cu_q, cu_kv):
+                errors.append(f"Batch {i}: cu_seqlens_q != cu_seqlens_kv")
+                print(f"    ERROR: cu_seqlens_q != cu_seqlens_kv!")
+
+            # Verify content within segments: check each segment has valid tokens
+            for seg_idx in range(num_segments):
+                start = cu_q[seg_idx].item()
+                end = cu_q[seg_idx + 1].item()
+                seg_tokens = input_ids[0, start:end]
+                seg_loss = loss_mask[0, start:end]
+                seg_img_count = (seg_tokens == image_token_id).sum().item()
+                seg_loss_count = seg_loss.sum().int().item()
+                seg_pad_count = (seg_tokens == (tokenizer.pad_token_id or 0)).sum().item()
+                print(f"    segment {seg_idx}: [{start}:{end}] len={end-start}  "
+                      f"img_tok={seg_img_count}  loss_tok={seg_loss_count}  pad={seg_pad_count}")
+        else:
+            print(f"  packing_kwargs: NOT present (single sample, no packing)")
+
         print()
 
-    print("Done.")
+    print(f"{'='*60}")
+    if errors:
+        print(f"ERRORS ({len(errors)}):")
+        for e in errors:
+            print(f"  - {e}")
+    else:
+        print("All checks passed!")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(
-            "Usage: python energon_multimodal_provider.py <blend.yaml> [batch_size] [num_batches]"
+            "Usage: python energon_multimodal_provider.py <blend.yaml> "
+            "[batch_size] [num_batches] [seq_length]"
         )
         sys.exit(1)
 
     blend_yaml = sys.argv[1]
-    batch_size = int(sys.argv[2]) if len(sys.argv) > 2 else 2
-    num_batches = int(sys.argv[3]) if len(sys.argv) > 3 else 3
-    _test_standalone(blend_yaml, batch_size, num_batches)
+    batch_size = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    num_batches = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+    seq_length = int(sys.argv[4]) if len(sys.argv) > 4 else 4096
+    _test_standalone(blend_yaml, batch_size, num_batches, seq_length)
