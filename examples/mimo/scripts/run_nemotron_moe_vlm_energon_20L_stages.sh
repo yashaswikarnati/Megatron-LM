@@ -83,7 +83,7 @@ GPT_MODEL_ARGS=(
     --kv-channels 128
     --ffn-hidden-size 1856
     --max-position-embeddings 8192
-    --encoder-seq-length 4096
+    --encoder-seq-length 8192
     --position-embedding-type none
     --normalization RMSNorm
     --disable-bias-linear
@@ -159,8 +159,10 @@ TRAINING_ARGS=(
 DATA_ARGS=(
     --dataloader-type external
     --data-path "$DATA_PATH"
-    --total-seq-length 4096
+    --total-seq-length 8192
     --num-workers 2
+    --packing-buffer-size 128
+    --use-loss-scaling
 )
 
 TOKENIZER_ARGS=(
@@ -186,7 +188,7 @@ echo "=== Nemotron6-MoE VLM 20L Training (MIMO + energon) ==="
 echo "Stage: $TRAINING_STAGE — $STAGE_DESC"
 echo "GPUs: $GPUS_PER_NODE | TP=$TP EP=$EP DP=$DP"
 echo "Layers: 20 | Pattern: MEMEM*EMEMEM*EMEMEM*"
-echo "Seq: 4096 | GBS: 8 | Iters: 10000"
+echo "Seq: 8192 | GBS: 8 | Iters: 10000 | Packing: 128"
 echo "Data: $DATA_PATH"
 echo "Logs: $LOG_DIR"
 echo "========================================================="
