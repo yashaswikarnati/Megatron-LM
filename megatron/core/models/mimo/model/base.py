@@ -11,6 +11,7 @@ from megatron.core.models.mimo.partition.utils import PartitionAdapter, Partitio
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
+from megatron.core.transformer.utils import sharded_state_dict_default
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,28 @@ class MimoModel(MegatronModule):
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
         self._initialize_language_model()
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Override to recurse into modality_submodules ModuleDict for TP resharding.
+
+        The parent MegatronModule.sharded_state_dict() treats nn.ModuleDict as a
+        single child and flattens all its params as replicated — losing TP metadata.
+        We fix this by re-processing modality_submodules, iterating into each
+        ModalitySubmodules child so their sharded_state_dict() is called.
+        """
+        sharded_sd = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        # Replace incorrectly-flattened modality_submodules with proper recursion.
+        mod_prefix = f'{prefix}modality_submodules.'
+        for k in [k for k in sharded_sd if k.startswith(mod_prefix)]:
+            del sharded_sd[k]
+        for mod_name, mod in self.modality_submodules.items():
+            sharded_sd.update(
+                sharded_state_dict_default(
+                    mod, f'{mod_prefix}{mod_name}.', sharded_offsets, metadata
+                )
+            )
+        return sharded_sd
 
     def align_embeddings_by_token_positions(
         self,

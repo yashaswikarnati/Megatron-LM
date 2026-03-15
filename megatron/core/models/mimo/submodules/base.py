@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.utils import sharded_state_dict_default
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -57,6 +58,21 @@ class ModalitySubmodules(ABC, nn.Module):
             category=UserWarning,
             stacklevel=2,
         )
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Recurse into children for distributed checkpoint TP resharding support."""
+        sharded_sd = {}
+        # Children are ModuleDict (encoders, decoders) and ModuleList
+        # (input_projections, output_projections). Iterate into them so that
+        # child modules with sharded_state_dict are reached.
+        for name, container in self.named_children():
+            for sub_name, module in container.named_children():
+                sharded_sd.update(
+                    sharded_state_dict_default(
+                        module, f'{prefix}{name}.{sub_name}.', sharded_offsets, metadata
+                    )
+                )
+        return sharded_sd
 
     @classmethod
     def from_spec(cls, module_spec: ModuleSpec) -> 'ModalitySubmodules':

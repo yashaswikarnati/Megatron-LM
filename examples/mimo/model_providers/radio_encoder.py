@@ -13,6 +13,7 @@ from megatron.core.models.multimodal.llava_model import pixel_shuffle
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import sharded_state_dict_default
 
 
 class RADIOEncoderWrapper(nn.Module):
@@ -61,6 +62,15 @@ class RADIOEncoderWrapper(nn.Module):
             embedder_bias=embedder_bias,
             force_eval_mode=force_eval_mode,
         )
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Delegate to radio_model for distributed checkpoint TP resharding support."""
+        sharded_sd = {}
+        for name, child in self.named_children():
+            sharded_sd.update(
+                sharded_state_dict_default(child, f'{prefix}{name}.', sharded_offsets, metadata)
+            )
+        return sharded_sd
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run RADIO encoder.
