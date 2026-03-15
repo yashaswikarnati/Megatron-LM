@@ -13,6 +13,7 @@ Usage (via inference.sh):
     # Vision+text inference (needs energon dataloader):
     bash examples/mimo/scripts/inference/inference.sh <megatron_root> --mode vision_text
 """
+import argparse
 import os
 import sys
 
@@ -50,7 +51,6 @@ def main():
                 pass
         return parser
 
-    import argparse
     initialize_megatron(extra_args_provider=extra_args)
     args = get_args()
     tokenizer = get_tokenizer()

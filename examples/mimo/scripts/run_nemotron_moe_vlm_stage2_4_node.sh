@@ -9,7 +9,7 @@
 #   TP=4, EP=64, PP=1, 64 nodes
 #
 # Usage:
-#   sbatch examples/mimo/scripts/run_nemotron_moe_vlm_stage2_64node.sh
+#   sbatch examples/mimo/scripts/run_nemotron_moe_vlm_stage2_4_node.sh
 #
 # Environment variables (all have defaults):
 #   STAGE1_CKPT     – path to Stage 1 adapter-only checkpoint
