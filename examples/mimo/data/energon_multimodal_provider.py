@@ -199,6 +199,9 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
             labels_batch[i, : len(l)] = l
 
         loss_mask = (labels_batch != ignore_index).float()
+        # Don't train the model to predict <image> tokens — they are special
+        # placeholders replaced by vision embeddings, never naturally generated.
+        loss_mask[labels_batch == image_token_id] = 0.0
         position_ids = torch.arange(max_len).unsqueeze(0).expand(B, -1).contiguous()
 
         result = {
@@ -255,6 +258,7 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
                 "cu_seqlens_kv_padded": cu_seqlens,
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_kv": max_seqlen,
+                "total_tokens": max_len,
             }
 
         return result

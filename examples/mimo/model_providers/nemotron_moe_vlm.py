@@ -151,6 +151,7 @@ def model_provider_nemotron_moe_vlm(
             "class_token_len": class_token_len,
             "drop_class_token": disable_vision_class_token,
             "apply_pixel_shuffle": apply_pixel_shuffle,
+            "force_eval_mode": getattr(args, "freeze_vit", False),
         },
     )
 

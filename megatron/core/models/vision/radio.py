@@ -66,6 +66,7 @@ class RADIOViTModel(VisionModule):
         embedder_bias: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        force_eval_mode: bool = False,
     ) -> None:
         super().__init__(config=transformer_config)
 
@@ -164,6 +165,16 @@ class RADIOViTModel(VisionModule):
             pg_collection=self.pg_collection,
             vp_stage=self.vp_stage,
         )
+
+        self.force_eval_mode = force_eval_mode
+        if self.force_eval_mode:
+            self.eval()
+
+    def train(self, mode: bool = True) -> 'RADIOViTModel':
+        """Override to keep model in eval mode when force_eval_mode is set."""
+        if mode and self.force_eval_mode:
+            return self
+        return super().train(mode)
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """Sets input tensor to the model.

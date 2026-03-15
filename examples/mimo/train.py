@@ -187,6 +187,10 @@ def forward_step(data_iterator, model):
     data_batch = get_batch(data_iterator)
     output_tensor, loss_mask = model(**data_batch)
 
+    # Advance all optional debug profilers (no-ops when env vars are unset).
+    from utils.profiler_manager import step_profilers
+    step_profilers(model, output_tensor)
+
     args = get_args()
     if getattr(args, 'use_loss_scaling', False):
         loss_function = partial(scaled_loss_func, loss_mask)
@@ -279,13 +283,19 @@ def model_provider(
             f"Must be one of {list(_MODEL_PROVIDERS.keys())}"
         )
 
-    return builder_fn(
+    model = builder_fn(
         pre_process,
         post_process,
         add_encoder,
         add_decoder,
         **builder_kwargs,
     )
+
+    # Register optional debug profilers (no-ops when env vars are unset).
+    from utils.profiler_manager import register_profilers
+    register_profilers(model)
+
+    return model
 
 if __name__ == "__main__":
     

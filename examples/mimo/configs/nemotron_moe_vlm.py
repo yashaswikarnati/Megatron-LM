@@ -18,6 +18,7 @@ import torch
 from megatron.core.activations import fast_gelu, squared_relu
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
+    TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
@@ -182,6 +183,12 @@ def get_vlm_projection_config(
     """Return a TransformerConfig for the vision→language projection MLP.
 
     ``hidden_size`` should match the language model's hidden size.
+
+    Must match the original pretrain_vlm.py architecture:
+    - activation_func = squared_relu (inherited from language model base config)
+    - normalization = "RMSNorm" (inherited from language model base config)
+    - bias_activation_fusion = False
+    - bias_dropout_fusion = False
     """
     cfg = TransformerConfig(
         num_layers=1,
@@ -190,8 +197,10 @@ def get_vlm_projection_config(
     )
     cfg.ffn_hidden_size = 4 * 5120
     cfg.bias_activation_fusion = False
+    cfg.bias_dropout_fusion = False
     cfg.add_bias_linear = False
-    cfg.activation_func = torch.nn.functional.gelu
+    cfg.activation_func = squared_relu
+    cfg.normalization = "RMSNorm"
 
     if config is not None:
         for field, value in vars(config).items():
@@ -219,11 +228,17 @@ def get_nemotron_moe_language_layer_spec() -> ModuleSpec:
 
 
 def get_vlm_projection_layer_spec() -> ModuleSpec:
-    """Layer spec for the vision→language projection MLP."""
+    """Layer spec for the vision→language projection MLP.
+
+    Uses TELayerNormColumnParallelLinear for fc1 to match the original
+    pretrain_vlm.py architecture (examples/multimodal/model.py). The fused
+    layer norm normalizes the vision encoder output before the first linear
+    layer, which is critical for training stability.
+    """
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear,
+            linear_fc1=TELayerNormColumnParallelLinear,
             linear_fc2=TERowParallelLinear,
         ),
     )

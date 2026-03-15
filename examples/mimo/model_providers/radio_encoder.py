@@ -40,6 +40,7 @@ class RADIOEncoderWrapper(nn.Module):
         max_img_w: int = 2048,
         has_cpe: bool = True,
         embedder_bias: bool = False,
+        force_eval_mode: bool = False,
     ):
         super().__init__()
         self.drop_class_token = drop_class_token
@@ -58,6 +59,7 @@ class RADIOEncoderWrapper(nn.Module):
             max_img_w=max_img_w,
             has_cpe=has_cpe,
             embedder_bias=embedder_bias,
+            force_eval_mode=force_eval_mode,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
