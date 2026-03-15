@@ -23,10 +23,10 @@
 #SBATCH --gpus-per-node=8
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH -t 04:00:00
+#SBATCH -t 01:00:00
 #SBATCH --job-name=mimo_vlm_stage2
 #SBATCH --partition=batch
-#SBATCH --account=coreai_dlalgo_genai
+#SBATCH --account=coreai_dlalgo_nemorl
 #SBATCH --dependency=singleton
 
 set -euo pipefail
@@ -68,7 +68,7 @@ NGPUS=$((NNODES * GPUS_PER_NODE))
 TP=2
 EP=32
 PP=1
-GBS=256
+GBS=1024
 
 # ── Output directories ──────────────────────────────────────────────────────
 MODEL_NAME="mimo_vlm_stage2"
@@ -84,16 +84,17 @@ mkdir -p "${TRITON_CACHE_DIR}"
 
 # ── Checkpoint (Stage 1 adapter-only output) ─────────────────────────────────
 STAGE1_CKPT="${STAGE1_CKPT:-${MEGATRON_ROOT}/logs/mimo_vlm_adapter_only_stage1/checkpoints}"
+STAGE1_ITER="${STAGE1_ITER:-3000}"
 
 # ── Restart-aware checkpoint loading ─────────────────────────────────────────
 # If we already have a stage 2 checkpoint, resume from it.
-# Otherwise, load from stage 1 adapter-only checkpoint.
+# Otherwise, load from stage 1 adapter-only checkpoint (specific iteration).
 if [ -f "${CHECKPOINT_DIR}/latest_checkpointed_iteration.txt" ]; then
     echo ">>> Resuming from existing stage 2 checkpoint in ${CHECKPOINT_DIR}"
     CKPT_ARGS=(--load "${CHECKPOINT_DIR}")
 else
-    echo ">>> First run: loading from stage 1 checkpoint ${STAGE1_CKPT}"
-    CKPT_ARGS=(--load "${STAGE1_CKPT}" --finetune --no-load-optim --no-load-rng)
+    echo ">>> First run: loading from stage 1 checkpoint ${STAGE1_CKPT} (iter ${STAGE1_ITER})"
+    CKPT_ARGS=(--load "${STAGE1_CKPT}" --ckpt-step "${STAGE1_ITER}" --finetune --no-load-optim --no-load-rng)
 fi
 
 # ── Data (OmniCorpus: 50% text + 50% multimodal) ────────────────────────────
@@ -189,17 +190,17 @@ VISION_ARGS=(
 TRAINING_ARGS=(
     --micro-batch-size 1
     --global-batch-size ${GBS}
-    --train-iters 5000
-    --lr 5e-4
-    --min-lr 1e-5
-    --weight-decay 0.1
+    --train-iters 10000
+    --lr 5e-5
+    --min-lr 0
+    --weight-decay 0.05
     --adam-beta1 0.9
     --adam-beta2 0.95
     --clip-grad 1.0
     --lr-decay-style WSD
     --lr-wsd-decay-style minus_sqrt
     --lr-warmup-iters 500
-    --lr-decay-iters 5000
+    --lr-decay-iters 10000
     --lr-wsd-decay-iters 500
     --model-provider nemotron_moe_vlm
     --dataset-provider energon_multimodal
@@ -259,8 +260,8 @@ echo "=== MIMO VLM Stage 2 Training (Projection + LLM) ==="
 echo "Nodes:  ${NNODES} | GPUs: ${NGPUS} | TP=${TP} EP=${EP} PP=${PP}"
 echo "Layers: 52 | Experts: 128 | Hidden: 2688"
 echo "Pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
-echo "GBS:    ${GBS} | MBS: 1 | total-seq-length: 8192 | Iters: 5000"
-echo "LR:     5e-4 → 1e-5 (WSD minus_sqrt, warmup=500, decay=500)"
+echo "GBS:    ${GBS} | MBS: 1 | total-seq-length: 8192 | Iters: 10000"
+echo "LR:     5e-5 → 0 (WSD minus_sqrt, warmup=500, decay=500)"
 echo "Freeze: ViT only (projection + LLM trainable)"
 echo "Data:   ${DATA_PATH}"
 echo "Ckpt:   ${CKPT_ARGS[*]}"
