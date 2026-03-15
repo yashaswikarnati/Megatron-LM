@@ -188,7 +188,7 @@ def forward_step(data_iterator, model):
     output_tensor, loss_mask = model(**data_batch)
 
     # Advance all optional debug profilers (no-ops when env vars are unset).
-    from utils.profiler_manager import step_profilers
+    from utils.act_grad_profiler import step_profilers
     step_profilers(model, output_tensor)
 
     args = get_args()
@@ -292,7 +292,7 @@ def model_provider(
     )
 
     # Register optional debug profilers (no-ops when env vars are unset).
-    from utils.profiler_manager import register_profilers
+    from utils.act_grad_profiler import register_profilers
     register_profilers(model)
 
     return model

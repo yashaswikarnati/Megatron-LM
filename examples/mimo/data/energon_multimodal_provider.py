@@ -258,7 +258,7 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
                 "cu_seqlens_kv_padded": cu_seqlens,
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_kv": max_seqlen,
-                "total_tokens": max_len,
+                "total_tokens": torch.tensor(max_len, dtype=torch.int32),
             }
 
         return result
