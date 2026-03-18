@@ -28,7 +28,7 @@
 #SBATCH -t 04:00:00
 #SBATCH --job-name=mimo_vlm_adapter_only
 #SBATCH --partition=batch
-#SBATCH --account=coreai_dlalgo_nemorl
+#SBATCH --account=coreai_dlalgo_llm
 #SBATCH --dependency=singleton
 
 set -euo pipefail
@@ -67,13 +67,13 @@ GPUS_PER_NODE=8
 NNODES="${SLURM_NNODES:-4}"
 NGPUS=$((NNODES * GPUS_PER_NODE))
 
-TP=2
+TP=1
 EP=4
 PP=1
 GBS=128
 
 # ── Output directories ──────────────────────────────────────────────────────
-MODEL_NAME="mimo_vlm_adapter_only_stage1_post_fix_norm_activation"
+MODEL_NAME="mimo_vlm_adapter_only_stage1_post_fix_norm_activation_ckpt_tp_1_ep_4"
 BASE_DIR="${BASE_DIR:-${MEGATRON_ROOT}/logs/${MODEL_NAME}}"
 CHECKPOINT_DIR="${BASE_DIR}/checkpoints"
 TENSORBOARD_DIR="${BASE_DIR}/tensorboard"
