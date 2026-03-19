@@ -233,6 +233,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         assert len(self.local_expert_indices) > 0, "Expected at least one local expert index"
         self.router_topk = config.moe_router_topk
         self.add_bias = config.add_bias_linear
+        self.memory_efficient_permute = (
+            config.recompute_granularity == 'selective'
+            and "moe_permute" in config.recompute_modules
+        )
 
         # self.global_local_map: 2D tensor. A mask of mapping between global and local tokens where
         # each element is True if it's between the local_expert_indices. Only useful when cross
@@ -299,7 +303,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 hidden_states,
                 self.local_map,
                 num_out_tokens=tokens_per_expert.sum().item(),
-                fused=self.config.moe_permute_fusion,
+                fused=self.config.moe_permute_fusion and not self.memory_efficient_permute,
             )
         )
 
@@ -323,7 +327,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.local_map,
-            fused=self.config.moe_permute_fusion,
+            fused=self.config.moe_permute_fusion and not self.memory_efficient_permute,
         )
         return unpermuted_local_hidden
 
@@ -382,6 +386,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         super().__init__(config=config, pg_collection=pg_collection)
         self.num_local_experts = num_local_experts
+        self.memory_efficient_permute = (
+            config.recompute_granularity == 'selective'
+            and "moe_permute" in config.recompute_modules
+        )
         assert config.num_moe_experts is not None
         self.num_experts = config.num_moe_experts
         assert self.num_local_experts > 0, "Expected at least one expert"
@@ -580,7 +588,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(
                 -1, self.num_local_experts
             )
-            if not self.config.moe_permute_fusion:
+            if not self.config.moe_permute_fusion or self.memory_efficient_permute:
                 # A synchronization is needed before permutation 2
                 # to get the `num_global_tokens_per_local_expert` CPU value.
                 self._maybe_update_cuda_sync_point("before_permutation_2")
@@ -643,7 +651,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.routing_map,
             probs=probs,
             num_out_tokens=self.num_out_tokens,
-            fused=self.config.moe_permute_fusion,
+            fused=self.config.moe_permute_fusion and not self.memory_efficient_permute,
             drop_and_pad=self.drop_and_pad,
         )
         return permutated_local_input_tokens, permuted_probs
@@ -739,7 +747,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     self.num_global_tokens_per_local_expert.ravel(),
                     self.sort_input_by_local_experts,
                     probs=global_probs,
-                    fused=self.config.moe_permute_fusion,
+                    fused=self.config.moe_permute_fusion and not self.memory_efficient_permute,
                 )
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -773,7 +781,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     hidden_states,
                     self.num_global_tokens_per_local_expert.T.ravel(),
                     self.restore_output_by_local_experts,
-                    fused=self.config.moe_permute_fusion,
+                    fused=self.config.moe_permute_fusion and not self.memory_efficient_permute,
                 )
 
         if self.tp_size > 1:
@@ -840,7 +848,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.routing_map,
-            fused=self.config.moe_permute_fusion,
+            fused=self.config.moe_permute_fusion and not self.memory_efficient_permute,
             drop_and_pad=self.drop_and_pad,
         )
 
@@ -893,7 +901,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     self.num_out_tokens = maybe_move_tensor_to_cpu(
                         self.num_out_tokens, record_stream=on_side_stream
                     )
-                    if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
+                    if self.num_local_experts > 1 and (
+                        not self.config.moe_permute_fusion or self.memory_efficient_permute
+                    ):
                         self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
                             self.num_global_tokens_per_local_expert, record_stream=on_side_stream
                         )
@@ -1143,6 +1153,10 @@ class _DeepepManager(_DispatchManager):
         self.router_dtype = config.moe_router_dtype
         self.capacity_factor = config.moe_expert_capacity_factor
         self.permute_fusion = config.moe_permute_fusion
+        self.memory_efficient_permute = (
+            config.recompute_granularity == 'selective'
+            and "moe_permute" in config.recompute_modules
+        )
 
         # Metadata
         self.token_indices: Optional[torch.Tensor] = None
@@ -1311,7 +1325,7 @@ class _DeepepManager(_DispatchManager):
             self.dispatched_routing_map,
             probs=self.dispatched_probs,
             num_out_tokens=self.tokens_per_expert.sum().item(),
-            fused=self.permute_fusion,
+            fused=self.permute_fusion and not self.memory_efficient_permute,
             tokens_per_expert=self.tokens_per_expert,
             align_size=get_align_size_for_quantization(self.config),
         )
@@ -1325,7 +1339,7 @@ class _DeepepManager(_DispatchManager):
             self.reversed_mapping_for_combine,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.dispatched_routing_map,
-            fused=self.permute_fusion,
+            fused=self.permute_fusion and not self.memory_efficient_permute,
             pad_offsets=self.pad_offsets,
         )
         return hidden_states

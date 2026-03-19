@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import gc
+
 import pytest
 import torch
 
@@ -9,7 +11,10 @@ from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import (
     MoEModelTestContainer,
     permute_fusion_params,
+    token_permutation,
+    token_unpermutation,
 )
+from megatron.core.typed_torch import apply_module
 
 
 def test_placeholder():
@@ -94,6 +99,109 @@ class TestAlltoAllDispatcher:
             moe_permute_fusion=permute_fusion,
         )
         container.dispatcher_drop_and_pad_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not is_te_min_version("2.1.0"), reason="TE 2.1.0 is required for permute fusion."
+    )
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1)])
+    def test_memory_efficient_permute(self, tp_size, ep_size):
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_permute_fusion=True,
+            recompute_granularity="selective",
+            recompute_modules=["moe_permute"],
+        )
+        container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not is_te_min_version("2.1.0"), reason="TE 2.1.0 is required for permute fusion."
+    )
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
+    def test_memory_efficient_permute_saves_memory(self, tp_size, ep_size):
+        """Verify that memory_efficient_permute reduces peak GPU memory."""
+
+        def _run_forward_backward(container):
+            moe_layer = container.moe_layer
+            bs, seql = 32, 8
+            hidden_states = torch.randn(
+                (bs, seql, moe_layer.config.hidden_size), dtype=torch.float32
+            ).cuda()
+            hidden_states.requires_grad = True
+            probs, indices = apply_module(moe_layer.router)(hidden_states)
+            probs = torch.ones_like(probs) / moe_layer.router.topk
+
+            permuted_states, tokens_per_expert, permuted_probs = token_permutation(
+                moe_layer.token_dispatcher, hidden_states, probs, indices
+            )
+            permuted_states = permuted_states * permuted_probs.unsqueeze(-1)
+            restored, _ = token_unpermutation(moe_layer.token_dispatcher, permuted_states)
+            torch.autograd.backward(restored, torch.ones_like(restored))
+
+        # --- Baseline: fused permute (no memory_efficient_permute) ---
+        baseline_container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_permute_fusion=True,
+        )
+        # Warm-up run to stabilize allocator
+        _run_forward_backward(baseline_container)
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        _run_forward_backward(baseline_container)
+        torch.cuda.synchronize()
+        baseline_peak = torch.cuda.max_memory_allocated()
+        del baseline_container
+        Utils.destroy_model_parallel()
+
+        # --- Optimized: memory_efficient_permute ---
+        opt_container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_permute_fusion=True,
+            recompute_granularity="selective",
+            recompute_modules=["moe_permute"],
+        )
+        # Warm-up run to stabilize allocator
+        _run_forward_backward(opt_container)
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        _run_forward_backward(opt_container)
+        torch.cuda.synchronize()
+        opt_peak = torch.cuda.max_memory_allocated()
+        del opt_container
+        Utils.destroy_model_parallel()
+
+        saved_bytes = baseline_peak - opt_peak
+        assert saved_bytes > 0, (
+            f"Expected memory reduction with memory_efficient_permute, but "
+            f"baseline_peak={baseline_peak / (1024**2):.2f}MiB, "
+            f"opt_peak={opt_peak / (1024**2):.2f}MiB, "
+            f"saved={saved_bytes / (1024**2):.2f}MiB"
+        )
 
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"), reason="TE 1.7.0 is required for MoE with FP8."

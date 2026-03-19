@@ -482,10 +482,13 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "moe_permute", "layernorm", "mla_up_proj", "mlp", "moe",
+        "shared_experts".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
+    "moe_permute": use memory-efficient (unfused) permute/unpermute in MoE token dispatchers,
+        avoiding saving the large permuted activation tensor for backward.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
@@ -1350,6 +1353,7 @@ class TransformerConfig(ModelParallelConfig):
                 allowed_modules = {
                     "core_attn",
                     "moe_act",
+                    "moe_permute",
                     "layernorm",
                     "mla_up_proj",
                     "mlp",

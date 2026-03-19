@@ -93,6 +93,8 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            recompute_granularity=kwargs.get("recompute_granularity", None),
+            recompute_modules=kwargs.get("recompute_modules", None),
         )
 
         # init moe layer
