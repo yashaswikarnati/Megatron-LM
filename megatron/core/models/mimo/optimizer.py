@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedObject
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -110,6 +111,7 @@ class MimoOptimizer(MegatronOptimizer):
 
     @property
     def param_groups(self) -> List[dict]:
+        """Aggregate param groups from all active optimizers."""
         groups = []
         for opt in self._active_optimizers:
             groups.extend(opt.param_groups)
@@ -124,22 +126,70 @@ class MimoOptimizer(MegatronOptimizer):
         }
 
     def load_state_dict(self, state_dict: Dict):
+        """Load per-module optimizer state dicts."""
         for name, info in self.module_infos.items():
-            if info.is_active and info.optimizer and state_dict.get(name):
-                info.optimizer.load_state_dict(state_dict[name])
+            if not (info.is_active and info.optimizer):
+                continue
+            module_sd = state_dict.get(name)
+            if module_sd is None:
+                continue
+            info.optimizer.load_state_dict(module_sd)
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
+        """Build sharded state dict for all per-module optimizers.
+
+        Wraps non-sharded optimizer metadata (param_groups, step, grad_scaler)
+        as ShardedObject so it goes through the sharded file path instead of
+        common.pt. Uses the same key/replica_id pattern as DistributedOptimizer's
+        dp_zero_gather_scatter path, but keeps fully_sharded_model_space for
+        param state tensors (preserving reshardability).
+
+        All ranks produce the same dict key structure (empty {} for inactive
+        modules) to avoid common state divergence across ranks.
+        """
         sharded_state = {}
         for name, info in self.module_infos.items():
             if info.is_active and info.optimizer:
-                sharded_state[name] = info.optimizer.sharded_state_dict(
+                module_sd = info.optimizer.sharded_state_dict(
                     model_sharded_state_dict, is_loading, **kwargs
                 )
+                # Wrap plain values as ShardedObject keyed by module name.
+                # Uses per-module optimizer's DP group for replica_id so only
+                # dp_rank=0 writes, others are replicas. Key includes module
+                # name for uniqueness across modules on different ranks.
+                dp_rank = (
+                    info.pg_collection.dp.rank()
+                    if info.pg_collection and info.pg_collection.dp
+                    else 0
+                )
+                for key, val in list(module_sd.items()):
+                    if not isinstance(val, ShardedBase) and not _has_sharded_base(val):
+                        module_sd[key] = ShardedObject(
+                            f'optimizer.mimo.{name}.{key}',
+                            val,
+                            (1,),
+                            (0,),
+                            replica_id=(0, 0, dp_rank),
+                        )
+                sharded_state[name] = module_sd
+            else:
+                sharded_state[name] = {}
         return sharded_state
 
     def reload_model_params(self, state_dict=None):
         for opt in self._active_optimizers:
             opt.reload_model_params(state_dict)
+
+
+def _has_sharded_base(obj) -> bool:
+    """Check if a nested structure contains any ShardedBase instances."""
+    if isinstance(obj, ShardedBase):
+        return True
+    if isinstance(obj, dict):
+        return any(_has_sharded_base(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_sharded_base(v) for v in obj)
+    return False
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
@@ -189,11 +239,10 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
 
 def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
     """Create optimizer for MimoModel with heterogeneous parallelism."""
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
     from megatron.core.optimizer import get_megatron_optimizer
 
     grid_map = mimo_model.mimo_config.module_to_grid_map
-    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-
     lang_key = MIMO_LANGUAGE_MODULE_KEY
 
     module_infos: Dict[str, ModuleOptimizerInfo] = {}
