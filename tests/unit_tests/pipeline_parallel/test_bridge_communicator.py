@@ -485,3 +485,158 @@ class TestBridgeCommunicator:
         assert (
             dest_leaders == expected_dest_leaders
         ), f"Dest leaders: Expected {expected_dest_leaders}, got {dest_leaders}"
+
+
+class TestBridgeCommunicator2DTensors:
+    """Tests for 2D tensor communication through bridge with asymmetric DP.
+
+    These tests verify that tensor_ndim=2 enables correct fan-in and fan-out
+    for 2D tensors [B*S, H] where batch is folded into dim 0.
+
+    Requires 4 GPUs: grid1 uses ranks 0-1, grid2 uses ranks 2-3.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        cls.world_size = dist.get_world_size()
+        if cls.world_size != 4:
+            pytest.skip(
+                f"These tests require 4 GPUs, but {cls.world_size} are available.",
+                allow_module_level=True,
+            )
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        destroy_all_grids()
+
+    def test_2d_fan_in_forward(self):
+        """Fan-in forward: 2 src DP ranks → 1 dest DP group.
+
+        Src grid: TP=1, DP=2 (ranks 0,1), each sends [577, 128]
+        Dest grid: TP=2, DP=1 (ranks 2,3), receives cat → [1154, 128]
+        """
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=2)
+        dest_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=1, dp=1)
+        dim_mapping = {'s': 0, 'h': 2, 'b': 1}
+        bridge = BridgeCommunicator(
+            src_grid, dest_grid, dim_mapping=dim_mapping, comm_dtype=torch.float32, tensor_ndim=2
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(src_grid):
+            # Each src rank sends a 2D tensor [577, 128] with unique values
+            tensor = torch.full((577, 128), float(rank + 1), device='cuda')
+            bridge.send_forward(tensor)
+        else:
+            received = bridge.recv_forward()
+            # Fan-in: 2 × [577, 128] → cat(dim=0) → [1154, 128]
+            assert received.shape == (1154, 128), f"Expected (1154, 128), got {received.shape}"
+            # First 577 rows from rank 0 (value 1.0), next 577 from rank 1 (value 2.0)
+            assert received[:577].mean().item() == pytest.approx(1.0)
+            assert received[577:].mean().item() == pytest.approx(2.0)
+
+    def test_2d_fan_in_backward(self):
+        """Fan-in backward: 1 dest DP group sends grad back to 2 src DP ranks.
+
+        Dest grid (ranks 2,3) sends [1154, 128] grad.
+        Bridge splits along dim 0 → 2 × [577, 128] back to src ranks (0,1).
+        """
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=2)
+        dest_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=1, dp=1)
+        dim_mapping = {'s': 0, 'h': 2, 'b': 1}
+        bridge = BridgeCommunicator(
+            src_grid, dest_grid, dim_mapping=dim_mapping, comm_dtype=torch.float32, tensor_ndim=2
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(dest_grid):
+            grad = torch.cat(
+                [
+                    torch.full((577, 128), 1.0, device='cuda'),
+                    torch.full((577, 128), 2.0, device='cuda'),
+                ],
+                dim=0,
+            )
+            bridge.send_backward(grad)
+        else:
+            received = bridge.recv_backward()
+            assert received.shape == (577, 128), f"Expected (577, 128), got {received.shape}"
+            expected_val = float(rank + 1)
+            assert received.mean().item() == pytest.approx(expected_val)
+
+    def test_2d_fan_out_forward(self):
+        """Fan-out forward: 1 src DP group → 2 dest DP ranks.
+
+        Src grid: TP=2, DP=1 (ranks 0,1), sends [1154, 128]
+        Dest grid: TP=1, DP=2 (ranks 2,3), each receives [577, 128]
+        """
+        src_grid = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=1)
+        dest_grid = create_hypercomm_grid(offset=2, tp=1, cp=1, pp=1, dp=2)
+        dim_mapping = {'s': 0, 'h': 2, 'b': 1}
+        bridge = BridgeCommunicator(
+            src_grid, dest_grid, dim_mapping=dim_mapping, comm_dtype=torch.float32, tensor_ndim=2
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(src_grid):
+            tensor = torch.cat(
+                [
+                    torch.full((577, 128), 1.0, device='cuda'),
+                    torch.full((577, 128), 2.0, device='cuda'),
+                ],
+                dim=0,
+            )
+            bridge.send_forward(tensor)
+        else:
+            received = bridge.recv_forward()
+            assert received.shape == (577, 128), f"Expected (577, 128), got {received.shape}"
+            expected_val = float(rank - 1)
+            assert received.mean().item() == pytest.approx(expected_val)
+
+    def test_2d_fan_out_backward(self):
+        """Fan-out backward: 2 dest DP ranks send grads back to 1 src DP group.
+
+        Dest ranks (2,3) each send [577, 128]. Bridge cat(dim=0) → [1154, 128].
+        """
+        src_grid = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=1)
+        dest_grid = create_hypercomm_grid(offset=2, tp=1, cp=1, pp=1, dp=2)
+        dim_mapping = {'s': 0, 'h': 2, 'b': 1}
+        bridge = BridgeCommunicator(
+            src_grid, dest_grid, dim_mapping=dim_mapping, comm_dtype=torch.float32, tensor_ndim=2
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(dest_grid):
+            grad = torch.full((577, 128), float(rank - 1), device='cuda')
+            bridge.send_backward(grad)
+        else:
+            received = bridge.recv_backward()
+            assert received.shape == (1154, 128), f"Expected (1154, 128), got {received.shape}"
+            assert received[:577].mean().item() == pytest.approx(1.0)
+            assert received[577:].mean().item() == pytest.approx(2.0)
+
+    def test_2d_send_forward_recv_backward(self):
+        """Combined send_forward_recv_backward with 2D tensors and fan-in."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=2)
+        dest_grid = create_hypercomm_grid(offset=2, tp=2, cp=1, pp=1, dp=1)
+        dim_mapping = {'s': 0, 'h': 2, 'b': 1}
+        bridge = BridgeCommunicator(
+            src_grid, dest_grid, dim_mapping=dim_mapping, comm_dtype=torch.float32, tensor_ndim=2
+        )
+
+        rank = dist.get_rank()
+        if bridge.is_current_rank_in_grid(src_grid):
+            tensor = torch.full((577, 128), float(rank + 1), device='cuda')
+            grad = bridge.send_forward_recv_backward(tensor)
+            assert grad.shape == (577, 128), f"Expected (577, 128), got {grad.shape}"
+        else:
+            grad = torch.randn(1154, 128, device='cuda')
+            activation = bridge.send_backward_recv_forward(grad)
+            assert activation.shape == (1154, 128), f"Expected (1154, 128), got {activation.shape}"
