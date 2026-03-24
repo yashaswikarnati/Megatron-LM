@@ -115,10 +115,9 @@ class MimoModel(MegatronModule):
                 inner = module.module if isinstance(module, DistributedDataParallel) else module
                 pg = getattr(inner, 'pg_collection', None)
                 mod_metadata = metadata
-                if pg and hasattr(pg, 'dp_cp') and pg.dp_cp is not None:
-                    if mod_metadata is None or 'dp_cp_group' not in mod_metadata:
-                        mod_metadata = dict(mod_metadata) if mod_metadata else {}
-                        mod_metadata['dp_cp_group'] = pg.dp_cp
+                if pg and getattr(pg, 'dp_cp', None) is not None:
+                    mod_metadata = dict(metadata) if metadata else {}
+                    mod_metadata.setdefault('dp_cp_group', pg.dp_cp)
                 sharded_sd.update(
                     sharded_state_dict_default(
                         module, f'{prefix}{name}.', sharded_offsets, mod_metadata

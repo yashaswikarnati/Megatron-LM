@@ -2,12 +2,13 @@
 
 """Optimizer for MIMO models with heterogeneous parallelism."""
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -126,26 +127,59 @@ class MimoOptimizer(MegatronOptimizer):
         }
 
     def load_state_dict(self, state_dict: Dict):
-        """Load per-module optimizer state dicts."""
+        """Load per-module optimizer state dicts.
+
+        Reassembles param_groups and grad_scaler that were extracted and saved
+        as ShardedObjects by sharded_state_dict(), then delegates to each
+        per-module optimizer's load_state_dict.
+        """
         for name, info in self.module_infos.items():
             if not (info.is_active and info.optimizer):
                 continue
             module_sd = state_dict.get(name)
             if module_sd is None:
                 continue
+
+            # Reassemble param_groups from the ShardedObject we saved separately.
+            # The saved groups have params=[] since LocalNonpersistentObject was
+            # stripped at save time. Restore params from the current optimizer's
+            # param_groups (these are runtime-local param IDs).
+            if '_mimo_param_groups' in module_sd:
+                opt_key = _get_optimizer_key(module_sd)
+                loaded_pg = module_sd.pop('_mimo_param_groups')
+                current_pg = info.optimizer.optimizer.state_dict()['param_groups']
+                if len(loaded_pg) != len(current_pg):
+                    raise ValueError(
+                        f"Optimizer '{name}': checkpoint has {len(loaded_pg)} param_groups "
+                        f"but current optimizer has {len(current_pg)}"
+                    )
+                for loaded_g, current_g in zip(loaded_pg, current_pg):
+                    loaded_g['params'] = current_g['params']
+                module_sd[opt_key]['param_groups'] = loaded_pg
+
+            if '_mimo_grad_scaler' in module_sd:
+                module_sd['grad_scaler'] = module_sd.pop('_mimo_grad_scaler')
+
             info.optimizer.load_state_dict(module_sd)
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
         """Build sharded state dict for all per-module optimizers.
 
-        Wraps non-sharded optimizer metadata (param_groups, step, grad_scaler)
-        as ShardedObject so it goes through the sharded file path instead of
-        common.pt. Uses the same key/replica_id pattern as DistributedOptimizer's
-        dp_zero_gather_scatter path, but keeps fully_sharded_model_space for
-        param state tensors (preserving reshardability).
+        Extracts param_groups and grad_scaler from each per-module optimizer's
+        state dict and wraps them as ShardedObjects so they go through the
+        distributed save path instead of common.pt.
+
+        This is necessary because common.pt is only written by global rank 0,
+        which in non-colocated MiMo is always the encoder's rank 0. Without
+        this, the LLM optimizer's param_groups and grad_scaler would never be
+        saved (NMFW-33 Issue 3).
+
+        param_groups contain runtime-local param IDs (wrapped as
+        LocalNonpersistentObject) that must not be persisted. We strip those
+        before wrapping, and restore them from the current optimizer on load.
 
         All ranks produce the same dict key structure (empty {} for inactive
-        modules) to avoid common state divergence across ranks.
+        modules) to keep the state dict structure consistent across ranks.
         """
         sharded_state = {}
         for name, info in self.module_infos.items():
@@ -153,24 +187,31 @@ class MimoOptimizer(MegatronOptimizer):
                 module_sd = info.optimizer.sharded_state_dict(
                     model_sharded_state_dict, is_loading, **kwargs
                 )
-                # Wrap plain values as ShardedObject keyed by module name.
-                # Uses per-module optimizer's DP group for replica_id so only
-                # dp_rank=0 writes, others are replicas. Key includes module
-                # name for uniqueness across modules on different ranks.
-                dp_rank = (
-                    info.pg_collection.dp.rank()
-                    if info.pg_collection and info.pg_collection.dp
-                    else 0
-                )
-                for key, val in list(module_sd.items()):
-                    if not isinstance(val, ShardedBase) and not _has_sharded_base(val):
-                        module_sd[key] = ShardedObject(
-                            f'optimizer.mimo.{name}.{key}',
-                            val,
-                            (1,),
-                            (0,),
-                            replica_id=(0, 0, dp_rank),
-                        )
+                replica_id = _get_replica_id(info.pg_collection)
+
+                # Extract param_groups from the optimizer sub-dict and wrap
+                # as ShardedObject. Strip runtime-local param IDs first.
+                opt_key = _get_optimizer_key(module_sd)
+                opt_sub = module_sd.get(opt_key)
+                if isinstance(opt_sub, dict) and 'param_groups' in opt_sub:
+                    pg = deepcopy(opt_sub['param_groups'])
+                    for group in pg:
+                        group['params'] = []
+                    module_sd['_mimo_param_groups'] = ShardedObject(
+                        f'optimizer.mimo.{name}.param_groups', pg, (1,), (0,), replica_id=replica_id
+                    )
+                    del opt_sub['param_groups']
+
+                # Extract grad_scaler similarly.
+                if 'grad_scaler' in module_sd and module_sd['grad_scaler'] is not None:
+                    module_sd['_mimo_grad_scaler'] = ShardedObject(
+                        f'optimizer.mimo.{name}.grad_scaler',
+                        module_sd.pop('grad_scaler'),
+                        (1,),
+                        (0,),
+                        replica_id=replica_id,
+                    )
+
                 sharded_state[name] = module_sd
             else:
                 sharded_state[name] = {}
@@ -181,15 +222,27 @@ class MimoOptimizer(MegatronOptimizer):
             opt.reload_model_params(state_dict)
 
 
-def _has_sharded_base(obj) -> bool:
-    """Check if a nested structure contains any ShardedBase instances."""
-    if isinstance(obj, ShardedBase):
-        return True
-    if isinstance(obj, dict):
-        return any(_has_sharded_base(v) for v in obj.values())
-    if isinstance(obj, (list, tuple)):
-        return any(_has_sharded_base(v) for v in obj)
-    return False
+def _get_optimizer_key(state_dict: Dict) -> str:
+    """Return the optimizer sub-dict key ('optimizer' or legacy 'optimizer_state_dict')."""
+    if 'optimizer' in state_dict:
+        return 'optimizer'
+    return 'optimizer_state_dict'
+
+
+def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
+    """Build replica_id tuple for ShardedObject deduplication.
+
+    Includes pp_rank so only one PP stage writes the metadata,
+    and dp_rank so only dp_rank=0 writes (others are replicas).
+    """
+    assert pg_collection is not None, "pg_collection required for checkpoint replica_id"
+    assert (
+        hasattr(pg_collection, 'pp') and pg_collection.pp is not None
+    ), "pg_collection.pp must be set for checkpoint deduplication"
+    assert (
+        hasattr(pg_collection, 'dp') and pg_collection.dp is not None
+    ), "pg_collection.dp must be set for checkpoint deduplication"
+    return (0, pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
@@ -220,10 +273,11 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     """
     pg = ProcessGroupCollection()
 
-    # Core groups needed by optimizer
+    # Core groups needed by optimizer and checkpointing
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
     pg.tp = grid.get_pg("tp")
+    pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
 
     # Expert groups
