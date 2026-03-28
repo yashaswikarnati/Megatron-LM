@@ -1,0 +1,7 @@
+# Fan-out: encoder TP4/DP2, LLM TP2/DP4, PP=1
+experiment:
+  name: "fan_out_enc_tp4dp2_llm_tp2dp4"
+
+parallelism:
+  encoder: { tp: 4, dp: 2 }
+  llm: { tp: 2, dp: 4 }

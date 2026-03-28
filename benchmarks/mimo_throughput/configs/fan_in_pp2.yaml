@@ -1,0 +1,10 @@
+# Fan-in with LLM PP=2: encoder TP2/DP4, LLM TP2/DP2/PP2
+experiment:
+  name: "fan_in_enc_tp2dp4_llm_tp2dp2pp2"
+
+parallelism:
+  encoder: { tp: 2, dp: 4 }
+  llm: { tp: 2, dp: 2, pp: 2 }
+
+data:
+  micro_batch_size: 2  # GBS=4 must be divisible by enc_dp=4
