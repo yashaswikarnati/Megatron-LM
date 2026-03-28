@@ -11,7 +11,9 @@ from .config import (
     BenchmarkConfig,
     DataSpec,
     ExperimentSpec,
+    MemorySpec,
     ModuleArch,
+    ModuleMemorySpec,
     ParallelSpec,
 )
 
@@ -48,6 +50,14 @@ def _build_config(raw: dict) -> BenchmarkConfig:
 
     data = DataSpec(**raw["data"])
 
+    # Parse optional memory optimization section
+    memory = None
+    if "memory" in raw:
+        mem_raw = raw["memory"]
+        enc_mem = ModuleMemorySpec(**mem_raw["encoder"]) if "encoder" in mem_raw else None
+        llm_mem = ModuleMemorySpec(**mem_raw["llm"]) if "llm" in mem_raw else None
+        memory = MemorySpec(encoder=enc_mem, llm=llm_mem)
+
     return BenchmarkConfig(
         experiment=experiment,
         encoder_arch=encoder_arch,
@@ -55,6 +65,7 @@ def _build_config(raw: dict) -> BenchmarkConfig:
         encoder_parallel=encoder_parallel,
         llm_parallel=llm_parallel,
         data=data,
+        memory=memory,
     )
 
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.mimo.config.memory_config import ModuleMemoryConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
@@ -45,3 +46,4 @@ class MimoModelConfig:
     special_token_ids: Dict[str, int] = field(default_factory=dict)
     module_to_grid_map: Optional[Dict[str, HyperCommGrid]] = None
     kv_format: str = "sbhd"
+    memory_config: Optional[Dict[str, ModuleMemoryConfig]] = None

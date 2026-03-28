@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
 
@@ -67,6 +71,11 @@ class ModalitySubmodules(ABC, nn.Module):
         self.pg_collection = pg_collection
         self._is_first_stage: bool = is_first_stage
         self._is_last_stage: bool = is_last_stage
+
+        # Memory optimization flags — set by MimoModel._initialize_submodules()
+        self.recompute_projection: bool = False
+        self.offload_projection: bool = False
+        self.offload_encoder_output: bool = False
 
         warnings.warn(
             "ModalitySubmodules is experimental and still under active development. "
@@ -283,7 +292,21 @@ class ModalitySubmodules(ABC, nn.Module):
 
         if projections:
             projection = projections[0]
-            projected = projection(combined)
+
+            if self.recompute_projection and self.training:
+                projected = activation_checkpoint(projection, combined, use_reentrant=False)
+            elif self.offload_projection and self.training:
+                off_interface = FineGrainedActivationOffloadingInterface(
+                    True, combined, "vision_projection"
+                )
+                with off_interface as combined:
+                    projected = projection(combined)
+                projected = off_interface.group_commit(
+                    projected, "vision_projection", forced_released_tensors=[combined]
+                )
+            else:
+                projected = projection(combined)
+
             logger.debug(f"Post-projection embeddings shape: {projected.shape}")
             return projected
 
@@ -310,10 +333,27 @@ class ModalitySubmodules(ABC, nn.Module):
         if self.is_first_stage:
             if encoder_inputs is None:
                 return None
-            embeddings = self.encode(encoder_inputs)
-            if not embeddings:
-                return None
-            combined = self.combine_embeddings(embeddings)
+
+            if self.offload_encoder_output and self.training:
+                # Offload the encoder's saved-for-backward tensors to CPU.
+                # We use a dummy scalar as the interface input since the actual
+                # encoder inputs are a dict (not a single tensor).  The interface
+                # intercepts all save_for_backward calls inside the with-block.
+                dummy = torch.tensor(0.0, device='cuda', requires_grad=False)
+                off_interface = FineGrainedActivationOffloadingInterface(
+                    True, dummy, "vision_encoder_output"
+                )
+                with off_interface as _:
+                    embeddings = self.encode(encoder_inputs)
+                    if not embeddings:
+                        return None
+                    combined = self.combine_embeddings(embeddings)
+                combined = off_interface.group_commit(combined, "vision_encoder_output")
+            else:
+                embeddings = self.encode(encoder_inputs)
+                if not embeddings:
+                    return None
+                combined = self.combine_embeddings(embeddings)
         else:
             if hidden_states is None:
                 return None

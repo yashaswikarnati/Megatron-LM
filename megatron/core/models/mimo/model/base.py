@@ -9,7 +9,7 @@ from torch.profiler import record_function
 
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
-from megatron.core.models.mimo.config import MimoModelConfig
+from megatron.core.models.mimo.config import MimoModelConfig, ModuleMemoryConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -112,6 +112,9 @@ class MimoModel(MegatronModule):
                 tp_group=tp_group,
             )
             self.partition_adapter = PartitionAdapter(partition_config)
+
+        # Apply memory optimization config before building modules
+        self._apply_memory_config()
 
         # Initialize modality submodules from specifications
         self.modality_submodules = torch.nn.ModuleDict()
@@ -251,6 +254,13 @@ class MimoModel(MegatronModule):
             submodule = submodule_class.from_spec(
                 submodule_spec, is_first_stage=is_first_stage, is_last_stage=is_last_stage
             )
+
+            # Apply MIMO-specific memory flags to submodule
+            modality_mcfg = self._modality_memory_configs.get(modality_name)
+            if modality_mcfg is not None:
+                submodule.recompute_projection = modality_mcfg.recompute_projection
+                submodule.offload_projection = modality_mcfg.offload_projection
+                submodule.offload_encoder_output = modality_mcfg.offload_encoder_output
 
             self.modality_submodules[modality_name] = submodule
 
@@ -565,6 +575,59 @@ class MimoModel(MegatronModule):
                         src_module_name=mod_name,
                         dest_module_name=lang_key,
                     )
+
+    def _apply_memory_config(self):
+        """Apply ModuleMemoryConfig to each module's TransformerConfig.
+
+        Stamps recompute/offload fields from memory_config onto each module's
+        TransformerConfig before module construction.  MIMO-specific flags
+        (recompute_projection, offload_projection, offload_encoder_output) are
+        stored on self for later use by ModalitySubmodules.
+        """
+        mem_cfg = self.mimo_config.memory_config
+        if not mem_cfg:
+            self._modality_memory_configs = {}
+            return
+
+        self._modality_memory_configs = {}
+
+        for module_name, mcfg in mem_cfg.items():
+            if module_name == MIMO_LANGUAGE_MODULE_KEY:
+                tc = self.mimo_config.language_model_spec.params['config']
+            else:
+                # Encoder module — find the TransformerConfig in the encoder spec
+                submodule_spec = self.mimo_config.modality_submodules_spec.get(module_name)
+                if submodule_spec is None:
+                    logger.warning(
+                        f"memory_config key '{module_name}' not found in modality_submodules_spec"
+                    )
+                    continue
+                # Encoder config is in the encoder spec's params
+                encoder_specs = (submodule_spec.submodules or {}).get('encoders', {})
+                for enc_spec in (
+                    encoder_specs.values() if isinstance(encoder_specs, dict) else [encoder_specs]
+                ):
+                    enc_tc = getattr(enc_spec, 'params', {}).get('config')
+                    if enc_tc is not None:
+                        self._stamp_transformer_config(enc_tc, mcfg)
+                # Store MIMO-specific flags for this modality
+                self._modality_memory_configs[module_name] = mcfg
+                continue
+
+            self._stamp_transformer_config(tc, mcfg)
+
+    @staticmethod
+    def _stamp_transformer_config(tc, mcfg: ModuleMemoryConfig):
+        """Stamp recompute/offload fields from ModuleMemoryConfig onto a TransformerConfig."""
+        if mcfg.recompute_granularity is not None:
+            tc.recompute_granularity = mcfg.recompute_granularity
+            tc.recompute_method = mcfg.recompute_method
+            tc.recompute_num_layers = mcfg.recompute_num_layers
+            if mcfg.recompute_modules is not None:
+                tc.recompute_modules = mcfg.recompute_modules
+        if mcfg.offload_modules is not None:
+            tc.fine_grained_activation_offloading = True
+            tc.offload_modules = mcfg.offload_modules
 
     def _apply_colocated_comms(self, modality_embeddings):
         """Transform encoder embeddings from encoder TP/DP to LLM TP/DP layout."""

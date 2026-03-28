@@ -2,7 +2,8 @@
 
 """Frozen dataclasses for MIMO throughput benchmark configuration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,36 @@ class ExperimentSpec:
 
 
 @dataclass(frozen=True)
+class ModuleMemorySpec:
+    """Memory optimization for one module (encoder or LLM).
+
+    Fields map 1:1 to ModuleMemoryConfig.  None/empty means "leave default".
+    """
+
+    # Recompute (TransformerLayer internals)
+    recompute_granularity: Optional[str] = None
+    recompute_method: Optional[str] = None
+    recompute_num_layers: Optional[int] = None
+    recompute_modules: Optional[List[str]] = None
+
+    # Fine-grained offload (TransformerLayer internals)
+    offload_modules: Optional[List[str]] = None
+
+    # MIMO inter-module boundary
+    recompute_projection: bool = False
+    offload_projection: bool = False
+    offload_encoder_output: bool = False
+
+
+@dataclass(frozen=True)
+class MemorySpec:
+    """Per-module memory optimization config for the benchmark."""
+
+    encoder: Optional[ModuleMemorySpec] = None
+    llm: Optional[ModuleMemorySpec] = None
+
+
+@dataclass(frozen=True)
 class BenchmarkConfig:
     """Top-level benchmark configuration combining all specs."""
 
@@ -59,6 +90,7 @@ class BenchmarkConfig:
     encoder_parallel: ParallelSpec
     llm_parallel: ParallelSpec
     data: DataSpec
+    memory: Optional[MemorySpec] = None
 
     @property
     def llm_has_pp(self) -> bool:
