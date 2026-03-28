@@ -121,6 +121,8 @@ def aggregate_results_csv(results_dir: str, output_path: str = None):
             'median_samples_per_sec': _fmt(summary.get('median_samples_per_sec')),
             'median_elapsed_sec': _fmt(summary.get('median_elapsed_sec')),
             'max_memory_gb': _fmt(summary.get('max_memory_gb')),
+            'median_fwd_bwd_ms': _fmt(summary.get('median_fwd_bwd_ms')),
+            'median_opt_step_ms': _fmt(summary.get('median_opt_step_ms')),
             'num_iterations': summary.get('num_iterations', ''),
         })
 
@@ -159,10 +161,32 @@ def main():
         default='./results',
         help='Output directory for results (default: ./results).',
     )
+    parser.add_argument(
+        '--profile',
+        action='store_true',
+        default=False,
+        help='Enable torch.profiler for the iterations specified by --profile-steps.',
+    )
+    parser.add_argument(
+        '--profile-steps',
+        type=str,
+        default=None,
+        help='Iteration range to profile, e.g. "5-7" (0-based). Requires --profile.',
+    )
     args = parser.parse_args()
 
     if not args.config and not args.configs_dir:
         parser.error("Provide either --config or --configs-dir")
+
+    # Parse --profile-steps into a tuple
+    profile_steps = None
+    if args.profile:
+        if args.profile_steps is None:
+            parser.error("--profile requires --profile-steps START-END (e.g. --profile-steps 5-7)")
+        parts = args.profile_steps.split('-')
+        if len(parts) != 2:
+            parser.error("--profile-steps must be in START-END format (e.g. 5-7)")
+        profile_steps = (int(parts[0]), int(parts[1]))
 
     # Initialize distributed (torch.distributed should already be initialized by torchrun)
     if not dist.is_initialized():
@@ -177,7 +201,9 @@ def main():
         config.validate()
         if rank == 0:
             logger.info(f"Running single experiment: {config.experiment.name}")
-        summary = run_benchmark(config)
+        summary = run_benchmark(
+            config, profile_steps=profile_steps, results_dir=args.results_dir
+        )
         if rank == 0:
             _save_result(summary, config, args.results_dir)
 
@@ -191,7 +217,9 @@ def main():
             cfg.validate()
             if rank == 0:
                 logger.info(f"--- Running experiment: {cfg.experiment.name} ---")
-            summary = run_benchmark(cfg)
+            summary = run_benchmark(
+                cfg, profile_steps=profile_steps, results_dir=args.results_dir
+            )
             if rank == 0:
                 _save_result(summary, cfg, args.results_dir)
 

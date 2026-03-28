@@ -12,6 +12,7 @@ are all handled here. The entry point is ``run_benchmark(config)``.
 import gc
 import logging
 import os
+import time
 from contextlib import ExitStack, contextmanager
 from functools import partial
 
@@ -405,7 +406,11 @@ def _compute_effective_mbs(config: BenchmarkConfig, encoder_grid, llm_grid):
     return mbs
 
 
-def run_benchmark(config: BenchmarkConfig) -> dict:
+def run_benchmark(
+    config: BenchmarkConfig,
+    profile_steps: tuple[int, int] | None = None,
+    results_dir: str = "./results",
+) -> dict:
     """Run benchmark for a single configuration.
 
     Creates grids, model, optimizer, and data iterator; runs the training loop;
@@ -413,6 +418,9 @@ def run_benchmark(config: BenchmarkConfig) -> dict:
 
     Args:
         config: Fully validated BenchmarkConfig.
+        profile_steps: Optional (start, end) tuple of 0-based iteration indices
+            to profile with torch.profiler. None means no profiling.
+        results_dir: Directory to save profiler output when profiling is enabled.
 
     Returns:
         Summary dict with median tflops_per_gpu, tokens_per_sec, etc.
@@ -471,8 +479,29 @@ def run_benchmark(config: BenchmarkConfig) -> dict:
     num_iterations = config.experiment.num_iterations
     optimizer.zero_grad()
 
+    # Set up optional torch.profiler context
+    profiler_ctx = None
+    if profile_steps is not None:
+        from torch.profiler import ProfilerActivity, profile
+
+        profiler_ctx = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        )
+
     for i in range(num_iterations):
+        # Enter profiler for the profiled range
+        in_profile_range = (
+            profile_steps is not None and profile_steps[0] <= i <= profile_steps[1]
+        )
+        if in_profile_range and i == profile_steps[0] and profiler_ctx is not None:
+            profiler_ctx.__enter__()
+
         monitor.start_iteration()
+
+        # --- Phase: forward_backward ---
+        torch.cuda.synchronize()
+        t_fwd_bwd_start = time.time()
 
         if config.llm_has_pp:
             from megatron.core.models.mimo.colocated_schedule import (
@@ -510,10 +539,20 @@ def run_benchmark(config: BenchmarkConfig) -> dict:
                 pg_collection=llm_pg,
             )
 
+        torch.cuda.synchronize()
+        t_fwd_bwd_ms = (time.time() - t_fwd_bwd_start) * 1000.0
+
+        # --- Phase: optimizer_step ---
+        torch.cuda.synchronize()
+        t_opt_start = time.time()
+
         optimizer.step()
         optimizer.zero_grad()
 
-        metrics = monitor.end_iteration()
+        torch.cuda.synchronize()
+        t_opt_ms = (time.time() - t_opt_start) * 1000.0
+
+        metrics = monitor.end_iteration(fwd_bwd_ms=t_fwd_bwd_ms, opt_step_ms=t_opt_ms)
 
         if rank == 0 and (i + 1) % config.experiment.log_interval == 0:
             warmup_tag = " (warmup)" if (i + 1) <= config.experiment.warmup_iterations else ""
@@ -521,8 +560,27 @@ def run_benchmark(config: BenchmarkConfig) -> dict:
                 f"Iter {metrics['iteration']}{warmup_tag}: "
                 f"{metrics['tflops_per_gpu']:.1f} TFLOPs/GPU, "
                 f"{metrics['tokens_per_sec']:.0f} tok/s, "
-                f"{metrics['max_memory_gb']:.1f} GB"
+                f"{metrics['max_memory_gb']:.1f} GB | "
+                f"fwd_bwd: {metrics['fwd_bwd_ms']:.1f}ms, "
+                f"opt: {metrics['opt_step_ms']:.1f}ms"
             )
+
+        # Exit profiler after the profiled range
+        if in_profile_range and i == profile_steps[1] and profiler_ctx is not None:
+            profiler_ctx.__exit__(None, None, None)
+            # Save profiler output
+            if rank == 0:
+                os.makedirs(results_dir, exist_ok=True)
+                prof_path = os.path.join(
+                    results_dir,
+                    f"{config.experiment.name}_profile_{profile_steps[0]}-{profile_steps[1]}.txt",
+                )
+                table = profiler_ctx.key_averages().table(
+                    sort_by="cuda_time_total", row_limit=30
+                )
+                with open(prof_path, 'w') as f:
+                    f.write(table)
+                print(f"Profiler output saved to {prof_path}")
 
     # 7. Summary
     summary = monitor.get_summary()

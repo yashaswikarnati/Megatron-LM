@@ -1,0 +1,7 @@
+# Homogeneous baseline: both modules at TP2/DP4.
+experiment:
+  name: "homo_tp2_dp4"
+
+parallelism:
+  encoder: { tp: 2, dp: 4 }
+  llm: { tp: 2, dp: 4 }

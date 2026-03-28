@@ -1,0 +1,11 @@
+# Homogeneous baseline: both modules at TP8/DP1.
+experiment:
+  name: "homo_tp8_dp1"
+
+parallelism:
+  encoder: { tp: 8, dp: 1 }
+  llm: { tp: 8, dp: 1 }
+
+data:
+  micro_batch_size: 8  # No DP, so GBS = mbs * 1
+  num_microbatches: 1

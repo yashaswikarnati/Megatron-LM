@@ -90,12 +90,18 @@ class PerformanceMonitor:
         torch.cuda.synchronize()
         self._iter_start = time.time()
 
-    def end_iteration(self) -> dict:
+    def end_iteration(
+        self, fwd_bwd_ms: float = 0.0, opt_step_ms: float = 0.0
+    ) -> dict:
         """Mark the end of a training iteration and record metrics.
+
+        Args:
+            fwd_bwd_ms: Wall-clock time for forward+backward pass in ms.
+            opt_step_ms: Wall-clock time for optimizer step + zero_grad in ms.
 
         Returns:
             Dict with iteration number, elapsed time, TFLOPs/GPU,
-            tokens/sec, samples/sec, and peak memory in GB.
+            tokens/sec, samples/sec, peak memory in GB, and phase timings.
         """
         torch.cuda.synchronize()
         elapsed = time.time() - self._iter_start
@@ -115,6 +121,8 @@ class PerformanceMonitor:
             'tokens_per_sec': tokens_per_sec,
             'samples_per_sec': samples_per_sec,
             'max_memory_gb': mem_gb,
+            'fwd_bwd_ms': fwd_bwd_ms,
+            'opt_step_ms': opt_step_ms,
         }
         self.history.append(metrics)
         return metrics
@@ -140,6 +148,8 @@ class PerformanceMonitor:
                 'median_samples_per_sec': 0.0,
                 'median_elapsed_sec': 0.0,
                 'max_memory_gb': 0.0,
+                'median_fwd_bwd_ms': 0.0,
+                'median_opt_step_ms': 0.0,
                 'num_iterations': 0,
             }
 
@@ -149,6 +159,8 @@ class PerformanceMonitor:
             'median_samples_per_sec': statistics.median(m['samples_per_sec'] for m in filtered),
             'median_elapsed_sec': statistics.median(m['elapsed_sec'] for m in filtered),
             'max_memory_gb': max(m['max_memory_gb'] for m in filtered),
+            'median_fwd_bwd_ms': statistics.median(m['fwd_bwd_ms'] for m in filtered),
+            'median_opt_step_ms': statistics.median(m['opt_step_ms'] for m in filtered),
             'num_iterations': len(filtered),
         }
 

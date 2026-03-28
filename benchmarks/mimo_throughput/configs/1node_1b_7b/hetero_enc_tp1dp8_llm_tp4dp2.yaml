@@ -1,0 +1,11 @@
+# Extreme fan-in: encoder TP1/DP8, LLM TP4/DP2
+# Encoder at TP1 eliminates all-reduce entirely. Max DP for encoder.
+experiment:
+  name: "hetero_enc_tp1dp8_llm_tp4dp2"
+
+parallelism:
+  encoder: { tp: 1, dp: 8 }
+  llm: { tp: 4, dp: 2 }
+
+data:
+  micro_batch_size: 4  # GBS=8 must divide enc_dp=8

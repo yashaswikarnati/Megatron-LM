@@ -1,0 +1,11 @@
+# Extreme heterogeneous: encoder TP1/DP8, LLM TP8/DP1
+# Encoder no all-reduce, LLM max TP for large hidden. No DP gradient sync for LLM.
+experiment:
+  name: "hetero_enc_tp1dp8_llm_tp8dp1"
+
+parallelism:
+  encoder: { tp: 1, dp: 8 }
+  llm: { tp: 8, dp: 1 }
+
+data:
+  micro_batch_size: 8  # GBS=8 must divide enc_dp=8
