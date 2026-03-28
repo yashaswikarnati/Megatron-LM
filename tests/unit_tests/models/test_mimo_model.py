@@ -550,7 +550,7 @@ class TestMimoModelNonColocated:
             self.patch_dim,
             {"images": 50257},
         )
-        assert model_no_grid.role.mode == ModuleLayout.UNIFIED
+        assert model_no_grid.role.mode == ModuleLayout.COLOCATED
         assert model_no_grid.role.has_language_module is True
         assert model_no_grid.role.has_modality_modules is True
 
