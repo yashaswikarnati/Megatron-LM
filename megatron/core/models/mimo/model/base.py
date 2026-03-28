@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from megatron.core.distributed import DistributedDataParallel
+from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
@@ -59,10 +60,35 @@ class MimoModel(MegatronModule):
 
         self.mimo_config = mimo_config
         modality_names = list(mimo_config.modality_submodules_spec.keys())
+        self.colocated_comms = {}
         if mimo_config.module_to_grid_map:
-            self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
+            if self._is_colocated(mimo_config.module_to_grid_map):
+                self.role = RankRole.colocated(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
+                self._build_colocated_communicators()
+            else:
+                self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
         else:
-            self.role = RankRole.unified(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
+            self.role = RankRole.colocated(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
+
+        # Detect LLM PP>1 for two-phase colocated execution
+        self.lm_has_pp = False
+        self.lm_is_first_pp_stage = True
+        if mimo_config.module_to_grid_map:
+            lang_grid = mimo_config.module_to_grid_map.get(MIMO_LANGUAGE_MODULE_KEY)
+            if lang_grid and 'pp' in lang_grid.dim_names:
+                pp_idx = lang_grid.dim_names.index('pp')
+                if lang_grid.shape[pp_idx] > 1:
+                    self.lm_has_pp = True
+                    pp_group = lang_grid.get_pg('pp')
+                    pp_rank = pp_group.rank()
+                    pp_size = pp_group.size()
+                    self.lm_is_first_pp_stage = pp_rank == 0
+                    # Update language module stage info for PP>1
+                    from megatron.core.models.mimo.config.role import ModuleStageInfo
+
+                    self.role.modules[MIMO_LANGUAGE_MODULE_KEY] = ModuleStageInfo(
+                        is_first_stage=(pp_rank == 0), is_last_stage=(pp_rank == pp_size - 1)
+                    )
 
         # Use special token IDs from the config
         self.special_token_ids = (
@@ -315,6 +341,7 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor] = None,
         modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
         packing_kwargs: Optional[dict] = None,
+        encoder_embeddings: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass through the multimodal model.
 
@@ -355,10 +382,23 @@ class MimoModel(MegatronModule):
                 - Language module ranks: language model output (logits or loss)
                 - No role (all modules colocated): language model output
         """
-        # Get any tensors passed via set_input_tensor
-        input_tensors = getattr(self, 'input_tensors', None)
+        if self.role.mode == ModuleLayout.COLOCATED:
+            input_tensors = getattr(self, 'input_tensors', None)
 
-        if self.role.mode == ModuleLayout.UNIFIED:
+            if self.lm_has_pp and input_tensors is not None:
+                # PP>1 non-first stage: hidden states from P2P
+                lm_result = self._forward_language_module(
+                    input_ids,
+                    position_ids,
+                    attention_mask,
+                    labels,
+                    {MIMO_LANGUAGE_MODULE_KEY: input_tensors},
+                )
+                # Unwrap dict for P2P (schedule uses plain tensors, not dicts)
+                if isinstance(lm_result, dict):
+                    lm_result = lm_result[MIMO_LANGUAGE_MODULE_KEY]
+                return lm_result, loss_mask
+
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -367,7 +407,11 @@ class MimoModel(MegatronModule):
                 labels,
                 modality_inputs,
                 packing_kwargs,
+                encoder_embeddings=encoder_embeddings,
             )
+
+        # Get any tensors passed via set_input_tensor
+        input_tensors = getattr(self, 'input_tensors', None)
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
@@ -491,6 +535,56 @@ class MimoModel(MegatronModule):
 
         return lm_output
 
+    @staticmethod
+    def _is_colocated(module_to_grid_map):
+        """Check if all grids span the same ranks (colocated)."""
+        grids = list(module_to_grid_map.values())
+        first = grids[0]
+        return all(g.rank_offset == first.rank_offset and g.size == first.size for g in grids[1:])
+
+    def _build_colocated_communicators(self):
+        """Build communicators for each encoder → language edge."""
+        grid_map = self.mimo_config.module_to_grid_map
+        lang_key = MIMO_LANGUAGE_MODULE_KEY
+        lang_grid = grid_map[lang_key]
+        for mod_name in self.mimo_config.modality_submodules_spec:
+            if mod_name in grid_map and mod_name != lang_key:
+                src_grid = grid_map[mod_name]
+                if src_grid.size == lang_grid.size:
+                    self.colocated_comms[(mod_name, lang_key)] = ColocatedBridgeCommunicator(
+                        src_grid=src_grid,
+                        dest_grid=lang_grid,
+                        src_module_name=mod_name,
+                        dest_module_name=lang_key,
+                    )
+
+    def _apply_colocated_comms(self, modality_embeddings):
+        """Transform encoder embeddings from encoder TP/DP to LLM TP/DP layout."""
+        lang_key = MIMO_LANGUAGE_MODULE_KEY
+        for modality_name in list(modality_embeddings.keys()):
+            comm = self.colocated_comms.get((modality_name, lang_key))
+            if comm is not None:
+                modality_embeddings[modality_name] = comm.communicate(
+                    modality_embeddings[modality_name]
+                )
+        return modality_embeddings
+
+    def encode_and_communicate(self, modality_inputs):
+        """Run encoder forward + colocated TP/DP transform (collective)."""
+        modality_embeddings = {}
+        for modality_name, submodule in self.modality_submodules.items():
+            if (
+                modality_inputs
+                and modality_name in modality_inputs
+                and modality_inputs[modality_name] is not None
+            ):
+                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
+                if embeddings is not None:
+                    modality_embeddings[modality_name] = embeddings
+        if self.colocated_comms:
+            modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+        return modality_embeddings
+
     def _forward_all_modules(
         self,
         input_ids: torch.Tensor,
@@ -500,6 +594,7 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
         packing_kwargs: Optional[dict] = None,
+        encoder_embeddings: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass when all modules are on all ranks (no multi-module PP).
 
@@ -516,22 +611,27 @@ class MimoModel(MegatronModule):
             packed_seq_params.qkv_format = 'thd'
             logger.debug(f"Packed sequence parameters: {packed_seq_params}")
 
-        # 1. Process each modality to get embeddings
-        modality_embeddings = {}
+        if encoder_embeddings is not None:
+            modality_embeddings = encoder_embeddings
+        else:
+            # 1. Process each modality to get embeddings
+            modality_embeddings = {}
 
-        for modality_name, submodule in self.modality_submodules.items():
-            if (
-                modality_inputs
-                and modality_name in modality_inputs
-                and modality_inputs[modality_name] is not None
-            ):
-                logger.debug(f"Processing {modality_name} modality")
-                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
-                if embeddings is not None:
-                    modality_embeddings[modality_name] = embeddings
-                    logger.debug(
-                        f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
-                    )
+            for modality_name, submodule in self.modality_submodules.items():
+                if (
+                    modality_inputs
+                    and modality_name in modality_inputs
+                    and modality_inputs[modality_name] is not None
+                ):
+                    logger.debug(f"Processing {modality_name} modality")
+                    embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
+                    if embeddings is not None:
+                        modality_embeddings[modality_name] = embeddings
+                        logger.debug(f"{modality_name} embeddings: {embeddings.shape}")
+
+            # Apply colocated communication if configured (no-op when colocated_comms is empty)
+            if self.colocated_comms:
+                modality_embeddings = self._apply_colocated_comms(modality_embeddings)
 
         # Get text embeddings
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
