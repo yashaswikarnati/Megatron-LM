@@ -1,0 +1,26 @@
+# M3: ViT-6B + LLM-70B (32 GPUs) | Encoder/LLM ratio ~0.09x
+# Tests: large-scale multi-node with extreme LLM dominance, TP8/DP4
+experiment:
+  name: "m3_vit6b_llm70b"
+  num_iterations: 10
+  warmup_iterations: 2
+  log_interval: 1
+model:
+  encoder:
+    num_layers: 48
+    hidden_size: 3200
+    num_attention_heads: 25
+    seq_length: 1024
+  llm:
+    num_layers: 80
+    hidden_size: 8192
+    num_attention_heads: 64
+    vocab_size: 32000
+    seq_length: 8192
+parallelism:
+  encoder: { tp: 8, dp: 4 }
+  llm: { tp: 8, dp: 4 }
+data:
+  micro_batch_size: 1
+  num_microbatches: 2
+  image_token_id: 32000

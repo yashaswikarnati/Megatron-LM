@@ -1,0 +1,26 @@
+# S6: ViT-6B + LLM-7B | Encoder/LLM ratio ~0.86x
+# Tests: near-symmetric sizes with higher resolution (1024 vis tokens)
+experiment:
+  name: "s6_vit6b_llm7b_hires"
+  num_iterations: 10
+  warmup_iterations: 2
+  log_interval: 1
+model:
+  encoder:
+    num_layers: 48
+    hidden_size: 3200
+    num_attention_heads: 25
+    seq_length: 1024
+  llm:
+    num_layers: 32
+    hidden_size: 4096
+    num_attention_heads: 32
+    vocab_size: 32000
+    seq_length: 8192
+parallelism:
+  encoder: { tp: 4, dp: 2 }
+  llm: { tp: 4, dp: 2 }
+data:
+  micro_batch_size: 1
+  num_microbatches: 2
+  image_token_id: 32000

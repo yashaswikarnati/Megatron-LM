@@ -1,0 +1,26 @@
+# S3: ViT-L (0.9B) + LLM-7B | Encoder/LLM ratio ~0.13x
+# Tests: high asymmetry with standard sequence length, TP4 parallelism
+experiment:
+  name: "s3_vitL_llm7b"
+  num_iterations: 10
+  warmup_iterations: 2
+  log_interval: 1
+model:
+  encoder:
+    num_layers: 40
+    hidden_size: 1408
+    num_attention_heads: 16
+    seq_length: 1024
+  llm:
+    num_layers: 32
+    hidden_size: 4096
+    num_attention_heads: 32
+    vocab_size: 32000
+    seq_length: 8192
+parallelism:
+  encoder: { tp: 4, dp: 2 }
+  llm: { tp: 4, dp: 2 }
+data:
+  micro_batch_size: 2
+  num_microbatches: 2
+  image_token_id: 32000

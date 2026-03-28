@@ -1,0 +1,26 @@
+# S8: ViT-L (0.9B) + LLM-14B | Encoder/LLM ratio ~0.06x
+# Tests: very high asymmetry with large LLM, full TP8 single-node
+experiment:
+  name: "s8_vitL_llm14b"
+  num_iterations: 10
+  warmup_iterations: 2
+  log_interval: 1
+model:
+  encoder:
+    num_layers: 40
+    hidden_size: 1408
+    num_attention_heads: 16
+    seq_length: 1024
+  llm:
+    num_layers: 48
+    hidden_size: 5120
+    num_attention_heads: 40
+    vocab_size: 32000
+    seq_length: 8192
+parallelism:
+  encoder: { tp: 8, dp: 1 }
+  llm: { tp: 8, dp: 1 }
+data:
+  micro_batch_size: 1
+  num_microbatches: 2
+  image_token_id: 32000
