@@ -829,3 +829,51 @@ class TestMemoryReduction:
 
         # Correctness must still hold
         assert_grads_match(grads_base, grads_opt)
+
+
+class TestOffloadProjectionCorrectness:
+    """Verify offload_projection produces identical gradients to baseline.
+
+    Uses FineGrainedActivationOffloadingInterface to offload the projection's
+    saved-for-backward tensors (including encoder output) to CPU.
+    """
+
+    def test_offload_projection(self, homogeneous_grids):
+        """Offload projection saved tensors to CPU via fine-grained interface."""
+        enc_grid, llm_grid = homogeneous_grids
+        memory_config = {ENCODER_NAME: ModuleMemoryConfig(offload_projection=True)}
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
+
+
+class TestOffloadEncoderOutputCorrectness:
+    """Verify offload_encoder_output produces identical gradients to baseline.
+
+    Uses FineGrainedActivationOffloadingInterface to offload the encoder's
+    saved-for-backward tensors to CPU.
+    """
+
+    def test_offload_encoder_output(self, homogeneous_grids):
+        """Offload encoder saved tensors to CPU via fine-grained interface."""
+        enc_grid, llm_grid = homogeneous_grids
+        memory_config = {ENCODER_NAME: ModuleMemoryConfig(offload_encoder_output=True)}
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
+
+
+class TestMixedRecomputeAndOffloadCorrectness:
+    """Verify combined recompute + offload produces correct gradients."""
+
+    def test_encoder_recompute_plus_offload_projection(self, homogeneous_grids):
+        """Encoder full recompute + projection offload combined."""
+        enc_grid, llm_grid = homogeneous_grids
+        memory_config = {
+            ENCODER_NAME: ModuleMemoryConfig(
+                recompute_granularity='full',
+                recompute_method='uniform',
+                recompute_num_layers=ENCODER_LAYERS,
+                offload_projection=True,
+            )
+        }
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)

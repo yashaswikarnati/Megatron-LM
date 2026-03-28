@@ -13,6 +13,9 @@ from megatron.core.models.mimo.config import MimoModelConfig, ModuleMemoryConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -120,6 +123,12 @@ class MimoModel(MegatronModule):
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
         self._initialize_language_model()
+
+        # Enable schedule-level offload reset if any MIMO module uses offloading.
+        # The schedule checks config.fine_grained_activation_offloading to call
+        # off_interface.reset() at the end of each iteration.
+        if self._has_mimo_offloading:
+            self.config.fine_grained_activation_offloading = True
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
@@ -587,9 +596,11 @@ class MimoModel(MegatronModule):
         mem_cfg = self.mimo_config.memory_config
         if not mem_cfg:
             self._modality_memory_configs = {}
+            self._has_mimo_offloading = False
             return
 
         self._modality_memory_configs = {}
+        self._has_mimo_offloading = False
 
         for module_name, mcfg in mem_cfg.items():
             if module_name == MIMO_LANGUAGE_MODULE_KEY:
@@ -617,6 +628,8 @@ class MimoModel(MegatronModule):
                             enc_spec.params['config'] = new_tc
                 # Store MIMO-specific flags for this modality
                 self._modality_memory_configs[module_name] = mcfg
+                if mcfg.offload_projection or mcfg.offload_encoder_output:
+                    self._has_mimo_offloading = True
 
     @staticmethod
     def _rebuild_transformer_config(tc, mcfg: ModuleMemoryConfig):
@@ -686,6 +699,14 @@ class MimoModel(MegatronModule):
 
         This is the original behavior, preserved for backward compatibility.
         """
+        # Initialize fine-grained offload chunk handler for MIMO-level offloading
+        # (offload_projection, offload_encoder_output). Must be called per forward
+        # pass, same as GPTModel.preprocess_for_fine_grained_offloading().
+        if self._has_mimo_offloading and self.training:
+            off_interface.init_chunk_handler(
+                vp_size=1, vp_stage=None, min_offloaded_tensor_size=1024
+            )
+
         # If packing_kwargs is provided, construct PackedSeqParams
         packed_seq_params = None
         if packing_kwargs is not None:
