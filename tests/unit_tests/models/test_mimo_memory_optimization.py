@@ -156,15 +156,17 @@ def get_pg_collection(grid, is_language_model=False):
 # ============================================================================
 
 
-def _make_encoder_spec(pg_collection):
+def _make_encoder_spec(
+    pg_collection, num_layers=ENCODER_LAYERS, hidden_size=HIDDEN_SIZE, num_heads=NUM_HEADS
+):
     from megatron.core.transformer.transformer_block import TransformerBlock
 
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
 
     vision_config = TransformerConfig(
-        num_layers=ENCODER_LAYERS,
-        hidden_size=HIDDEN_SIZE,
-        num_attention_heads=NUM_HEADS,
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=num_heads,
         use_cpu_initialization=True,
         variable_seq_lengths=True,
         moe_token_dispatcher_type='alltoall',
@@ -174,8 +176,8 @@ def _make_encoder_spec(pg_collection):
         bf16=True,
     )
 
-    proj_cfg = TransformerConfig(num_layers=1, hidden_size=HIDDEN_SIZE, num_attention_heads=1)
-    proj_cfg.ffn_hidden_size = HIDDEN_SIZE
+    proj_cfg = TransformerConfig(num_layers=1, hidden_size=hidden_size, num_attention_heads=1)
+    proj_cfg.ffn_hidden_size = hidden_size
     proj_cfg.bias_activation_fusion = True
     proj_cfg.add_bias_linear = True
     proj_cfg.activation_func = torch.nn.functional.gelu
@@ -204,7 +206,7 @@ def _make_encoder_spec(pg_collection):
                             linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
                         ),
                         "projector_type": "mlp",
-                        "input_size": HIDDEN_SIZE,
+                        "input_size": hidden_size,
                         "tp_group": pg_collection.tp,
                     },
                 )
@@ -213,15 +215,22 @@ def _make_encoder_spec(pg_collection):
     )
 
 
-def _make_lm_spec(pg_collection):
+def _make_lm_spec(
+    pg_collection,
+    num_layers=LLM_LAYERS,
+    hidden_size=HIDDEN_SIZE,
+    num_heads=NUM_HEADS,
+    vocab_size=VOCAB_SIZE,
+    seq_length=SEQ_LENGTH,
+):
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
 
     lm_config = TransformerConfig(
-        num_layers=LLM_LAYERS,
-        hidden_size=HIDDEN_SIZE,
-        num_attention_heads=NUM_HEADS,
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=num_heads,
         use_cpu_initialization=True,
         variable_seq_lengths=True,
         moe_token_dispatcher_type='alltoall',
@@ -238,8 +247,8 @@ def _make_lm_spec(pg_collection):
         params={
             "config": lm_config,
             "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
-            "vocab_size": VOCAB_SIZE,
-            "max_sequence_length": SEQ_LENGTH,
+            "vocab_size": vocab_size,
+            "max_sequence_length": seq_length,
             "pre_process": (pp_rank == 0),
             "post_process": (pp_rank == pp_size - 1),
             "pg_collection": pg_collection,
@@ -247,7 +256,20 @@ def _make_lm_spec(pg_collection):
     )
 
 
-def create_mimo_model(encoder_grid, llm_grid, memory_config=None, use_ddp=True):
+def create_mimo_model(
+    encoder_grid,
+    llm_grid,
+    memory_config=None,
+    use_ddp=True,
+    enc_layers=ENCODER_LAYERS,
+    enc_hidden=HIDDEN_SIZE,
+    enc_heads=NUM_HEADS,
+    llm_layers=LLM_LAYERS,
+    llm_hidden=HIDDEN_SIZE,
+    llm_heads=NUM_HEADS,
+    vocab_size=VOCAB_SIZE,
+    seq_length=SEQ_LENGTH,
+):
     """Create a MIMO model with optional memory config, optionally DDP-wrapped."""
     os.environ.pop('NVTE_FLASH_ATTN', None)
     os.environ.pop('NVTE_FUSED_ATTN', None)
@@ -262,8 +284,17 @@ def create_mimo_model(encoder_grid, llm_grid, memory_config=None, use_ddp=True):
     )
     torch.manual_seed(42)
 
-    encoder_spec = _make_encoder_spec(encoder_pg)
-    lm_spec = _make_lm_spec(llm_pg)
+    encoder_spec = _make_encoder_spec(
+        encoder_pg, num_layers=enc_layers, hidden_size=enc_hidden, num_heads=enc_heads
+    )
+    lm_spec = _make_lm_spec(
+        llm_pg,
+        num_layers=llm_layers,
+        hidden_size=llm_hidden,
+        num_heads=llm_heads,
+        vocab_size=vocab_size,
+        seq_length=seq_length,
+    )
 
     mimo_config = MimoModelConfig(
         language_model_spec=lm_spec,
@@ -345,17 +376,24 @@ def create_mimo_model(encoder_grid, llm_grid, memory_config=None, use_ddp=True):
 # ============================================================================
 
 
-def make_batch(device='cuda'):
+def make_batch(
+    device='cuda',
+    seq_length=SEQ_LENGTH,
+    image_seq_length=IMAGE_SEQ_LENGTH,
+    hidden_size=HIDDEN_SIZE,
+    micro_batch_size=MICRO_BATCH_SIZE,
+    vocab_size=VOCAB_SIZE,
+):
     """Create a synthetic VLM batch."""
-    input_ids = torch.randint(0, VOCAB_SIZE, (MICRO_BATCH_SIZE, SEQ_LENGTH), device=device)
-    input_ids[:, :IMAGE_SEQ_LENGTH] = IMAGE_TOKEN_ID
+    input_ids = torch.randint(0, vocab_size, (micro_batch_size, seq_length), device=device)
+    input_ids[:, :image_seq_length] = IMAGE_TOKEN_ID
 
-    labels = torch.randint(0, VOCAB_SIZE, (MICRO_BATCH_SIZE, SEQ_LENGTH), device=device)
-    loss_mask = torch.ones(MICRO_BATCH_SIZE, SEQ_LENGTH, device=device)
-    position_ids = torch.arange(SEQ_LENGTH, device=device).unsqueeze(0).expand(MICRO_BATCH_SIZE, -1)
+    labels = torch.randint(0, vocab_size, (micro_batch_size, seq_length), device=device)
+    loss_mask = torch.ones(micro_batch_size, seq_length, device=device)
+    position_ids = torch.arange(seq_length, device=device).unsqueeze(0).expand(micro_batch_size, -1)
 
     pixel_values = torch.randn(
-        IMAGE_SEQ_LENGTH, MICRO_BATCH_SIZE, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
+        image_seq_length, micro_batch_size, hidden_size, device=device, dtype=torch.bfloat16
     )
 
     return {
@@ -373,9 +411,10 @@ def make_batch(device='cuda'):
 class BatchIterator:
     """Repeatable deterministic batch iterator."""
 
-    def __init__(self, seed=123):
+    def __init__(self, seed=123, **batch_kwargs):
         self.seed = seed
         self.call_count = 0
+        self.batch_kwargs = batch_kwargs
 
     def __iter__(self):
         return self
@@ -383,7 +422,7 @@ class BatchIterator:
     def __next__(self):
         torch.manual_seed(self.seed + self.call_count)
         self.call_count += 1
-        return make_batch()
+        return make_batch(**self.batch_kwargs)
 
 
 def forward_step(data_iterator, model, *args, **kwargs):
@@ -425,17 +464,19 @@ def zero_grads(model):
             param.grad.zero_()
 
 
-def run_fwd_bwd(model, llm_pg, seed=42):
+def run_fwd_bwd(model, llm_pg, seed=42, num_microbatches=NUM_MICROBATCHES, **batch_kwargs):
     """Run forward-backward and return collected gradients."""
-    data_iter = BatchIterator(seed=seed)
+    seq_length = batch_kwargs.get('seq_length', SEQ_LENGTH)
+    micro_batch_size = batch_kwargs.get('micro_batch_size', MICRO_BATCH_SIZE)
+    data_iter = BatchIterator(seed=seed, **batch_kwargs)
 
     schedule.forward_backward_no_pipelining(
         forward_step_func=forward_step,
         data_iterator=data_iter,
         model=[model],
-        num_microbatches=NUM_MICROBATCHES,
-        seq_length=SEQ_LENGTH,
-        micro_batch_size=MICRO_BATCH_SIZE,
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
         forward_only=False,
         pg_collection=llm_pg,
     )
@@ -443,39 +484,89 @@ def run_fwd_bwd(model, llm_pg, seed=42):
     return collect_grads(model)
 
 
-def run_baseline_and_optimized(enc_grid, llm_grid, memory_config, seed=42):
+def _reset_cuda_memory():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+
+def run_baseline_and_optimized(enc_grid, llm_grid, memory_config, seed=42, **model_kwargs):
     """Create baseline (no memory opt) and optimized models, run fwd/bwd, compare grads.
 
     Returns (grads_baseline, grads_optimized, peak_mem_baseline, peak_mem_optimized).
     """
-    # --- Baseline (no DDP to avoid main_grad complexity) ---
-    model_base, _, llm_pg = create_mimo_model(enc_grid, llm_grid, memory_config=None, use_ddp=False)
+    # Extract batch-relevant kwargs for data generation
+    seq_length = model_kwargs.get('seq_length', SEQ_LENGTH)
+    enc_hidden = model_kwargs.get('enc_hidden', HIDDEN_SIZE)
+    image_seq_length = model_kwargs.get('image_seq_length', IMAGE_SEQ_LENGTH)
+    micro_batch_size = model_kwargs.get('micro_batch_size', MICRO_BATCH_SIZE)
+    num_microbatches = model_kwargs.get('num_microbatches', NUM_MICROBATCHES)
+    vocab_size = model_kwargs.get('vocab_size', VOCAB_SIZE)
 
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
-    grads_base = run_fwd_bwd(model_base, llm_pg, seed=seed)
-    torch.cuda.synchronize()
-    peak_mem_base = torch.cuda.max_memory_allocated()
-
-    # Cleanup baseline model fully before creating optimized
-    del model_base
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # --- Optimized (no DDP to avoid main_grad complexity) ---
-    model_opt, _, llm_pg = create_mimo_model(
-        enc_grid, llm_grid, memory_config=memory_config, use_ddp=False
+    batch_kwargs = dict(
+        seq_length=seq_length,
+        hidden_size=enc_hidden,
+        image_seq_length=image_seq_length,
+        micro_batch_size=micro_batch_size,
+        vocab_size=vocab_size,
     )
 
+    fwd_bwd_kwargs = dict(num_microbatches=num_microbatches, **batch_kwargs)
+
+    # Filter model_kwargs to only what create_mimo_model accepts
+    create_kwargs = {
+        k: v
+        for k, v in model_kwargs.items()
+        if k
+        in (
+            'enc_layers',
+            'enc_hidden',
+            'enc_heads',
+            'llm_layers',
+            'llm_hidden',
+            'llm_heads',
+            'vocab_size',
+            'seq_length',
+        )
+    }
+
+    # --- Optimized first (to avoid CUDA allocator caching bias) ---
+    model_opt, _, llm_pg = create_mimo_model(
+        enc_grid, llm_grid, memory_config=memory_config, use_ddp=False, **create_kwargs
+    )
+
+    # Warmup then measure
+    run_fwd_bwd(model_opt, llm_pg, seed=seed + 1000, **fwd_bwd_kwargs)
+    for p in model_opt.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+    _reset_cuda_memory()
     torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
-    grads_opt = run_fwd_bwd(model_opt, llm_pg, seed=seed)
+    grads_opt = run_fwd_bwd(model_opt, llm_pg, seed=seed, **fwd_bwd_kwargs)
     torch.cuda.synchronize()
     peak_mem_opt = torch.cuda.max_memory_allocated()
 
     del model_opt
-    gc.collect()
-    torch.cuda.empty_cache()
+    _reset_cuda_memory()
+
+    # --- Baseline (no DDP to avoid main_grad complexity) ---
+    model_base, _, llm_pg = create_mimo_model(
+        enc_grid, llm_grid, memory_config=None, use_ddp=False, **create_kwargs
+    )
+
+    # Warmup then measure
+    run_fwd_bwd(model_base, llm_pg, seed=seed + 1000, **fwd_bwd_kwargs)
+    for p in model_base.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+    _reset_cuda_memory()
+    torch.cuda.reset_peak_memory_stats()
+    grads_base = run_fwd_bwd(model_base, llm_pg, seed=seed, **fwd_bwd_kwargs)
+    torch.cuda.synchronize()
+    peak_mem_base = torch.cuda.max_memory_allocated()
+
+    del model_base
+    _reset_cuda_memory()
 
     return grads_base, grads_opt, peak_mem_base, peak_mem_opt
 
@@ -615,38 +706,95 @@ class TestMixedRecomputeCorrectness:
 
 
 class TestMemoryReduction:
-    """Verify recompute runs and report peak GPU memory (informational).
+    """Verify recompute saves GPU memory with analytically-bounded expectations.
 
-    Note: with small test models (2 layers, hidden=64), recompute overhead
-    (RNG state saves, checkpoint buffers) can exceed activation savings.
-    Memory reduction is only meaningful for production-scale models.
+    Uses a larger model (hidden=1024, 8 encoder layers, seq=512) where
+    activation savings dominate over checkpoint overhead.
+
+    Analytical model for full recompute savings on the encoder:
+      Without recompute: each layer saves ~N activation tensors for backward.
+        With TE flash attention, per-layer cost ≈ (10*S*B*H + 2*S*B*4H) * dtype_bytes
+        = 18 * S * B * H * dtype_bytes  (dominant terms)
+      With full recompute (recompute_num_layers=L): only 1 input tensor saved
+        = S * B * H * dtype_bytes for the entire block
+
+      Expected savings ≈ L * 18 * S * B * H * dtype_bytes (minus the one saved input)
+
+    We use a generous tolerance (50%) since TE kernels may save additional
+    tensors and the allocator has jitter.
     """
 
-    def test_encoder_full_recompute_memory_report(self, homogeneous_grids):
-        """Full encoder recompute: verify it runs and report memory usage."""
+    # Larger model dimensions for measurable memory signal
+    MEM_ENC_LAYERS = 8
+    MEM_ENC_HIDDEN = 1024
+    MEM_ENC_HEADS = 8
+    MEM_LLM_LAYERS = 2  # Keep LLM small — we're measuring encoder savings
+    MEM_LLM_HIDDEN = 1024
+    MEM_LLM_HEADS = 8
+    MEM_SEQ_LENGTH = 512
+    MEM_IMAGE_SEQ = 256
+    MEM_BATCH = 2
+
+    def test_encoder_full_recompute_saves_memory(self, homogeneous_grids):
+        """Full encoder recompute saves measurable GPU memory."""
         enc_grid, llm_grid = homogeneous_grids
+        L = self.MEM_ENC_LAYERS
+
         memory_config = {
             ENCODER_NAME: ModuleMemoryConfig(
-                recompute_granularity='full',
-                recompute_method='uniform',
-                recompute_num_layers=ENCODER_LAYERS,
+                recompute_granularity='full', recompute_method='uniform', recompute_num_layers=L
             )
         }
-        grads_base, grads_opt, mem_base, mem_opt = run_baseline_and_optimized(
-            enc_grid, llm_grid, memory_config
+
+        model_kwargs = dict(
+            enc_layers=L,
+            enc_hidden=self.MEM_ENC_HIDDEN,
+            enc_heads=self.MEM_ENC_HEADS,
+            llm_layers=self.MEM_LLM_LAYERS,
+            llm_hidden=self.MEM_LLM_HIDDEN,
+            llm_heads=self.MEM_LLM_HEADS,
+            seq_length=self.MEM_SEQ_LENGTH,
+            image_seq_length=self.MEM_IMAGE_SEQ,
+            micro_batch_size=self.MEM_BATCH,
+            num_microbatches=1,  # Single microbatch for cleaner measurement
         )
 
-        mem_base_mb = mem_base / (1024 * 1024)
-        mem_opt_mb = mem_opt / (1024 * 1024)
+        grads_base, grads_opt, mem_base, mem_opt = run_baseline_and_optimized(
+            enc_grid, llm_grid, memory_config, **model_kwargs
+        )
+
+        mem_base_mb = mem_base / (1024**2)
+        mem_opt_mb = mem_opt / (1024**2)
         savings_mb = mem_base_mb - mem_opt_mb
 
-        # Log memory for manual inspection
+        # Analytical expected savings (conservative lower bound)
+        # Per-layer activation: ~18 * S * B * H * 2 bytes (bf16)
+        # With TP=2, effective H per rank = H/2 for some tensors, but many are full H
+        # Use ~10 * S * B * H * 2 as conservative per-layer estimate
+        S, B, H = self.MEM_IMAGE_SEQ, self.MEM_BATCH, self.MEM_ENC_HIDDEN
+        conservative_per_layer_bytes = 10 * S * B * H * 2
+        expected_savings_mb = (L * conservative_per_layer_bytes) / (1024**2)
+
         if dist.get_rank() == 0:
             print(
-                f"\nMemory report: baseline={mem_base_mb:.1f}MB, "
-                f"optimized={mem_opt_mb:.1f}MB, "
-                f"delta={savings_mb:+.1f}MB"
+                f"\nMemory test (enc {L}L h={H} seq={S} bs={B}):\n"
+                f"  Baseline peak:  {mem_base_mb:.1f} MB\n"
+                f"  Optimized peak: {mem_opt_mb:.1f} MB\n"
+                f"  Actual savings: {savings_mb:.1f} MB\n"
+                f"  Expected (analytical lower bound): {expected_savings_mb:.1f} MB"
             )
 
-        # Correctness must still hold regardless of memory outcome
+        # Assert positive savings
+        assert savings_mb > 0, (
+            f"Recompute did not reduce memory: "
+            f"baseline={mem_base_mb:.1f}MB, optimized={mem_opt_mb:.1f}MB"
+        )
+
+        # Assert savings are in the right ballpark (within 50% of analytical estimate)
+        assert savings_mb >= expected_savings_mb * 0.5, (
+            f"Memory savings ({savings_mb:.1f}MB) less than 50% of expected "
+            f"({expected_savings_mb:.1f}MB). Something may be wrong with recompute."
+        )
+
+        # Correctness must still hold
         assert_grads_match(grads_base, grads_opt)
