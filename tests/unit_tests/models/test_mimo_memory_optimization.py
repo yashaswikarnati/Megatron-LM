@@ -490,12 +490,36 @@ def _reset_cuda_memory():
     torch.cuda.synchronize()
 
 
+def _run_one_mimo_iter(model, llm_pg, seed, batch_kwargs, num_microbatches):
+    """Run one fwd/bwd iteration on the same model instance, return (grads, peak_bytes).
+
+    Mirrors the pattern from test_fine_grained_activation_offloading.py:
+    reset_peak_memory_stats -> fwd/bwd -> synchronize -> capture peak.
+    """
+    # Zero existing grads
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+
+    torch.cuda.reset_peak_memory_stats()
+    grads = run_fwd_bwd(model, llm_pg, seed=seed, num_microbatches=num_microbatches, **batch_kwargs)
+    torch.cuda.synchronize()
+    peak_bytes = torch.cuda.max_memory_allocated()
+    return grads, peak_bytes
+
+
 def run_baseline_and_optimized(enc_grid, llm_grid, memory_config, seed=42, **model_kwargs):
-    """Create baseline (no memory opt) and optimized models, run fwd/bwd, compare grads.
+    """Create baseline and optimized models, warmup + measure steady-state on each.
+
+    Follows the same pattern as test_fine_grained_activation_offloading.py:
+      1. Build model
+      2. Warmup iteration (allocator warm, caches populated)
+      3. _reset_cuda_memory (gc + empty_cache)
+      4. Measurement iteration (reset_peak -> fwd/bwd -> capture peak)
+      5. Delete model + cleanup
 
     Returns (grads_baseline, grads_optimized, peak_mem_baseline, peak_mem_optimized).
     """
-    # Extract batch-relevant kwargs for data generation
     seq_length = model_kwargs.get('seq_length', SEQ_LENGTH)
     enc_hidden = model_kwargs.get('enc_hidden', HIDDEN_SIZE)
     image_seq_length = model_kwargs.get('image_seq_length', IMAGE_SEQ_LENGTH)
@@ -511,9 +535,6 @@ def run_baseline_and_optimized(enc_grid, llm_grid, memory_config, seed=42, **mod
         vocab_size=vocab_size,
     )
 
-    fwd_bwd_kwargs = dict(num_microbatches=num_microbatches, **batch_kwargs)
-
-    # Filter model_kwargs to only what create_mimo_model accepts
     create_kwargs = {
         k: v
         for k, v in model_kwargs.items()
@@ -530,40 +551,50 @@ def run_baseline_and_optimized(enc_grid, llm_grid, memory_config, seed=42, **mod
         )
     }
 
-    # --- Optimized first (to avoid CUDA allocator caching bias) ---
+    # --- Optimized first (avoids CUDA allocator caching bias on baseline) ---
     model_opt, _, llm_pg = create_mimo_model(
         enc_grid, llm_grid, memory_config=memory_config, use_ddp=False, **create_kwargs
     )
+    model_opt.train()
 
-    # Warmup then measure
-    run_fwd_bwd(model_opt, llm_pg, seed=seed + 1000, **fwd_bwd_kwargs)
-    for p in model_opt.parameters():
-        if p.grad is not None:
-            p.grad.zero_()
+    # Warmup iteration (same model instance — allocator warm, TE caches populated)
+    _run_one_mimo_iter(
+        model_opt,
+        llm_pg,
+        seed=seed + 1000,
+        batch_kwargs=batch_kwargs,
+        num_microbatches=num_microbatches,
+    )
     _reset_cuda_memory()
-    torch.cuda.reset_peak_memory_stats()
-    grads_opt = run_fwd_bwd(model_opt, llm_pg, seed=seed, **fwd_bwd_kwargs)
-    torch.cuda.synchronize()
-    peak_mem_opt = torch.cuda.max_memory_allocated()
+
+    # Steady-state measurement iteration
+    grads_opt, peak_mem_opt = _run_one_mimo_iter(
+        model_opt, llm_pg, seed=seed, batch_kwargs=batch_kwargs, num_microbatches=num_microbatches
+    )
 
     del model_opt
     _reset_cuda_memory()
 
-    # --- Baseline (no DDP to avoid main_grad complexity) ---
+    # --- Baseline ---
     model_base, _, llm_pg = create_mimo_model(
         enc_grid, llm_grid, memory_config=None, use_ddp=False, **create_kwargs
     )
+    model_base.train()
 
-    # Warmup then measure
-    run_fwd_bwd(model_base, llm_pg, seed=seed + 1000, **fwd_bwd_kwargs)
-    for p in model_base.parameters():
-        if p.grad is not None:
-            p.grad.zero_()
+    # Warmup
+    _run_one_mimo_iter(
+        model_base,
+        llm_pg,
+        seed=seed + 1000,
+        batch_kwargs=batch_kwargs,
+        num_microbatches=num_microbatches,
+    )
     _reset_cuda_memory()
-    torch.cuda.reset_peak_memory_stats()
-    grads_base = run_fwd_bwd(model_base, llm_pg, seed=seed, **fwd_bwd_kwargs)
-    torch.cuda.synchronize()
-    peak_mem_base = torch.cuda.max_memory_allocated()
+
+    # Steady-state measurement
+    grads_base, peak_mem_base = _run_one_mimo_iter(
+        model_base, llm_pg, seed=seed, batch_kwargs=batch_kwargs, num_microbatches=num_microbatches
+    )
 
     del model_base
     _reset_cuda_memory()
