@@ -3,13 +3,16 @@
 """Unit tests for MIMO memory optimization: recompute and fine-grained offload.
 
 Tests each cell of the recompute/offload support matrix plus mix/match integration.
+Each test validates:
+  1. Correctness: gradients match a no-optimization baseline (torch.allclose)
+  2. Functionality: forward/backward completes without error
 
 Run with:
     uv run python -m torch.distributed.run --nproc_per_node=8 -m pytest \
         tests/unit_tests/models/test_mimo_memory_optimization.py -v
 """
 
-import copy
+import gc
 import logging
 import os
 from contextlib import ExitStack, contextmanager
@@ -31,13 +34,12 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
-from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
-from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -66,7 +68,7 @@ MICRO_BATCH_SIZE = 2
 NUM_MICROBATCHES = 2
 
 # ============================================================================
-# Grid / PG helpers (same as test_mimo_colocated_e2e.py)
+# Grid / PG helpers
 # ============================================================================
 
 _active_grids = []
@@ -131,7 +133,6 @@ def get_pg_collection(grid, is_language_model=False):
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
     pg_collection.expt_dp = grid.get_pg("expt_dp")
 
-    # Add embedding groups
     if pg_collection.pp:
         pp_ranks = sorted(dist.get_process_group_ranks(pg_collection.pp))
         cache_key = tuple(pp_ranks)
@@ -246,9 +247,8 @@ def _make_lm_spec(pg_collection):
     )
 
 
-def create_mimo_model(encoder_grid, llm_grid, memory_config=None):
-    """Create a MIMO model with optional memory config, DDP-wrapped."""
-    # Clear NVTE env vars that conftest set_env fixture sets to '0'.
+def create_mimo_model(encoder_grid, llm_grid, memory_config=None, use_ddp=True):
+    """Create a MIMO model with optional memory config, optionally DDP-wrapped."""
     os.environ.pop('NVTE_FLASH_ATTN', None)
     os.environ.pop('NVTE_FUSED_ATTN', None)
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
@@ -256,7 +256,6 @@ def create_mimo_model(encoder_grid, llm_grid, memory_config=None):
     encoder_pg = get_pg_collection(encoder_grid, is_language_model=False)
     llm_pg = get_pg_collection(llm_grid, is_language_model=True)
 
-    # Initialize RNG tracker (required by TE layers for model-parallel-rng)
     tp_rank = dist.get_rank(llm_pg.tp) if llm_pg.tp else 0
     model_parallel_cuda_manual_seed(
         42, tp_rank=tp_rank, ep_rank=0, etp_rank=0, force_reset_rng=True
@@ -278,56 +277,57 @@ def create_mimo_model(encoder_grid, llm_grid, memory_config=None):
     model.to(torch.device("cuda")).to(torch.bfloat16)
     model.model_type = ModelType.encoder_or_decoder
 
-    # DDP wrap
-    ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=False, use_distributed_optimizer=False
-    )
-
-    if model.language_model is not None:
-        model.language_model = DistributedDataParallel(
-            config=model.language_model.config,
-            ddp_config=ddp_config,
-            module=model.language_model,
-            pg_collection=llm_pg,
+    if use_ddp:
+        ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=False, use_distributed_optimizer=False
         )
 
-    if ENCODER_NAME in model.modality_submodules:
-        submodule = model.modality_submodules[ENCODER_NAME]
-        if submodule is not None:
-            model.modality_submodules[ENCODER_NAME] = DistributedDataParallel(
-                config=submodule.encoders['clip_encoder'].config,
+        if model.language_model is not None:
+            model.language_model = DistributedDataParallel(
+                config=model.language_model.config,
                 ddp_config=ddp_config,
-                module=submodule,
-                pg_collection=encoder_pg,
+                module=model.language_model,
+                pg_collection=llm_pg,
             )
 
-    # Attach schedule callbacks
+        if ENCODER_NAME in model.modality_submodules:
+            submodule = model.modality_submodules[ENCODER_NAME]
+            if submodule is not None:
+                model.modality_submodules[ENCODER_NAME] = DistributedDataParallel(
+                    config=submodule.encoders['clip_encoder'].config,
+                    ddp_config=ddp_config,
+                    module=submodule,
+                    pg_collection=encoder_pg,
+                )
+
     @contextmanager
     def no_sync_func():
         with ExitStack() as stack:
-            if model.language_model is not None:
-                stack.enter_context(model.language_model.no_sync())
-            for sub in model.modality_submodules.values():
-                if sub is not None:
-                    stack.enter_context(sub.no_sync())
+            if use_ddp:
+                if model.language_model is not None:
+                    stack.enter_context(model.language_model.no_sync())
+                for sub in model.modality_submodules.values():
+                    if sub is not None:
+                        stack.enter_context(sub.no_sync())
             yield
 
     def finalize_grads_func(*args, force_all_reduce=False, **kwargs):
-        if model.language_model is not None:
-            finalize_model_grads(
-                [model.language_model],
-                num_tokens=None,
-                pg_collection=llm_pg,
-                force_all_reduce=force_all_reduce,
-            )
-        for sub in model.modality_submodules.values():
-            if sub is not None:
+        if use_ddp:
+            if model.language_model is not None:
                 finalize_model_grads(
-                    [sub],
+                    [model.language_model],
                     num_tokens=None,
-                    pg_collection=encoder_pg,
+                    pg_collection=llm_pg,
                     force_all_reduce=force_all_reduce,
                 )
+            for sub in model.modality_submodules.values():
+                if sub is not None:
+                    finalize_model_grads(
+                        [sub],
+                        num_tokens=None,
+                        pg_collection=encoder_pg,
+                        force_all_reduce=force_all_reduce,
+                    )
 
     model.config.no_sync_func = no_sync_func
     model.config.finalize_model_grads_func = finalize_grads_func
@@ -348,14 +348,12 @@ def create_mimo_model(encoder_grid, llm_grid, memory_config=None):
 def make_batch(device='cuda'):
     """Create a synthetic VLM batch."""
     input_ids = torch.randint(0, VOCAB_SIZE, (MICRO_BATCH_SIZE, SEQ_LENGTH), device=device)
-    # Replace first IMAGE_SEQ_LENGTH tokens with image token
     input_ids[:, :IMAGE_SEQ_LENGTH] = IMAGE_TOKEN_ID
 
     labels = torch.randint(0, VOCAB_SIZE, (MICRO_BATCH_SIZE, SEQ_LENGTH), device=device)
     loss_mask = torch.ones(MICRO_BATCH_SIZE, SEQ_LENGTH, device=device)
     position_ids = torch.arange(SEQ_LENGTH, device=device).unsqueeze(0).expand(MICRO_BATCH_SIZE, -1)
 
-    # Vision encoder input: [seq, batch, hidden]
     pixel_values = torch.randn(
         IMAGE_SEQ_LENGTH, MICRO_BATCH_SIZE, HIDDEN_SIZE, device=device, dtype=torch.bfloat16
     )
@@ -406,8 +404,29 @@ def forward_step(data_iterator, model, *args, **kwargs):
 # ============================================================================
 
 
-def run_fwd_bwd(model, llm_pg, encoder_grid, llm_grid, seed=42):
-    """Run one forward-backward pass and return a dict of param gradients."""
+def collect_grads(model):
+    """Collect gradients from all parameters (handles Megatron DDP main_grad)."""
+    grads = {}
+    for name, param in model.named_parameters():
+        grad = getattr(param, 'main_grad', None)
+        if grad is None:
+            grad = param.grad
+        if grad is not None:
+            grads[name] = grad.float().clone()
+    return grads
+
+
+def zero_grads(model):
+    """Zero all gradients including main_grad."""
+    for param in model.parameters():
+        if hasattr(param, 'main_grad') and param.main_grad is not None:
+            param.main_grad.zero_()
+        if param.grad is not None:
+            param.grad.zero_()
+
+
+def run_fwd_bwd(model, llm_pg, seed=42):
+    """Run forward-backward and return collected gradients."""
     data_iter = BatchIterator(seed=seed)
 
     schedule.forward_backward_no_pipelining(
@@ -421,15 +440,74 @@ def run_fwd_bwd(model, llm_pg, encoder_grid, llm_grid, seed=42):
         pg_collection=llm_pg,
     )
 
-    grads = {}
-    for name, param in model.named_parameters():
-        # Megatron DDP stores grads in param.main_grad, not param.grad
-        grad = getattr(param, 'main_grad', None)
-        if grad is None:
-            grad = param.grad
-        if grad is not None:
-            grads[name] = grad.clone()
-    return grads
+    return collect_grads(model)
+
+
+def run_baseline_and_optimized(enc_grid, llm_grid, memory_config, seed=42):
+    """Create baseline (no memory opt) and optimized models, run fwd/bwd, compare grads.
+
+    Returns (grads_baseline, grads_optimized, peak_mem_baseline, peak_mem_optimized).
+    """
+    # --- Baseline (no DDP to avoid main_grad complexity) ---
+    model_base, _, llm_pg = create_mimo_model(enc_grid, llm_grid, memory_config=None, use_ddp=False)
+
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+    grads_base = run_fwd_bwd(model_base, llm_pg, seed=seed)
+    torch.cuda.synchronize()
+    peak_mem_base = torch.cuda.max_memory_allocated()
+
+    # Cleanup baseline model fully before creating optimized
+    del model_base
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # --- Optimized (no DDP to avoid main_grad complexity) ---
+    model_opt, _, llm_pg = create_mimo_model(
+        enc_grid, llm_grid, memory_config=memory_config, use_ddp=False
+    )
+
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+    grads_opt = run_fwd_bwd(model_opt, llm_pg, seed=seed)
+    torch.cuda.synchronize()
+    peak_mem_opt = torch.cuda.max_memory_allocated()
+
+    del model_opt
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return grads_base, grads_opt, peak_mem_base, peak_mem_opt
+
+
+def assert_grads_match(grads_base, grads_opt, atol=1e-2, rtol=1e-2):
+    """Assert gradient correctness: optimized grads match baseline within tolerance.
+
+    Uses relaxed tolerance (1e-2) because bf16 recomputation can introduce
+    small numerical differences due to non-deterministic TE kernels.
+    """
+    # Verify we got gradients from both runs
+    assert len(grads_base) > 0, "Baseline produced no gradients"
+    assert len(grads_opt) > 0, "Optimized model produced no gradients"
+
+    matched = 0
+    for name in grads_base:
+        if name not in grads_opt:
+            continue
+        g_base = grads_base[name]
+        g_opt = grads_opt[name]
+        assert (
+            g_base.shape == g_opt.shape
+        ), f"Shape mismatch for {name}: {g_base.shape} vs {g_opt.shape}"
+        assert torch.isfinite(g_opt).all(), f"Non-finite gradient in optimized model for {name}"
+        assert torch.allclose(g_base, g_opt, atol=atol, rtol=rtol), (
+            f"Gradient mismatch for {name}: "
+            f"max_diff={torch.max(torch.abs(g_base - g_opt)).item():.6f}, "
+            f"base_norm={g_base.norm().item():.6f}, opt_norm={g_opt.norm().item():.6f}"
+        )
+        matched += 1
+
+    assert matched > 0, "No matching parameter names between baseline and optimized"
 
 
 # ============================================================================
@@ -455,24 +533,16 @@ def homogeneous_grids():
 
 
 # ============================================================================
-# Tests — one per matrix cell
+# Correctness tests — baseline comparison for each recompute config
 # ============================================================================
 
 
-def _assert_valid_grads(grads):
-    """Assert grads dict is non-empty and all values are finite."""
-    assert len(grads) > 0, "No gradients produced"
-    for name, grad in grads.items():
-        assert torch.isfinite(grad).all(), f"Non-finite gradient for {name}"
-
-
-class TestEncoderRecompute:
-    """Test encoder internal recompute (TransformerBlock-level)."""
+class TestEncoderRecomputeCorrectness:
+    """Verify encoder recompute produces identical gradients to baseline."""
 
     def test_encoder_recompute_full(self, homogeneous_grids):
         """Full recompute on encoder: all layers checkpointed."""
         enc_grid, llm_grid = homogeneous_grids
-
         memory_config = {
             ENCODER_NAME: ModuleMemoryConfig(
                 recompute_granularity='full',
@@ -480,68 +550,55 @@ class TestEncoderRecompute:
                 recompute_num_layers=ENCODER_LAYERS,
             )
         }
-        model, _, llm_pg = create_mimo_model(enc_grid, llm_grid, memory_config=memory_config)
-        grads = run_fwd_bwd(model, llm_pg, enc_grid, llm_grid, seed=42)
-        _assert_valid_grads(grads)
-        del model
+        grads_base, grads_opt, mem_base, mem_opt = run_baseline_and_optimized(
+            enc_grid, llm_grid, memory_config
+        )
+        assert_grads_match(grads_base, grads_opt)
 
     def test_encoder_recompute_selective(self, homogeneous_grids):
         """Selective recompute on encoder: only core_attn checkpointed."""
         enc_grid, llm_grid = homogeneous_grids
-
         memory_config = {
             ENCODER_NAME: ModuleMemoryConfig(
                 recompute_granularity='selective', recompute_modules=['core_attn']
             )
         }
-        model, _, llm_pg = create_mimo_model(enc_grid, llm_grid, memory_config=memory_config)
-        grads = run_fwd_bwd(model, llm_pg, enc_grid, llm_grid, seed=42)
-        _assert_valid_grads(grads)
-        del model
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
 
 
-class TestLLMRecompute:
-    """Test LLM internal recompute."""
+class TestLLMRecomputeCorrectness:
+    """Verify LLM recompute produces identical gradients to baseline."""
 
     def test_llm_recompute_selective(self, homogeneous_grids):
-        """Selective recompute on LLM: core_attn checkpointed.
-
-        Verifies fwd/bwd runs without error and produces valid gradients.
-        """
+        """Selective recompute on LLM: core_attn checkpointed."""
         enc_grid, llm_grid = homogeneous_grids
-
         memory_config = {
             MIMO_LANGUAGE_MODULE_KEY: ModuleMemoryConfig(
                 recompute_granularity='selective', recompute_modules=['core_attn']
             )
         }
-        model, _, llm_pg = create_mimo_model(enc_grid, llm_grid, memory_config=memory_config)
-        grads = run_fwd_bwd(model, llm_pg, enc_grid, llm_grid, seed=42)
-        _assert_valid_grads(grads)
-        del model
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
 
 
-class TestProjectionRecompute:
-    """Test projection layer recompute (MLP projection)."""
+class TestProjectionRecomputeCorrectness:
+    """Verify projection recompute produces identical gradients to baseline."""
 
     def test_recompute_projection_mlp(self, homogeneous_grids):
         """Recompute projection: MLP intermediates freed during forward."""
         enc_grid, llm_grid = homogeneous_grids
-
         memory_config = {ENCODER_NAME: ModuleMemoryConfig(recompute_projection=True)}
-        model, _, llm_pg = create_mimo_model(enc_grid, llm_grid, memory_config=memory_config)
-        grads = run_fwd_bwd(model, llm_pg, enc_grid, llm_grid, seed=42)
-        _assert_valid_grads(grads)
-        del model
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
 
 
-class TestMixedRecomputeAndOffload:
-    """Integration test: mix/match recompute + offload across modules."""
+class TestMixedRecomputeCorrectness:
+    """Verify combined encoder + LLM + projection recompute produces correct gradients."""
 
     def test_mixed_recompute(self, homogeneous_grids):
         """Encoder full recompute + recompute projection + LLM selective recompute."""
         enc_grid, llm_grid = homogeneous_grids
-
         memory_config = {
             ENCODER_NAME: ModuleMemoryConfig(
                 recompute_granularity='full',
@@ -553,7 +610,43 @@ class TestMixedRecomputeAndOffload:
                 recompute_granularity='selective', recompute_modules=['core_attn']
             ),
         }
-        model, _, llm_pg = create_mimo_model(enc_grid, llm_grid, memory_config=memory_config)
-        grads = run_fwd_bwd(model, llm_pg, enc_grid, llm_grid, seed=42)
-        _assert_valid_grads(grads)
-        del model
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
+
+
+class TestMemoryReduction:
+    """Verify recompute runs and report peak GPU memory (informational).
+
+    Note: with small test models (2 layers, hidden=64), recompute overhead
+    (RNG state saves, checkpoint buffers) can exceed activation savings.
+    Memory reduction is only meaningful for production-scale models.
+    """
+
+    def test_encoder_full_recompute_memory_report(self, homogeneous_grids):
+        """Full encoder recompute: verify it runs and report memory usage."""
+        enc_grid, llm_grid = homogeneous_grids
+        memory_config = {
+            ENCODER_NAME: ModuleMemoryConfig(
+                recompute_granularity='full',
+                recompute_method='uniform',
+                recompute_num_layers=ENCODER_LAYERS,
+            )
+        }
+        grads_base, grads_opt, mem_base, mem_opt = run_baseline_and_optimized(
+            enc_grid, llm_grid, memory_config
+        )
+
+        mem_base_mb = mem_base / (1024 * 1024)
+        mem_opt_mb = mem_opt / (1024 * 1024)
+        savings_mb = mem_base_mb - mem_opt_mb
+
+        # Log memory for manual inspection
+        if dist.get_rank() == 0:
+            print(
+                f"\nMemory report: baseline={mem_base_mb:.1f}MB, "
+                f"optimized={mem_opt_mb:.1f}MB, "
+                f"delta={savings_mb:+.1f}MB"
+            )
+
+        # Correctness must still hold regardless of memory outcome
+        assert_grads_match(grads_base, grads_opt)

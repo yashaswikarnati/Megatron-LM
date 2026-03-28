@@ -594,40 +594,55 @@ class MimoModel(MegatronModule):
         for module_name, mcfg in mem_cfg.items():
             if module_name == MIMO_LANGUAGE_MODULE_KEY:
                 tc = self.mimo_config.language_model_spec.params['config']
+                new_tc = self._rebuild_transformer_config(tc, mcfg)
+                if new_tc is not tc:
+                    self.mimo_config.language_model_spec.params['config'] = new_tc
             else:
-                # Encoder module — find the TransformerConfig in the encoder spec
+                # Encoder module — find and rebuild the TransformerConfig in each encoder spec
                 submodule_spec = self.mimo_config.modality_submodules_spec.get(module_name)
                 if submodule_spec is None:
                     logger.warning(
                         f"memory_config key '{module_name}' not found in modality_submodules_spec"
                     )
                     continue
-                # Encoder config is in the encoder spec's params
                 encoder_specs = (submodule_spec.submodules or {}).get('encoders', {})
                 for enc_spec in (
                     encoder_specs.values() if isinstance(encoder_specs, dict) else [encoder_specs]
                 ):
-                    enc_tc = getattr(enc_spec, 'params', {}).get('config')
+                    enc_params = getattr(enc_spec, 'params', None) or {}
+                    enc_tc = enc_params.get('config')
                     if enc_tc is not None:
-                        self._stamp_transformer_config(enc_tc, mcfg)
+                        new_tc = self._rebuild_transformer_config(enc_tc, mcfg)
+                        if new_tc is not enc_tc:
+                            enc_spec.params['config'] = new_tc
                 # Store MIMO-specific flags for this modality
                 self._modality_memory_configs[module_name] = mcfg
-                continue
-
-            self._stamp_transformer_config(tc, mcfg)
 
     @staticmethod
-    def _stamp_transformer_config(tc, mcfg: ModuleMemoryConfig):
-        """Stamp recompute/offload fields from ModuleMemoryConfig onto a TransformerConfig."""
+    def _rebuild_transformer_config(tc, mcfg: ModuleMemoryConfig):
+        """Rebuild a TransformerConfig with memory optimization fields from ModuleMemoryConfig.
+
+        We reconstruct the config rather than mutating it because TransformerConfig.__post_init__
+        performs validation and setup that depends on recompute/offload fields.  Direct mutation
+        after construction would bypass that logic and leave the config in an inconsistent state.
+        """
+        import dataclasses
+
+        overrides = {}
         if mcfg.recompute_granularity is not None:
-            tc.recompute_granularity = mcfg.recompute_granularity
-            tc.recompute_method = mcfg.recompute_method
-            tc.recompute_num_layers = mcfg.recompute_num_layers
+            overrides['recompute_granularity'] = mcfg.recompute_granularity
+            overrides['recompute_method'] = mcfg.recompute_method
+            overrides['recompute_num_layers'] = mcfg.recompute_num_layers
             if mcfg.recompute_modules is not None:
-                tc.recompute_modules = mcfg.recompute_modules
+                overrides['recompute_modules'] = mcfg.recompute_modules
         if mcfg.offload_modules is not None:
-            tc.fine_grained_activation_offloading = True
-            tc.offload_modules = mcfg.offload_modules
+            overrides['fine_grained_activation_offloading'] = True
+            overrides['offload_modules'] = mcfg.offload_modules
+
+        if not overrides:
+            return tc
+
+        return dataclasses.replace(tc, **overrides)
 
     def _apply_colocated_comms(self, modality_embeddings):
         """Transform encoder embeddings from encoder TP/DP to LLM TP/DP layout."""
