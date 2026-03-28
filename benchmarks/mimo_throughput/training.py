@@ -487,6 +487,8 @@ def run_benchmark(
         profiler_ctx = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
         )
 
     for i in range(num_iterations):
@@ -570,17 +572,29 @@ def run_benchmark(
             profiler_ctx.__exit__(None, None, None)
             # Save profiler output
             if rank == 0:
+                from benchmarks.mimo_throughput.analyze_profile import (
+                    analyze_profile,
+                    save_analysis,
+                )
+
                 os.makedirs(results_dir, exist_ok=True)
-                prof_path = os.path.join(
+
+                # Structured analysis report
+                desc = (
+                    f"{config.experiment.name} | "
+                    f"enc TP{config.encoder_parallel.tp}/DP{config.encoder_parallel.dp} | "
+                    f"llm TP{config.llm_parallel.tp}/DP{config.llm_parallel.dp}"
+                    f"/PP{config.llm_parallel.pp} | "
+                    f"mbs={config.data.micro_batch_size} nmb={config.data.num_microbatches}"
+                )
+                report = analyze_profile(profiler_ctx, config_description=desc)
+                analysis_path = os.path.join(
                     results_dir,
-                    f"{config.experiment.name}_profile_{profile_steps[0]}-{profile_steps[1]}.txt",
+                    f"{config.experiment.name}_analysis_{profile_steps[0]}-{profile_steps[1]}.txt",
                 )
-                table = profiler_ctx.key_averages().table(
-                    sort_by="cuda_time_total", row_limit=30
-                )
-                with open(prof_path, 'w') as f:
-                    f.write(table)
-                print(f"Profiler output saved to {prof_path}")
+                save_analysis(report, analysis_path)
+                print(report)
+                print(f"\nAnalysis saved to {analysis_path}")
 
     # 7. Summary
     summary = monitor.get_summary()

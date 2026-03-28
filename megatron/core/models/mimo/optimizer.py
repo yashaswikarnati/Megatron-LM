@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+from torch.profiler import record_function
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
@@ -72,35 +73,36 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self) -> Tuple[bool, Optional[float], Optional[int]]:
-        found_inf = self.prepare_grads()
-        # Synchronize found_inf across all ranks to prevent deadlock:
-        # if encoder ranks detect inf but LLM ranks don't, the early return
-        # would skip the all_reduce in get_grad_norm(), causing a hang.
-        found_inf_tensor = torch.tensor([found_inf], dtype=torch.float32, device="cuda")
-        torch.distributed.all_reduce(found_inf_tensor, op=torch.distributed.ReduceOp.MAX)
-        found_inf = found_inf_tensor.item() > 0
-        if found_inf:
-            return False, None, None
+        with record_function("mimo::optimizer_step"):
+            found_inf = self.prepare_grads()
+            # Synchronize found_inf across all ranks to prevent deadlock:
+            # if encoder ranks detect inf but LLM ranks don't, the early return
+            # would skip the all_reduce in get_grad_norm(), causing a hang.
+            found_inf_tensor = torch.tensor([found_inf], dtype=torch.float32, device="cuda")
+            torch.distributed.all_reduce(found_inf_tensor, op=torch.distributed.ReduceOp.MAX)
+            found_inf = found_inf_tensor.item() > 0
+            if found_inf:
+                return False, None, None
 
-        grad_norm = self.get_grad_norm()
+            grad_norm = self.get_grad_norm()
 
-        # Clip with global norm
-        for opt in self._active_optimizers:
-            if getattr(opt, "is_stub_optimizer", False):
-                continue
-            params = opt.get_parameters()
-            if params and opt.config.clip_grad > 0.0:
-                clip_grad_by_total_norm_fp32(
-                    params,
-                    max_norm=opt.config.clip_grad,
-                    total_norm=grad_norm,
-                    use_decoupled_grad=opt.config.use_precision_aware_optimizer,
-                )
+            # Clip with global norm
+            for opt in self._active_optimizers:
+                if getattr(opt, "is_stub_optimizer", False):
+                    continue
+                params = opt.get_parameters()
+                if params and opt.config.clip_grad > 0.0:
+                    clip_grad_by_total_norm_fp32(
+                        params,
+                        max_norm=opt.config.clip_grad,
+                        total_norm=grad_norm,
+                        use_decoupled_grad=opt.config.use_precision_aware_optimizer,
+                    )
 
-        num_zeros = self.count_zeros() if self.config.log_num_zeros_in_grad else None
-        success = self.step_with_ready_grads()
+            num_zeros = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+            success = self.step_with_ready_grads()
 
-        return success, grad_norm, num_zeros
+            return success, grad_norm, num_zeros
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:

@@ -18,6 +18,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from torch.profiler import record_function
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel import schedules
@@ -49,54 +50,57 @@ def colocated_forward_backward_with_pp(
     pp_group = llm_grid.get_pg("pp") if llm_grid and 'pp' in llm_grid.dim_names else None
     is_pp_first = pp_group is None or pp_group.rank() == 0
 
-    # ── Phase 1: Encoder forward on full batch (one pass) ────────────────
-    # All ranks participate (encoder is PP=1, communicate is collective).
-    all_batches = [next(data_iterator) for _ in range(num_microbatches)]
-    full_encoder_input = _concat_encoder_inputs(all_batches, encoder_name)
-    _slice_for_encoder_dp(full_encoder_input, encoder_grid, llm_grid)
+    with record_function("mimo::forward_backward"):
+        # ── Phase 1: Encoder forward on full batch (one pass) ────────────────
+        # All ranks participate (encoder is PP=1, communicate is collective).
+        all_batches = [next(data_iterator) for _ in range(num_microbatches)]
+        full_encoder_input = _concat_encoder_inputs(all_batches, encoder_name)
+        _slice_for_encoder_dp(full_encoder_input, encoder_grid, llm_grid)
 
-    enc_out = mimo_model.encode_and_communicate({encoder_name: full_encoder_input})
+        with record_function("mimo::encoder_forward"):
+            enc_out = mimo_model.encode_and_communicate({encoder_name: full_encoder_input})
 
-    # Detach: sever autograd link to encoder so Phase 2 has no encoder collectives.
-    # Microbatch slices are views into detached_full — their .grad accumulates
-    # into detached_full.grad automatically via PyTorch's view gradient semantics.
-    detached_full = {k: v.detach().requires_grad_(True) for k, v in enc_out.items()}
-    lm_data = _build_lm_microbatches(detached_full, all_batches, num_microbatches)
+        # Detach: sever autograd link to encoder so Phase 2 has no encoder collectives.
+        # Microbatch slices are views into detached_full — their .grad accumulates
+        # into detached_full.grad automatically via PyTorch's view gradient semantics.
+        detached_full = {k: v.detach().requires_grad_(True) for k, v in enc_out.items()}
+        lm_data = _build_lm_microbatches(detached_full, all_batches, num_microbatches)
 
-    # ── Phase 2: LLM 1F1B pipeline ──────────────────────────────────────
-    # Only LLM P2P communication (within PP group). No encoder collectives.
-    cache_iter = iter(lm_data)
+        # ── Phase 2: LLM 1F1B pipeline ──────────────────────────────────────
+        # Only LLM P2P communication (within PP group). No encoder collectives.
+        cache_iter = iter(lm_data)
 
-    def _lm_forward_step(data_iterator_unused, model, *args):
-        cached = next(cache_iter)
-        output_tensor, loss_mask = model(
-            input_ids=cached['input_ids'],
-            labels=cached['labels'],
-            loss_mask=cached['loss_mask'],
-            position_ids=cached['position_ids'],
-            encoder_embeddings=cached['encoder_embeddings'],
-        )
-        return output_tensor, partial(_loss_func, cached['loss_mask'])
+        def _lm_forward_step(data_iterator_unused, model, *args):
+            cached = next(cache_iter)
+            output_tensor, loss_mask = model(
+                input_ids=cached['input_ids'],
+                labels=cached['labels'],
+                loss_mask=cached['loss_mask'],
+                position_ids=cached['position_ids'],
+                encoder_embeddings=cached['encoder_embeddings'],
+            )
+            return output_tensor, partial(_loss_func, cached['loss_mask'])
 
-    losses = schedules.forward_backward_pipelining_without_interleaving(
-        forward_step_func=_lm_forward_step,
-        data_iterator=cache_iter,
-        model=[mimo_model],
-        num_microbatches=num_microbatches,
-        forward_only=forward_only,
-        **schedule_kwargs,
-    )
+        with record_function("mimo::llm_forward"):
+            losses = schedules.forward_backward_pipelining_without_interleaving(
+                forward_step_func=_lm_forward_step,
+                data_iterator=cache_iter,
+                model=[mimo_model],
+                num_microbatches=num_microbatches,
+                forward_only=forward_only,
+                **schedule_kwargs,
+            )
 
-    # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────────
-    # detached_full.grad was populated by Phase 2's per-microbatch LLM backward
-    # (accumulated across microbatch view slices on PP stage 0).
-    # Broadcast to PP stage 1+ then run one encoder backward for the full batch.
-    if not forward_only and enc_out:
-        _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
-        for key in enc_out:
-            grad = detached_full[key].grad
-            if grad is not None:
-                torch.autograd.backward(enc_out[key], grad_tensors=grad)
+        # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────────
+        # detached_full.grad was populated by Phase 2's per-microbatch LLM backward
+        # (accumulated across microbatch view slices on PP stage 0).
+        # Broadcast to PP stage 1+ then run one encoder backward for the full batch.
+        if not forward_only and enc_out:
+            _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
+            for key in enc_out:
+                grad = detached_full[key].grad
+                if grad is not None:
+                    torch.autograd.backward(enc_out[key], grad_tensors=grad)
 
     return losses
 

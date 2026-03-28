@@ -5,6 +5,7 @@ import warnings
 from typing import Any, Dict, Optional
 
 import torch
+from torch.profiler import record_function
 
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
@@ -617,35 +618,43 @@ class MimoModel(MegatronModule):
             # 1. Process each modality to get embeddings
             modality_embeddings = {}
 
-            for modality_name, submodule in self.modality_submodules.items():
-                if (
-                    modality_inputs
-                    and modality_name in modality_inputs
-                    and modality_inputs[modality_name] is not None
-                ):
-                    logger.debug(f"Processing {modality_name} modality")
-                    embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
-                    if embeddings is not None:
-                        modality_embeddings[modality_name] = embeddings
-                        logger.debug(f"{modality_name} embeddings: {embeddings.shape}")
+            with record_function("mimo::encoder_forward"):
+                for modality_name, submodule in self.modality_submodules.items():
+                    if (
+                        modality_inputs
+                        and modality_name in modality_inputs
+                        and modality_inputs[modality_name] is not None
+                    ):
+                        logger.debug(f"Processing {modality_name} modality")
+                        embeddings = submodule.forward(
+                            encoder_inputs=modality_inputs[modality_name]
+                        )
+                        if embeddings is not None:
+                            modality_embeddings[modality_name] = embeddings
+                            logger.debug(f"{modality_name} embeddings: {embeddings.shape}")
 
             # Apply colocated communication if configured (no-op when colocated_comms is empty)
             if self.colocated_comms:
-                modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+                with record_function("mimo::bridge_communicate"):
+                    modality_embeddings = self._apply_colocated_comms(modality_embeddings)
 
         # Get text embeddings
-        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+        with record_function("mimo::text_embedding"):
+            text_embeddings = self.get_text_embeddings(
+                input_ids, position_ids, self.special_token_ids
+            )
         logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
 
         modality_embeddings["text"] = text_embeddings
 
         # 2. Merge embeddings from different modalities
         logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
-        combined_embeddings = self.align_embeddings_by_token_positions(
-            modality_embeddings=modality_embeddings,
-            input_ids=input_ids,
-            special_token_ids=self.special_token_ids,
-        )
+        with record_function("mimo::align_embeddings"):
+            combined_embeddings = self.align_embeddings_by_token_positions(
+                modality_embeddings=modality_embeddings,
+                input_ids=input_ids,
+                special_token_ids=self.special_token_ids,
+            )
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
         # 3. If sharding is needed, apply PartitionAdapter.
@@ -669,14 +678,15 @@ class MimoModel(MegatronModule):
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
         # 5. Forward pass through language model
-        lm_output = self.language_model(
-            input_ids=None,
-            position_ids=None,
-            decoder_input=combined_embeddings,
-            labels=labels,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-        )
+        with record_function("mimo::llm_forward"):
+            lm_output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                decoder_input=combined_embeddings,
+                labels=labels,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+            )
 
         logger.debug(f"Language model output shape: {lm_output.shape}")
 
