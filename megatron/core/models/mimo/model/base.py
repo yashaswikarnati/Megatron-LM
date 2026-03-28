@@ -212,11 +212,13 @@ class MimoModel(MegatronModule):
             else:
                 raise ValueError(f"No special token ID defined for modality {modality_name}")
 
-            num_tokens = mask.sum().item()
-            if num_tokens != modality_emb.size(0):
-                raise ValueError(
-                    f"Number of {modality_name} tokens ({num_tokens}) does not match "
-                    f"number of {modality_name} embeddings ({modality_emb.size(0)})"
+            # Validate on GPU without CPU sync (torch.debugging only, no .item())
+            num_tokens = mask.sum()
+            expected = modality_emb.size(0)
+            if torch.is_grad_enabled():
+                # Fast GPU-side check: avoid .item() which forces CPU-GPU sync
+                torch._assert(
+                    num_tokens == expected, f"{modality_name} token count mismatch with embeddings"
                 )
 
             expanded_mask = mask.unsqueeze(-1).expand_as(combined_embeddings)

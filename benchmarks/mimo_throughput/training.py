@@ -16,6 +16,9 @@ import time
 from contextlib import ExitStack, contextmanager
 from functools import partial
 
+# Ensure TP all-reduce overlaps with backward compute (TE recommendation)
+os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+
 import torch
 import torch.distributed as dist
 
@@ -111,6 +114,9 @@ def _get_vision_submodules_spec(arch, language_hidden_size, pg_collection):
         pipeline_model_parallel_size=1,
         pipeline_dtype=torch.bfloat16,
         bf16=True,
+        recompute_granularity='full',
+        recompute_method='uniform',
+        recompute_num_layers=arch.num_layers,
     )
 
     proj_cfg = TransformerConfig(

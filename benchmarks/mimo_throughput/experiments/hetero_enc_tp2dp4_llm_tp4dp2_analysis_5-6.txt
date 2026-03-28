@@ -7,14 +7,14 @@ Config: hetero_enc_tp2dp4_llm_tp4dp2 | enc TP2/DP4 | llm TP4/DP2/PP1 | mbs=2 nmb
 
 Phase                                  CUDA ms   % iter   Calls    Avg ms
 ────────────────────────────────────────────────────────────────────────
-encoder_forward                          358.8    17.2%       8     44.86
-bridge_communicate                         3.7     0.2%       8      0.47
-text_embedding                            11.5     0.6%       8      1.43
-align_embeddings                          14.9     0.7%       8      1.86
-llm_forward                             1504.7    72.3%       8    188.09 ◄ longest
-optimizer_step                           187.9     9.0%       4     46.99
+encoder_forward                          408.8    19.2%       8     51.09
+bridge_communicate                         1.4     0.1%       8      0.18
+text_embedding                            29.2     1.4%       8      3.65
+align_embeddings                          15.0     0.7%       8      1.88
+llm_forward                             1489.9    70.0%       8    186.24 ◄ longest
+optimizer_step                           185.5     8.7%       4     46.38
 ────────────────────────────────────────────────────────────────────────
-SUM                                     2081.6
+SUM                                     2129.8
 
 (Wall-clock fwd_bwd from harness timers is the ground truth.
  CUDA inclusive times may exceed wall-clock due to overlap.)
@@ -23,18 +23,18 @@ SUM                                     2081.6
 
 Category                CUDA ms   % total   Op count
 ───────────────────────────────────────────────────
-Compute                  3974.1     50.2%       8124
-Communication            2177.5     27.5%      15096
-Elementwise               735.8      9.3%      25104
-Other                    1023.1     12.9%     186982
+Compute                  4219.8     49.4%       8124
+Communication            2545.8     29.8%      15096
+Elementwise               734.1      8.6%      25112
+Other                    1042.6     12.2%     186919
 ───────────────────────────────────────────────────
-TOTAL                    7910.5    100.0%
+TOTAL                    8542.4    100.0%
 
 Collective             Total ms    Calls     Avg ms
 ──────────────────────────────────────────────────
-AllReduce               1427.82     4704      0.304
-AllGather                102.10     2896      0.035
-ReduceScatter             68.57     2148      0.032
+AllReduce               1652.71     4704      0.351
+AllGather                 95.91     2896      0.033
+ReduceScatter            107.01     2148      0.050
 
 ─── MEMORY ─────────────────────────────────────────────────────────────
 
@@ -43,27 +43,28 @@ Headroom:         25.6 GB
 
 Phase                                 Mem (GB)      Delta
 ─────────────────────────────────────────────────────────
-encoder_forward                          21.67    +21.67
-bridge_communicate                       21.70     +0.03
-text_embedding                           21.84     +0.14
-align_embeddings                         21.96     +0.13
-llm_forward                              54.36    +32.39 ◄ PEAK
+encoder_forward                          21.81    +21.81
+bridge_communicate                       21.84     +0.03
+text_embedding                           19.37     -2.47
+align_embeddings                         21.96     +2.59
+llm_forward                              54.35    +32.39 ◄ PEAK
 
 Top allocators                                             MB   Calls
 ─────────────────────────────────────────────────────────────────────
-aten::empty                                          261554.9   10106
-aten::empty_strided                                   99878.0    4582
-aten::add                                             92489.1    1456
+aten::empty                                          261487.6   10106
+aten::empty_strided                                  100066.8    4582
+aten::add                                             92347.6    1456
 aten::gelu_backward                                   19031.7     288
-aten::gelu                                            18897.4     288
-aten::cat                                             14435.2     296
+aten::gelu                                            19020.1     288
+aten::cat                                             14425.8     296
 aten::resize_                                          7786.5      40
 aten::mm                                               1847.6      12
-cudaEventQuery                                          525.9    5709
-cudaThreadExchangeStreamCaptureMode                     137.1    6186
+_LayerNormLinear                                        133.9     576
+cudaThreadExchangeStreamCaptureMode                      83.1    6109
 
 ─── BOTTLENECK ASSESSMENT ──────────────────────────────────────────────
 
-COMMUNICATION-BOUND: 28% of CUDA time in collectives (2177ms). TP all-reduce is the dominant cost.
-ENCODER/LLM SPLIT: encoder=19%, llm=81% of model compute
-OFFLOAD OPPORTUNITY: 21.7 GB encoder activations held through LLM forward (peaks at 54.4 GB)
+COMMUNICATION-BOUND: 30% of CUDA time in collectives (2546ms). TP all-reduce is the dominant cost.
+COMPUTE UNDERUTILIZED: Only 49% of CUDA time in compute. Increase batch size or reduce communication.
+ENCODER/LLM SPLIT: encoder=22%, llm=78% of model compute
+OFFLOAD OPPORTUNITY: 21.8 GB encoder activations held through LLM forward (peaks at 54.4 GB)
