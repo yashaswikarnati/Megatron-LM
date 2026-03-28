@@ -62,6 +62,7 @@ class MimoModel(MegatronModule):
         self.mimo_config = mimo_config
         modality_names = list(mimo_config.modality_submodules_spec.keys())
         self.colocated_comms = {}
+        self.memory_waterfall: dict = {}  # phase_name -> memory_allocated_bytes
         if mimo_config.module_to_grid_map:
             if self._is_colocated(mimo_config.module_to_grid_map):
                 self.role = RankRole.colocated(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
@@ -536,6 +537,10 @@ class MimoModel(MegatronModule):
 
         return lm_output
 
+    def _record_mem(self, phase_name: str):
+        """Record GPU memory at a phase boundary (no sync, fast CPU read)."""
+        self.memory_waterfall[phase_name] = torch.cuda.memory_allocated()
+
     @staticmethod
     def _is_colocated(module_to_grid_map):
         """Check if all grids span the same ranks (colocated)."""
@@ -612,10 +617,17 @@ class MimoModel(MegatronModule):
             packed_seq_params.qkv_format = 'thd'
             logger.debug(f"Packed sequence parameters: {packed_seq_params}")
 
+        # Compute text embeddings FIRST — independent of encoder, enables GPU overlap
+        with record_function("mimo::text_embedding"):
+            text_embeddings = self.get_text_embeddings(
+                input_ids, position_ids, self.special_token_ids
+            )
+        self._record_mem("mimo::text_embedding")
+
         if encoder_embeddings is not None:
             modality_embeddings = encoder_embeddings
         else:
-            # 1. Process each modality to get embeddings
+            # Process each modality to get embeddings
             modality_embeddings = {}
 
             with record_function("mimo::encoder_forward"):
@@ -625,25 +637,18 @@ class MimoModel(MegatronModule):
                         and modality_name in modality_inputs
                         and modality_inputs[modality_name] is not None
                     ):
-                        logger.debug(f"Processing {modality_name} modality")
                         embeddings = submodule.forward(
                             encoder_inputs=modality_inputs[modality_name]
                         )
                         if embeddings is not None:
                             modality_embeddings[modality_name] = embeddings
-                            logger.debug(f"{modality_name} embeddings: {embeddings.shape}")
+            self._record_mem("mimo::encoder_forward")
 
-            # Apply colocated communication if configured (no-op when colocated_comms is empty)
+            # Apply colocated communication if configured
             if self.colocated_comms:
                 with record_function("mimo::bridge_communicate"):
                     modality_embeddings = self._apply_colocated_comms(modality_embeddings)
-
-        # Get text embeddings
-        with record_function("mimo::text_embedding"):
-            text_embeddings = self.get_text_embeddings(
-                input_ids, position_ids, self.special_token_ids
-            )
-        logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
+                self._record_mem("mimo::bridge_communicate")
 
         modality_embeddings["text"] = text_embeddings
 
@@ -655,6 +660,7 @@ class MimoModel(MegatronModule):
                 input_ids=input_ids,
                 special_token_ids=self.special_token_ids,
             )
+        self._record_mem("mimo::align_embeddings")
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
         # 3. If sharding is needed, apply PartitionAdapter.
@@ -687,6 +693,7 @@ class MimoModel(MegatronModule):
                 attention_mask=None,
                 packed_seq_params=packed_seq_params,
             )
+        self._record_mem("mimo::llm_forward")
 
         logger.debug(f"Language model output shape: {lm_output.shape}")
 

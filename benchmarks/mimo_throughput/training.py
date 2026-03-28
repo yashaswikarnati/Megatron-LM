@@ -587,7 +587,13 @@ def run_benchmark(
                     f"/PP{config.llm_parallel.pp} | "
                     f"mbs={config.data.micro_batch_size} nmb={config.data.num_microbatches}"
                 )
-                report = analyze_profile(profiler_ctx, config_description=desc)
+                # Get memory waterfall from model (recorded at phase boundaries)
+                mem_waterfall = getattr(mimo_model, 'memory_waterfall', None)
+                report = analyze_profile(
+                    profiler_ctx,
+                    config_description=desc,
+                    memory_waterfall=mem_waterfall,
+                )
                 analysis_path = os.path.join(
                     results_dir,
                     f"{config.experiment.name}_analysis_{profile_steps[0]}-{profile_steps[1]}.txt",

@@ -1,28 +1,35 @@
 # Bottleneck Analysis — Colocated MIMO Training
 
-## Current Bottleneck: Communication-Bound (TP all-reduce)
+## Current State (2026-03-28)
 
-**Evidence:** Profiling shows 28.2% of CUDA time in NCCL all_reduce at TP4. Only 51% of time is actual compute (GEMM + attention).
+Model: 1B ViT + 7B LLM, 8xH100, mbs=2
 
-**Root cause:** With TP=4, every transformer layer does 2 all-reduces (one after attention column parallel, one after FFN row parallel). With 32 LLM layers × 2 all-reduces × 2 microbatches × 2 (fwd+bwd) = 256 all-reduce calls per iteration. At ~4.3ms average per all-reduce, this accounts for ~1.1s of the ~3.9s profiled.
+**Homo 275.0 TFLOPs vs Hetero 273.9 TFLOPs — hetero is NOT winning yet.**
 
-**Why this matters for colocated:** The colocated communicator adds minimal overhead (fan-in is a single all-gather). The dominant communication cost is WITHIN each module's TP all-reduce, not BETWEEN modules. This means:
-- Reducing encoder TP (from 4→2) saves encoder all-reduce but encoder is only 12% of compute
-- The LLM's TP all-reduce is the real bottleneck
+## Why Heterogeneous Doesn't Help (Yet)
 
-## Optimization Hypotheses (ordered by expected impact)
+The encoder is only 19% of model compute. The LLM (81%) dominates iteration time. Reducing encoder TP from 4→2 saves ~8ms in encoder all-reduce, but this is lost in the noise of the 1170ms iteration.
 
-1. **Increase batch size (mbs=4 or mbs=8)** — doubles/quadruples GEMM size, shifting balance toward compute. GEMM time scales linearly with batch, but all-reduce time stays constant.
-   - Expected: significant TFLOPs improvement
-   - Risk: OOM at higher batch (currently 58.6GB of 80GB)
+For heterogeneous to win, we need either:
+- **Larger batch** (increases encoder fraction due to better encoder GEMM utilization at lower TP)
+- **Longer vision sequences** (increases encoder compute relative to LLM)
+- **Extreme TP splits** (enc TP1/DP8 eliminates ALL encoder communication)
 
-2. **Try TP2/DP4 for LLM** — halves TP all-reduce frequency (larger messages, but fewer calls). Each all-reduce moves 2x more data but happens with 2x fewer ranks.
-   - Expected: moderate improvement if network-latency-bound (small messages)
-   - Risk: TP2 means each GPU holds 2x more LLM params → more memory
+## Primary Bottleneck: Communication (28% of CUDA time)
 
-3. **Enable activation recomputation** — frees memory to allow larger batch
-   - Expected: enables mbs=4-8 which unlocks hypothesis #1
-   - Risk: recomputation adds ~33% extra forward compute
+AllReduce: 1428ms out of 7911ms total CUDA time. This is TP all-reduce inside both encoder and LLM forward/backward. The LLM contributes ~90% of this.
 
-4. **DDP bucket tuning** — current bucket_size=10000. Larger buckets = fewer collective calls for gradient sync
-   - Expected: marginal improvement (reduce_scatter is only 1.3% of time)
+## Memory Bottleneck: Cannot Increase Batch
+
+- Peak at mbs=2: 54.4 GB forward, ~75 GB with backward
+- mbs=4: OOM (needs ~100+ GB)
+- Encoder activations: 21.7 GB held through entire LLM fwd+bwd → offload candidate
+- Freeing 21.7 GB via encoder activation recompute/offload → mbs=3 might fit
+
+## What to Try Next (Priority Order)
+
+1. **Activation recomputation for encoder** — research how Megatron enables this, wire into MIMO path. This frees 21.7 GB → enables mbs=3 → should significantly boost TFLOPs by improving compute/communication ratio.
+
+2. **Extreme heterogeneous: enc TP1/DP8, llm TP4/DP2** — eliminates ALL encoder all-reduce. Even if encoder is small, zero communication is always better. Requires mbs divisible by 8.
+
+3. **Longer vision seq (4096)** — increases encoder compute fraction, makes heterogeneous TP split more impactful. Also increases memory pressure so may need recompute first.

@@ -1,0 +1,123 @@
+{
+  "config": {
+    "experiment": "fan_in_pp1",
+    "world_size": 8,
+    "encoder_arch": {
+      "num_layers": 2,
+      "hidden_size": 256,
+      "seq_length": 32
+    },
+    "llm_arch": {
+      "num_layers": 2,
+      "hidden_size": 256,
+      "seq_length": 64,
+      "vocab_size": 1000
+    },
+    "encoder_parallel": {
+      "tp": 2,
+      "dp": 4,
+      "pp": 1
+    },
+    "llm_parallel": {
+      "tp": 4,
+      "dp": 2,
+      "pp": 1
+    },
+    "data": {
+      "micro_batch_size": 2,
+      "num_microbatches": 2,
+      "global_batch_size": 4
+    },
+    "total_flops_per_iteration": 8043626496
+  },
+  "summary": {
+    "median_tflops_per_gpu": 0.0331140927118211,
+    "median_tokens_per_sec": 16862.459217253447,
+    "median_samples_per_sec": 263.4759252695851,
+    "median_elapsed_sec": 0.03036332130432129,
+    "max_memory_gb": 0.161068032,
+    "num_iterations": 8
+  },
+  "history": [
+    {
+      "iteration": 1,
+      "elapsed_sec": 17.407862663269043,
+      "tflops_per_gpu": 5.775857332109632e-05,
+      "tokens_per_sec": 29.411996745604547,
+      "samples_per_sec": 0.45956244915007105,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 2,
+      "elapsed_sec": 0.03900957107543945,
+      "tflops_per_gpu": 0.025774528770274956,
+      "tokens_per_sec": 13124.98409710423,
+      "samples_per_sec": 205.0778765172536,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 3,
+      "elapsed_sec": 0.03103804588317871,
+      "tflops_per_gpu": 0.032394220814813364,
+      "tokens_per_sec": 16495.883855802986,
+      "samples_per_sec": 257.74818524692165,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 4,
+      "elapsed_sec": 0.03256559371948242,
+      "tflops_per_gpu": 0.030874711533310256,
+      "tokens_per_sec": 15722.11470825097,
+      "samples_per_sec": 245.65804231642142,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 5,
+      "elapsed_sec": 0.03083348274230957,
+      "tflops_per_gpu": 0.032609138591415794,
+      "tokens_per_sec": 16605.324941040017,
+      "samples_per_sec": 259.45820220375026,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 6,
+      "elapsed_sec": 0.030385255813598633,
+      "tflops_per_gpu": 0.033090171041114586,
+      "tokens_per_sec": 16850.277751186786,
+      "samples_per_sec": 263.28558986229353,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 7,
+      "elapsed_sec": 0.029978036880493164,
+      "tflops_per_gpu": 0.03353966492229692,
+      "tokens_per_sec": 17079.17039534902,
+      "samples_per_sec": 266.86203742732846,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 8,
+      "elapsed_sec": 0.030341386795043945,
+      "tflops_per_gpu": 0.03313801438252762,
+      "tokens_per_sec": 16874.640683320107,
+      "samples_per_sec": 263.6662606768767,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 9,
+      "elapsed_sec": 0.029984712600708008,
+      "tflops_per_gpu": 0.03353219773653121,
+      "tokens_per_sec": 17075.3679322546,
+      "samples_per_sec": 266.80262394147815,
+      "max_memory_gb": 0.161068032
+    },
+    {
+      "iteration": 10,
+      "elapsed_sec": 0.02980804443359375,
+      "tflops_per_gpu": 0.03373093844649706,
+      "tokens_per_sec": 17176.571282313795,
+      "samples_per_sec": 268.38392628615304,
+      "max_memory_gb": 0.161068032
+    }
+  ]
+}
