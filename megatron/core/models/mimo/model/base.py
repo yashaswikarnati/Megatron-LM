@@ -641,6 +641,7 @@ class MimoModel(MegatronModule):
                     mcfg.offload_projection
                     or mcfg.offload_encoder_output
                     or mcfg.offload_projection_output
+                    or mcfg.offload_modules
                 ):
                     self._has_mimo_offloading = True
 

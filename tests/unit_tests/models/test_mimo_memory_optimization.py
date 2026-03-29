@@ -886,6 +886,30 @@ class TestProjectionOutputOffloadCorrectness:
         assert_grads_match(grads_base, grads_opt)
 
 
+class TestEncoderInternalOffloadCorrectness:
+    """Verify offload_modules on encoder TransformerConfig (TransformerLayer-level offload)."""
+
+    def test_encoder_offload_attn_norm(self, homogeneous_grids):
+        """Offload attn_norm inside encoder TransformerLayers to CPU."""
+        enc_grid, llm_grid = homogeneous_grids
+        memory_config = {ENCODER_NAME: ModuleMemoryConfig(offload_modules=['attn_norm'])}
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
+
+
+class TestLLMInternalOffloadCorrectness:
+    """Verify offload_modules on LLM TransformerConfig (TransformerLayer-level offload)."""
+
+    def test_llm_offload_attn_norm(self, homogeneous_grids):
+        """Offload attn_norm inside LLM TransformerLayers to CPU."""
+        enc_grid, llm_grid = homogeneous_grids
+        memory_config = {
+            MIMO_LANGUAGE_MODULE_KEY: ModuleMemoryConfig(offload_modules=['attn_norm'])
+        }
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
+
+
 class TestMixedRecomputeAndOffloadCorrectness:
     """Verify combined recompute + offload produces correct gradients."""
 
