@@ -70,6 +70,8 @@ class ModuleMemorySpec:
     recompute_projection: bool = False
     offload_projection: bool = False
     offload_encoder_output: bool = False
+    recompute_projection_output: bool = False
+    offload_projection_output: bool = False
 
 
 @dataclass(frozen=True)

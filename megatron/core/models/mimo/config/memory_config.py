@@ -27,6 +27,12 @@ class ModuleMemoryConfig:
             (including encoder output) to CPU via FineGrainedActivationOffloadingInterface.
         offload_encoder_output: Offload encoder input saved tensors to CPU
             via FineGrainedActivationOffloadingInterface.
+        recompute_projection_output: Wrap align_embeddings_by_token_positions with
+            checkpoint(). Discards combined_embeddings intermediate ([B, S, H]).
+            Cheap to replay (just indexing + masked_scatter). Does NOT cascade
+            back through the projection — checkpoint saves projection_output as input.
+        offload_projection_output: Offload align_embeddings saved tensors to CPU
+            via FineGrainedActivationOffloadingInterface.
     """
 
     # Recompute (maps to TransformerConfig)
@@ -42,3 +48,5 @@ class ModuleMemoryConfig:
     recompute_projection: bool = False
     offload_projection: bool = False
     offload_encoder_output: bool = False
+    recompute_projection_output: bool = False
+    offload_projection_output: bool = False

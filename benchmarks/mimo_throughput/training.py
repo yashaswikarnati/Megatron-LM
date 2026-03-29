@@ -218,6 +218,8 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
                 recompute_projection=ms.recompute_projection,
                 offload_projection=ms.offload_projection,
                 offload_encoder_output=ms.offload_encoder_output,
+                recompute_projection_output=ms.recompute_projection_output,
+                offload_projection_output=ms.offload_projection_output,
             )
         if config.memory.llm is not None:
             ms = config.memory.llm

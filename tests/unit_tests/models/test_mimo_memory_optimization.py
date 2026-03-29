@@ -864,6 +864,28 @@ class TestOffloadEncoderOutputCorrectness:
         assert_grads_match(grads_base, grads_opt)
 
 
+class TestProjectionOutputRecomputeCorrectness:
+    """Verify recompute_projection_output produces identical gradients."""
+
+    def test_recompute_projection_output(self, homogeneous_grids):
+        """Checkpoint around align_embeddings: discards combined_embeddings intermediate."""
+        enc_grid, llm_grid = homogeneous_grids
+        memory_config = {ENCODER_NAME: ModuleMemoryConfig(recompute_projection_output=True)}
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
+
+
+class TestProjectionOutputOffloadCorrectness:
+    """Verify offload_projection_output produces identical gradients."""
+
+    def test_offload_projection_output(self, homogeneous_grids):
+        """Offload align_embeddings saved tensors to CPU."""
+        enc_grid, llm_grid = homogeneous_grids
+        memory_config = {ENCODER_NAME: ModuleMemoryConfig(offload_projection_output=True)}
+        grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
+        assert_grads_match(grads_base, grads_opt)
+
+
 class TestMixedRecomputeAndOffloadCorrectness:
     """Verify combined recompute + offload produces correct gradients."""
 

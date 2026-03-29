@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 import torch
 from torch.profiler import record_function
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
@@ -123,6 +124,14 @@ class MimoModel(MegatronModule):
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
         self._initialize_language_model()
+
+        # Collect projection_output flags from any modality config
+        self._recompute_projection_output = any(
+            mcfg.recompute_projection_output for mcfg in self._modality_memory_configs.values()
+        )
+        self._offload_projection_output = any(
+            mcfg.offload_projection_output for mcfg in self._modality_memory_configs.values()
+        )
 
         # Enable schedule-level offload reset if any MIMO module uses offloading.
         # The schedule checks config.fine_grained_activation_offloading to call
@@ -628,7 +637,11 @@ class MimoModel(MegatronModule):
                             enc_spec.params['config'] = new_tc
                 # Store MIMO-specific flags for this modality
                 self._modality_memory_configs[module_name] = mcfg
-                if mcfg.offload_projection or mcfg.offload_encoder_output:
+                if (
+                    mcfg.offload_projection
+                    or mcfg.offload_encoder_output
+                    or mcfg.offload_projection_output
+                ):
                     self._has_mimo_offloading = True
 
     @staticmethod
@@ -756,11 +769,33 @@ class MimoModel(MegatronModule):
         # 2. Merge embeddings from different modalities
         logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
         with record_function("mimo::align_embeddings"):
-            combined_embeddings = self.align_embeddings_by_token_positions(
-                modality_embeddings=modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=self.special_token_ids,
-            )
+            if self._recompute_projection_output and self.training:
+                combined_embeddings = activation_checkpoint(
+                    self.align_embeddings_by_token_positions,
+                    modality_embeddings,
+                    input_ids,
+                    self.special_token_ids,
+                    use_reentrant=False,
+                )
+            elif self._offload_projection_output and self.training:
+                # Use a dummy tensor for the interface — the actual inputs are a dict
+                dummy = torch.tensor(0.0, device='cuda', requires_grad=False)
+                align_off = off_interface(True, dummy, "projection_output")
+                with align_off as _:
+                    combined_embeddings = self.align_embeddings_by_token_positions(
+                        modality_embeddings=modality_embeddings,
+                        input_ids=input_ids,
+                        special_token_ids=self.special_token_ids,
+                    )
+                combined_embeddings = align_off.group_commit(
+                    combined_embeddings, "projection_output"
+                )
+            else:
+                combined_embeddings = self.align_embeddings_by_token_positions(
+                    modality_embeddings=modality_embeddings,
+                    input_ids=input_ids,
+                    special_token_ids=self.special_token_ids,
+                )
         self._record_mem("mimo::align_embeddings")
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
