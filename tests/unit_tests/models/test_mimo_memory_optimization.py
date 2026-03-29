@@ -485,6 +485,26 @@ def _reset_cuda():
 # ============================================================================
 
 
+def _has_offload(memory_config):
+    """Check if a memory_config dict contains any offload flags."""
+    if not memory_config:
+        return False
+    for mcfg in memory_config.values():
+        if (
+            mcfg.offload_projection
+            or mcfg.offload_encoder_output
+            or mcfg.offload_projection_output
+            or mcfg.offload_modules
+        ):
+            return True
+    return False
+
+
+# Tolerance for offload memory expectation (matches test_fine_grained_activation_offloading.py)
+_OFFLOAD_REL_TOL = 0.30  # 30% relative
+_OFFLOAD_ABS_TOL = 20  # MiB absolute
+
+
 def run_and_validate(
     sc: ScheduleConfig, memory_config: Dict[str, ModuleMemoryConfig], check_memory: bool = False
 ):
@@ -492,6 +512,10 @@ def run_and_validate(
 
     Works for both PP=1 (forward_backward_no_pipelining) and PP>1
     (colocated_forward_backward_with_pp) based on sc.is_pp.
+
+    For offload configs, validates peak memory savings match
+    PipelineOffloadManager.offload_summary_bytes within tolerance
+    (same approach as test_fine_grained_activation_offloading.py).
     """
 
     def _run_one_iteration(model, sc, enc_grid, llm_grid, llm_pg, seed):
@@ -532,24 +556,47 @@ def run_and_validate(
         return _collect_grads(model)
 
     def _build_and_measure(sc, memory_config, seed):
-        """Build model, warmup, measure steady-state."""
+        """Build model, warmup, measure steady-state. Returns (grads, peak, offload_bytes)."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_iface,
+            PipelineOffloadManager,
+        )
+
+        is_offload = _has_offload(memory_config)
+        if is_offload:
+            off_iface.reset_instance()
+
         model, enc_grid, llm_grid, _, llm_pg = _build_mimo_model(sc, memory_config)
-        # Warmup
+
+        # Warmup iteration
         _run_one_iteration(model, sc, enc_grid, llm_grid, llm_pg, seed=seed + 1000)
+
+        # For offload: read expected offload bytes after warmup triggers post_warmup_callback
+        expected_offload_bytes = 0
+        if is_offload:
+            mgr = PipelineOffloadManager.get_instance()
+            if mgr is not None and hasattr(mgr, 'offload_summary_bytes'):
+                expected_offload_bytes = int(sum(mgr.offload_summary_bytes.values()))
+
         _reset_cuda()
-        # Measure
+
+        # Steady-state measurement
         torch.cuda.reset_peak_memory_stats()
         grads = _run_one_iteration(model, sc, enc_grid, llm_grid, llm_pg, seed=seed)
         torch.cuda.synchronize()
         peak = torch.cuda.max_memory_allocated()
+
         del model
         _reset_cuda()
         _destroy_all_grids()
-        return grads, peak
+        if is_offload:
+            off_iface.reset_instance()
+
+        return grads, peak, expected_offload_bytes
 
     # Run optimized first (avoids CUDA allocator caching bias)
-    grads_opt, peak_opt = _build_and_measure(sc, memory_config, seed=42)
-    grads_base, peak_base = _build_and_measure(sc, None, seed=42)
+    grads_opt, peak_opt, expected_offload_bytes = _build_and_measure(sc, memory_config, seed=42)
+    grads_base, peak_base, _ = _build_and_measure(sc, None, seed=42)
 
     # --- Gradient correctness ---
     assert len(grads_base) > 0, "Baseline produced no gradients"
@@ -569,18 +616,38 @@ def run_and_validate(
         matched += 1
     assert matched > 0, "No matching parameter names between baseline and optimized"
 
-    # --- Memory check (optional) ---
+    # --- Memory check ---
     if check_memory:
-        savings_mb = (peak_base - peak_opt) / (1024**2)
+        saved_mib = (peak_base - peak_opt) / (1024**2)
+        expected_offload_mib = expected_offload_bytes / (1024**2)
+
         if dist.get_rank() == 0:
             print(
                 f"\n  Memory: baseline={peak_base / (1024**2):.1f}MB, "
-                f"optimized={peak_opt / (1024**2):.1f}MB, saved={savings_mb:.1f}MB"
+                f"optimized={peak_opt / (1024**2):.1f}MB, saved={saved_mib:.1f}MB"
+                + (
+                    f", expected_offload={expected_offload_mib:.1f}MB"
+                    if expected_offload_mib > 0
+                    else ""
+                )
             )
-        assert savings_mb > 0, (
+
+        # Positive savings required
+        assert saved_mib > 0, (
             f"Expected memory reduction but got: "
             f"baseline={peak_base / (1024**2):.1f}MB, optimized={peak_opt / (1024**2):.1f}MB"
         )
+
+        # For offload: match expected savings within tolerance
+        # (same pattern as test_fine_grained_activation_offloading.py)
+        if expected_offload_mib >= 2.0:
+            rel_err = abs(saved_mib - expected_offload_mib) / max(expected_offload_mib, 1e-6)
+            abs_err = abs(saved_mib - expected_offload_mib)
+            assert rel_err <= _OFFLOAD_REL_TOL or abs_err <= _OFFLOAD_ABS_TOL, (
+                f"Offload memory saving mismatch: saved={saved_mib:.2f}MiB "
+                f"expected~={expected_offload_mib:.2f}MiB "
+                f"(rel_err={rel_err:.2f}, abs_err={abs_err:.2f}MiB)"
+            )
 
 
 # ============================================================================
@@ -655,4 +722,16 @@ def test_encoder_full_recompute_memory():
             recompute_num_layers=PP1_MEMORY.enc_layers,
         )
     }
+    run_and_validate(PP1_MEMORY, mc, check_memory=True)
+
+
+def test_offload_projection_memory():
+    """Verify offload_projection saves memory matching offload_summary_bytes."""
+    mc = {ENCODER_NAME: ModuleMemoryConfig(offload_projection=True)}
+    run_and_validate(PP1_MEMORY, mc, check_memory=True)
+
+
+def test_encoder_offload_attn_norm_memory():
+    """Verify encoder offload_modules=['attn_norm'] saves memory matching offload_summary_bytes."""
+    mc = {ENCODER_NAME: ModuleMemoryConfig(offload_modules=['attn_norm'])}
     run_and_validate(PP1_MEMORY, mc, check_memory=True)
