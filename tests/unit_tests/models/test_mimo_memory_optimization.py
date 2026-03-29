@@ -34,7 +34,9 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.models.mimo.colocated_schedule import colocated_forward_backward_with_pp
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -383,10 +385,11 @@ def make_batch(
     hidden_size=HIDDEN_SIZE,
     micro_batch_size=MICRO_BATCH_SIZE,
     vocab_size=VOCAB_SIZE,
+    image_token_id=IMAGE_TOKEN_ID,
 ):
     """Create a synthetic VLM batch."""
     input_ids = torch.randint(0, vocab_size, (micro_batch_size, seq_length), device=device)
-    input_ids[:, :image_seq_length] = IMAGE_TOKEN_ID
+    input_ids[:, :image_seq_length] = image_token_id
 
     labels = torch.randint(0, vocab_size, (micro_batch_size, seq_length), device=device)
     loss_mask = torch.ones(micro_batch_size, seq_length, device=device)
@@ -877,3 +880,197 @@ class TestMixedRecomputeAndOffloadCorrectness:
         }
         grads_base, grads_opt, _, _ = run_baseline_and_optimized(enc_grid, llm_grid, memory_config)
         assert_grads_match(grads_base, grads_opt)
+
+
+# ============================================================================
+# PP>1 colocated tests
+# ============================================================================
+
+PP_HIDDEN = 256
+PP_HEADS = 8
+PP_LAYERS = 2
+PP_VOCAB = 1000
+PP_SEQ = 64
+PP_IMAGE_SEQ = 32
+PP_MBS = 2
+PP_NMB = 4
+PP_IMAGE_TOKEN = 50257
+
+
+def _run_pp_colocated(enc_tp, enc_dp, llm_tp, llm_dp, llm_pp, memory_config=None, num_iterations=2):
+    """Run colocated PP>1 training and return param grads from all ranks.
+
+    Creates model, runs colocated_forward_backward_with_pp for num_iterations,
+    and collects gradients. Uses no DDP for clean gradient access.
+    """
+    os.environ.pop('NVTE_FLASH_ATTN', None)
+    os.environ.pop('NVTE_FUSED_ATTN', None)
+    os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
+    encoder_grid = create_hypercomm_grid(offset=0, tp=enc_tp, dp=enc_dp)
+    llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, pp=llm_pp, dp=llm_dp)
+    create_all_embedding_groups([encoder_grid, llm_grid])
+
+    encoder_pg = get_pg_collection(encoder_grid, is_language_model=False)
+    llm_pg = get_pg_collection(llm_grid, is_language_model=True)
+
+    tp_rank = dist.get_rank(llm_pg.tp) if llm_pg.tp else 0
+    model_parallel_cuda_manual_seed(
+        42, tp_rank=tp_rank, ep_rank=0, etp_rank=0, force_reset_rng=True
+    )
+    torch.manual_seed(42)
+
+    encoder_spec = _make_encoder_spec(
+        encoder_pg, num_layers=PP_LAYERS, hidden_size=PP_HIDDEN, num_heads=PP_HEADS
+    )
+    lm_spec = _make_lm_spec(
+        llm_pg,
+        num_layers=PP_LAYERS,
+        hidden_size=PP_HIDDEN,
+        num_heads=PP_HEADS,
+        vocab_size=PP_VOCAB,
+        seq_length=PP_SEQ,
+    )
+
+    mimo_config = MimoModelConfig(
+        language_model_spec=lm_spec,
+        modality_submodules_spec={ENCODER_NAME: encoder_spec},
+        special_token_ids={ENCODER_NAME: PP_IMAGE_TOKEN},
+        module_to_grid_map={ENCODER_NAME: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid},
+        memory_config=memory_config,
+    )
+
+    model = MimoModel(mimo_config)
+    model.to(torch.device("cuda")).to(torch.bfloat16)
+    model.model_type = ModelType.encoder_or_decoder
+    model.train()
+
+    # Schedule callbacks (no DDP for clean gradients)
+    @contextmanager
+    def no_sync_func():
+        yield
+
+    def finalize_grads_func(*args, **kwargs):
+        pass
+
+    model.config.no_sync_func = no_sync_func
+    model.config.finalize_model_grads_func = finalize_grads_func
+    model.config.grad_scale_func = lambda loss: (
+        torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
+        if isinstance(loss, (int, float))
+        else loss
+    )
+
+    pp_group = llm_grid.get_pg("pp")
+    p2p = P2PCommunicator(pp_group=pp_group, config=model.config)
+
+    data_iter = BatchIterator(
+        seed=42,
+        seq_length=PP_SEQ,
+        image_seq_length=PP_IMAGE_SEQ,
+        hidden_size=PP_HIDDEN,
+        micro_batch_size=PP_MBS,
+        vocab_size=PP_VOCAB,
+        image_token_id=PP_IMAGE_TOKEN,
+    )
+
+    for iteration in range(num_iterations):
+        losses = colocated_forward_backward_with_pp(
+            mimo_model=model,
+            data_iterator=data_iter,
+            num_microbatches=PP_NMB,
+            encoder_grid=encoder_grid,
+            llm_grid=llm_grid,
+            encoder_name=ENCODER_NAME,
+            seq_length=PP_SEQ,
+            micro_batch_size=PP_MBS,
+            p2p_communicator=p2p,
+            pg_collection=llm_pg,
+        )
+
+    # Verify losses on last PP stage
+    if is_pp_last_stage(pp_group):
+        assert losses is not None and len(losses) > 0, "No losses on last PP stage"
+        for loss_dict in losses:
+            val = loss_dict.get('loss_reduced', 0)
+            if isinstance(val, torch.Tensor):
+                val = val.item()
+            assert val == val, "NaN loss"
+
+    grads = collect_grads(model)
+
+    del model
+    _reset_cuda_memory()
+    destroy_all_grids()
+
+    return grads
+
+
+class TestColocatedPPMemoryOptimization:
+    """Test recompute and offload with colocated PP>1 (three-phase schedule).
+
+    Uses encoder TP2/DP4/PP1 + LLM TP2/DP2/PP2 on 8 GPUs.
+    The three-phase schedule detaches encoder output between Phase 1 and Phase 2.
+    Recompute on encoder works because Phase 3's backward replays through checkpoint.
+    Offload works because we defer off_interface.reset() until after Phase 3.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_distributed()
+
+    def test_pp_encoder_full_recompute(self):
+        """Encoder full recompute with PP>1: verify training completes with valid grads."""
+        memory_config = {
+            ENCODER_NAME: ModuleMemoryConfig(
+                recompute_granularity='full',
+                recompute_method='uniform',
+                recompute_num_layers=PP_LAYERS,
+            )
+        }
+        grads = _run_pp_colocated(
+            enc_tp=2, enc_dp=4, llm_tp=2, llm_dp=2, llm_pp=2, memory_config=memory_config
+        )
+        assert len(grads) > 0, "No gradients produced"
+        for name, g in grads.items():
+            assert torch.isfinite(g).all(), f"Non-finite gradient for {name}"
+
+    def test_pp_recompute_projection(self):
+        """Projection recompute with PP>1."""
+        memory_config = {ENCODER_NAME: ModuleMemoryConfig(recompute_projection=True)}
+        grads = _run_pp_colocated(
+            enc_tp=2, enc_dp=4, llm_tp=2, llm_dp=2, llm_pp=2, memory_config=memory_config
+        )
+        assert len(grads) > 0, "No gradients produced"
+        for name, g in grads.items():
+            assert torch.isfinite(g).all(), f"Non-finite gradient for {name}"
+
+    def test_pp_offload_projection(self):
+        """Projection offload with PP>1: tests deferred reset across phases."""
+        memory_config = {ENCODER_NAME: ModuleMemoryConfig(offload_projection=True)}
+        grads = _run_pp_colocated(
+            enc_tp=2, enc_dp=4, llm_tp=2, llm_dp=2, llm_pp=2, memory_config=memory_config
+        )
+        assert len(grads) > 0, "No gradients produced"
+        for name, g in grads.items():
+            assert torch.isfinite(g).all(), f"Non-finite gradient for {name}"
+
+    def test_pp_mixed_recompute_and_offload(self):
+        """Encoder recompute + projection offload + LLM recompute with PP>1."""
+        memory_config = {
+            ENCODER_NAME: ModuleMemoryConfig(
+                recompute_granularity='full',
+                recompute_method='uniform',
+                recompute_num_layers=PP_LAYERS,
+                offload_projection=True,
+            ),
+            MIMO_LANGUAGE_MODULE_KEY: ModuleMemoryConfig(
+                recompute_granularity='selective', recompute_modules=['core_attn']
+            ),
+        }
+        grads = _run_pp_colocated(
+            enc_tp=2, enc_dp=4, llm_tp=2, llm_dp=2, llm_pp=2, memory_config=memory_config
+        )
+        assert len(grads) > 0, "No gradients produced"
+        for name, g in grads.items():
+            assert torch.isfinite(g).all(), f"Non-finite gradient for {name}"
