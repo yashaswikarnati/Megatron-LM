@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
+from megatron.core import tensor_parallel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface,
 )
@@ -294,7 +294,7 @@ class ModalitySubmodules(ABC, nn.Module):
             projection = projections[0]
 
             if self.recompute_projection and self.training:
-                projected = activation_checkpoint(projection, combined, use_reentrant=False)
+                projected = tensor_parallel.checkpoint(projection, False, combined)
             elif self.offload_projection and self.training:
                 off_interface = FineGrainedActivationOffloadingInterface(
                     True, combined, "vision_projection"
@@ -335,20 +335,21 @@ class ModalitySubmodules(ABC, nn.Module):
                 return None
 
             if self.offload_encoder_output and self.training:
-                # Offload the encoder's saved-for-backward tensors to CPU.
-                # We use a dummy scalar as the interface input since the actual
-                # encoder inputs are a dict (not a single tensor).  The interface
-                # intercepts all save_for_backward calls inside the with-block.
-                dummy = torch.tensor(0.0, device='cuda', requires_grad=False)
-                off_interface = FineGrainedActivationOffloadingInterface(
-                    True, dummy, "vision_encoder_output"
+                # Encode first, then offload the saved tensors from projection.
+                # Check for empty before entering the offload context to avoid
+                # a dangling OffloadTensorGroup if encode returns nothing.
+                embeddings = self.encode(encoder_inputs)
+                if not embeddings:
+                    return None
+                combined = self.combine_embeddings(embeddings)
+                # Wrap combine output as offload group — combined is in the
+                # autograd graph so the group-start backward hook will fire.
+                off_iface = FineGrainedActivationOffloadingInterface(
+                    True, combined, "vision_encoder_output"
                 )
-                with off_interface as _:
-                    embeddings = self.encode(encoder_inputs)
-                    if not embeddings:
-                        return None
-                    combined = self.combine_embeddings(embeddings)
-                combined = off_interface.group_commit(combined, "vision_encoder_output")
+                with off_iface as combined:
+                    pass  # hooks installed; save_for_backward intercepted
+                combined = off_iface.group_commit(combined, "vision_encoder_output")
             else:
                 embeddings = self.encode(encoder_inputs)
                 if not embeddings:

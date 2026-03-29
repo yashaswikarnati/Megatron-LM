@@ -93,39 +93,40 @@ def colocated_forward_backward_with_pp(
             )
             return output_tensor, partial(_loss_func, cached['loss_mask'])
 
-        # Temporarily disable the schedule's offload reset — Phase 1 may have
-        # offloaded tensors that Phase 3's encoder backward still needs.
-        # The colocated schedule owns the full iteration lifecycle and will
-        # call off_interface.reset() after Phase 3.
+        # Suppress the schedule's end-of-iteration off_interface.reset() — Phase 1
+        # may have offloaded tensors that Phase 3's encoder backward still needs.
+        # We use a _suppress_offload_reset flag checked nowhere else; the schedule
+        # checks config.fine_grained_activation_offloading which we must NOT mutate
+        # here because GPTModel.forward() also reads it for init_chunk_handler.
         config = mimo_model.config
         _saved_offload_flag = getattr(config, 'fine_grained_activation_offloading', False)
-        config.fine_grained_activation_offloading = False
-
-        with record_function("mimo::llm_forward"):
-            losses = schedules.forward_backward_pipelining_without_interleaving(
-                forward_step_func=_lm_forward_step,
-                data_iterator=cache_iter,
-                model=[mimo_model],
-                num_microbatches=num_microbatches,
-                forward_only=forward_only,
-                **schedule_kwargs,
-            )
-
-        # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────────
-        # detached_full.grad was populated by Phase 2's per-microbatch LLM backward
-        # (accumulated across microbatch view slices on PP stage 0).
-        # Broadcast to PP stage 1+ then run one encoder backward for the full batch.
-        if not forward_only and enc_out:
-            _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
-            for key in enc_out:
-                grad = detached_full[key].grad
-                if grad is not None:
-                    torch.autograd.backward(enc_out[key], grad_tensors=grad)
-
-        # Restore flag and reset offload manager after Phase 3 completes.
-        config.fine_grained_activation_offloading = _saved_offload_flag
         if _saved_offload_flag:
-            off_interface.reset()
+            config.fine_grained_activation_offloading = False
+
+        try:
+            with record_function("mimo::llm_forward"):
+                losses = schedules.forward_backward_pipelining_without_interleaving(
+                    forward_step_func=_lm_forward_step,
+                    data_iterator=cache_iter,
+                    model=[mimo_model],
+                    num_microbatches=num_microbatches,
+                    forward_only=forward_only,
+                    **schedule_kwargs,
+                )
+
+            # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────
+            if not forward_only and enc_out:
+                _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
+                for key in enc_out:
+                    grad = detached_full[key].grad
+                    if grad is not None:
+                        torch.autograd.backward(enc_out[key], grad_tensors=grad)
+        finally:
+            # Restore flag and reset offload manager after Phase 3 completes
+            # (or on exception, to avoid leaking CPU pinned memory).
+            config.fine_grained_activation_offloading = _saved_offload_flag
+            if _saved_offload_flag:
+                off_interface.reset()
 
     return losses
 

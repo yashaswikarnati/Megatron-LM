@@ -1,13 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
 import logging
 import warnings
 from typing import Any, Dict, Optional
 
 import torch
 from torch.profiler import record_function
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
+from megatron.core import tensor_parallel
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig, ModuleMemoryConfig
@@ -613,10 +614,27 @@ class MimoModel(MegatronModule):
 
         for module_name, mcfg in mem_cfg.items():
             if module_name == MIMO_LANGUAGE_MODULE_KEY:
+                # Warn if MIMO-boundary flags are set on the LLM entry (they have no effect)
+                for flag in (
+                    'recompute_projection',
+                    'offload_projection',
+                    'offload_encoder_output',
+                    'recompute_projection_output',
+                    'offload_projection_output',
+                ):
+                    if getattr(mcfg, flag, False):
+                        logger.warning(
+                            f"memory_config['{MIMO_LANGUAGE_MODULE_KEY}'].{flag}=True "
+                            "has no effect on the language module; "
+                            "MIMO boundary flags are encoder-only."
+                        )
                 tc = self.mimo_config.language_model_spec.params['config']
                 new_tc = self._rebuild_transformer_config(tc, mcfg)
                 if new_tc is not tc:
                     self.mimo_config.language_model_spec.params['config'] = new_tc
+                # LLM offload_modules also needs the schedule reset
+                if getattr(new_tc, 'fine_grained_activation_offloading', False):
+                    self._has_mimo_offloading = True
             else:
                 # Encoder module — find and rebuild the TransformerConfig in each encoder spec
                 submodule_spec = self.mimo_config.modality_submodules_spec.get(module_name)
@@ -625,6 +643,12 @@ class MimoModel(MegatronModule):
                         f"memory_config key '{module_name}' not found in modality_submodules_spec"
                     )
                     continue
+                # Warn on conflicting flags
+                if mcfg.recompute_projection and mcfg.offload_projection:
+                    logger.warning(
+                        f"memory_config['{module_name}']: recompute_projection and "
+                        "offload_projection are both True; offload_projection will be ignored."
+                    )
                 encoder_specs = (submodule_spec.submodules or {}).get('encoders', {})
                 for enc_spec in (
                     encoder_specs.values() if isinstance(encoder_specs, dict) else [encoder_specs]
@@ -653,7 +677,6 @@ class MimoModel(MegatronModule):
         performs validation and setup that depends on recompute/offload fields.  Direct mutation
         after construction would bypass that logic and leave the config in an inconsistent state.
         """
-        import dataclasses
 
         overrides = {}
         if mcfg.recompute_granularity is not None:
@@ -713,13 +736,18 @@ class MimoModel(MegatronModule):
 
         This is the original behavior, preserved for backward compatibility.
         """
-        # Initialize fine-grained offload chunk handler for MIMO-level offloading
-        # (offload_projection, offload_encoder_output). Must be called per forward
-        # pass, same as GPTModel.preprocess_for_fine_grained_offloading().
+        # Initialize fine-grained offload chunk handler for MIMO-level offloading.
+        # Skip if the LLM already has its own offloading — GPTModel.forward() will
+        # call init_chunk_handler itself, and double-init corrupts chunk accounting.
         if self._has_mimo_offloading and self.training:
-            off_interface.init_chunk_handler(
-                vp_size=1, vp_stage=None, min_offloaded_tensor_size=1024
+            lm_inner = unwrap_model(self.language_model)
+            lm_has_own_offloading = getattr(
+                getattr(lm_inner, 'config', None), 'fine_grained_activation_offloading', False
             )
+            if not lm_has_own_offloading:
+                off_interface.init_chunk_handler(
+                    vp_size=1, vp_stage=None, min_offloaded_tensor_size=1024
+                )
 
         # If packing_kwargs is provided, construct PackedSeqParams
         packed_seq_params = None
@@ -771,18 +799,19 @@ class MimoModel(MegatronModule):
         logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
         with record_function("mimo::align_embeddings"):
             if self._recompute_projection_output and self.training:
-                combined_embeddings = activation_checkpoint(
+                combined_embeddings = tensor_parallel.checkpoint(
                     self.align_embeddings_by_token_positions,
+                    False,  # distribute_saved_activations
                     modality_embeddings,
                     input_ids,
                     self.special_token_ids,
-                    use_reentrant=False,
                 )
             elif self._offload_projection_output and self.training:
-                # Use a dummy tensor for the interface — the actual inputs are a dict
-                dummy = torch.tensor(0.0, device='cuda', requires_grad=False)
-                align_off = off_interface(True, dummy, "projection_output")
-                with align_off as _:
+                # Use a real tensor from modality_embeddings for the interface
+                # so the group-start backward hook stays in the autograd graph.
+                ref_tensor = next(iter(modality_embeddings.values()))
+                align_off = off_interface(True, ref_tensor, "projection_output")
+                with align_off as ref_tensor:
                     combined_embeddings = self.align_embeddings_by_token_positions(
                         modality_embeddings=modality_embeddings,
                         input_ids=input_ids,
