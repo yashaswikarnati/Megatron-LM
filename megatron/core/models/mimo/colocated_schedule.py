@@ -22,6 +22,9 @@ from torch.profiler import record_function
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel import schedules
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 
 
 def colocated_forward_backward_with_pp(
@@ -57,6 +60,15 @@ def colocated_forward_backward_with_pp(
         full_encoder_input = _concat_encoder_inputs(all_batches, encoder_name)
         _slice_for_encoder_dp(full_encoder_input, encoder_grid, llm_grid)
 
+        # Initialize offload manager for MIMO-level offloading in Phase 1.
+        # encode_and_communicate doesn't go through _forward_all_modules,
+        # so we must init the chunk handler here.
+        has_mimo_offloading = getattr(mimo_model, '_has_mimo_offloading', False)
+        if has_mimo_offloading and mimo_model.training:
+            off_interface.init_chunk_handler(
+                vp_size=1, vp_stage=None, min_offloaded_tensor_size=1024
+            )
+
         with record_function("mimo::encoder_forward"):
             enc_out = mimo_model.encode_and_communicate({encoder_name: full_encoder_input})
 
@@ -81,6 +93,14 @@ def colocated_forward_backward_with_pp(
             )
             return output_tensor, partial(_loss_func, cached['loss_mask'])
 
+        # Temporarily disable the schedule's offload reset — Phase 1 may have
+        # offloaded tensors that Phase 3's encoder backward still needs.
+        # The colocated schedule owns the full iteration lifecycle and will
+        # call off_interface.reset() after Phase 3.
+        config = mimo_model.config
+        _saved_offload_flag = getattr(config, 'fine_grained_activation_offloading', False)
+        config.fine_grained_activation_offloading = False
+
         with record_function("mimo::llm_forward"):
             losses = schedules.forward_backward_pipelining_without_interleaving(
                 forward_step_func=_lm_forward_step,
@@ -101,6 +121,11 @@ def colocated_forward_backward_with_pp(
                 grad = detached_full[key].grad
                 if grad is not None:
                     torch.autograd.backward(enc_out[key], grad_tensors=grad)
+
+        # Restore flag and reset offload manager after Phase 3 completes.
+        config.fine_grained_activation_offloading = _saved_offload_flag
+        if _saved_offload_flag:
+            off_interface.reset()
 
     return losses
 
