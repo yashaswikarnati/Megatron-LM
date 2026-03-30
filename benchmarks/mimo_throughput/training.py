@@ -59,6 +59,107 @@ ENCODER_NAME = "images"
 
 
 # ---------------------------------------------------------------------------
+# Distributed optimizer instance group helpers
+# ---------------------------------------------------------------------------
+
+
+def _create_dist_opt_instance_groups(grid, num_instances):
+    """Create hierarchical distributed optimizer instance groups from a HyperCommGrid.
+
+    When ``num_distributed_optimizer_instances > 1`` the DP domain is split into
+    ``num_instances`` groups.  Within each group (intra), optimizer states are
+    sharded via ReduceScatter.  Between groups (inter), gradients are AllReduced so
+    every instance holds duplicated gradients before the optimizer step.
+
+    For DP ranks [r0..r7] with num_instances=4::
+
+        intra_dp groups (optimizer sharding, size dp/instances=2):
+            [r0,r1], [r2,r3], [r4,r5], [r6,r7]
+        inter groups (grad all-reduce across instances, size=instances=4):
+            [r0,r2,r4,r6], [r1,r3,r5,r7]
+
+    At ``num_instances == dp_size`` each intra group is a single rank (no
+    AllGather needed) and the inter group spans all DP ranks.
+
+    Additionally creates ``intra_dist_opt`` groups that span all model-parallel
+    dimensions (TP, CP, EP, PP) combined with the intra-DP ranks.  This is used
+    by the optimizer for grad-stats reductions (grad-norm, found-inf).
+
+    Args:
+        grid: HyperCommGrid with a ``dp`` dimension.
+        num_instances: Number of distributed optimizer instances.
+
+    Returns:
+        ``(intra_dp_group, inter_group, intra_dist_opt_group)`` for the calling
+        rank.  ``intra_dp_group`` is the intra-instance DP shard group,
+        ``inter_group`` is the inter-instance grad all-reduce group, and
+        ``intra_dist_opt_group`` spans model-parallel dims x intra-DP.
+    """
+    from megatron.core.parallel_state import create_hierarchical_groups
+
+    rank = dist.get_rank()
+    dp_size = grid.shape[grid.dim_names.index('dp')]
+
+    assert dp_size % num_instances == 0, (
+        f"DP size {dp_size} must be divisible by num_instances {num_instances}"
+    )
+    intra_size = dp_size // num_instances
+
+    # --- Step 1: intra/inter DP groups via hierarchical splitting ----------
+    # Get DP rank groups — one list of DP ranks per TP group
+    dp_rank_groups = grid.get_rank_enum('dp')
+
+    intra_dp_group = None
+    inter_group = None
+
+    for dp_ranks in dp_rank_groups:
+        hierarchical_groups, _ = create_hierarchical_groups(
+            rank=rank,
+            ranks=dp_ranks,
+            hierarchical_group_sizes=[intra_size, num_instances],
+            group_desc="DIST_OPT_INSTANCE",
+        )
+        if rank in dp_ranks:
+            intra_dp_group = hierarchical_groups[0]
+            inter_group = hierarchical_groups[1]
+
+    # --- Step 2: intra_dist_opt groups (model-parallel x intra-DP) ---------
+    # The optimizer needs a group spanning [tp, cp, ep, pp, intra_dp] for
+    # grad-stats reductions.  We collect, for each optimizer instance, ALL
+    # ranks in the grid that share the same intra-DP slice (across all
+    # TP/CP/EP/PP dimensions).
+
+    tp_rank_groups = grid.get_rank_enum('tp')  # one TP group per DP slot
+
+    # Build a lookup: rank -> set of its TP/CP/EP/PP peers
+    rank_to_mp_peers: dict[int, list[int]] = {}
+    for tp_ranks in tp_rank_groups:
+        for r in tp_ranks:
+            rank_to_mp_peers[r] = tp_ranks
+
+    # Collect unique intra_dist_opt rank sets (deduplicate across TP slots)
+    seen_rank_sets: set[tuple[int, ...]] = set()
+    intra_dist_opt_group = None
+
+    # Use ONE representative DP-rank group (e.g. the first) to enumerate
+    # intra slices — each slice maps deterministically to a set of MP peers.
+    representative_dp_ranks = dp_rank_groups[0]
+    for inst_start in range(0, len(representative_dp_ranks), intra_size):
+        intra_dp_ranks = representative_dp_ranks[inst_start : inst_start + intra_size]
+        all_ranks = set()
+        for dp_rank in intra_dp_ranks:
+            all_ranks.update(rank_to_mp_peers[dp_rank])
+        intra_dist_opt_ranks = tuple(sorted(all_ranks))
+        if intra_dist_opt_ranks not in seen_rank_sets:
+            seen_rank_sets.add(intra_dist_opt_ranks)
+            group = dist.new_group(ranks=list(intra_dist_opt_ranks))
+            if rank in intra_dist_opt_ranks:
+                intra_dist_opt_group = group
+
+    return intra_dp_group, inter_group, intra_dist_opt_group
+
+
+# ---------------------------------------------------------------------------
 # Model spec helpers (mirrors test_mimo_colocated_e2e.py patterns)
 # ---------------------------------------------------------------------------
 
@@ -82,6 +183,13 @@ def _get_language_model_spec(arch, pg_collection):
         bf16=True,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='te',
+        gradient_accumulation_fusion=True,
+        bias_dropout_fusion=True,
+        bias_activation_fusion=True,
+        sequence_parallel=tp_size > 1,
+        tp_comm_overlap=tp_size > 1,
+        tp_comm_overlap_rs_dgrad=False,
+        tp_comm_overlap_rs=False,
     )
     return ModuleSpec(
         module=GPTModel,
@@ -93,6 +201,9 @@ def _get_language_model_spec(arch, pg_collection):
             "pre_process": (pp_rank == 0),
             "post_process": (pp_rank == pp_size - 1),
             "pg_collection": pg_collection,
+            # Disable SP scatter in embedding — MIMO's align_embeddings needs the
+            # full [S, B, H] sequence. We scatter to SP region after alignment.
+            "scatter_embedding_sequence_parallel": False,
         },
     )
 
@@ -198,6 +309,57 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
     encoder_pg = pg_manager.get_pg_collection(encoder_grid, is_language_model=False)
     llm_pg = pg_manager.get_pg_collection(llm_grid, is_language_model=True)
 
+    # Initialize CUDA RNG tracker for sequence parallelism.
+    # SP needs per-TP-rank RNG seeds so dropout is consistent across the
+    # sequence-parallel dimension. Use the LLM's TP rank since only the LLM uses SP.
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    # Initialize CUDA RNG tracker and global memory buffer for sequence parallelism.
+    llm_tp_rank = dist.get_rank(llm_pg.tp)
+    model_parallel_cuda_manual_seed(seed=12345, tp_rank=llm_tp_rank, ep_rank=0, etp_rank=0)
+
+    from megatron.core.parallel_state import _set_global_memory_buffer
+
+    _set_global_memory_buffer()
+
+    # Initialize TE user-buffer (UB) communicators for TP comm overlap.
+    # This must happen before model creation so that TE Linear layers can
+    # register their comm buffers. Only needed when LLM TP > 1.
+    if lp.tp > 1:
+        try:
+            from transformer_engine.pytorch.module.base import (
+                UserBufferQuantizationMode,
+                initialize_ub,
+            )
+
+            effective_mbs = config.data.micro_batch_size
+            # For fan-out configs, effective MBS is larger
+            if lp.dp > ep.dp:
+                effective_mbs = config.data.micro_batch_size * (lp.dp // ep.dp)
+
+            input_shape = [
+                config.llm_arch.seq_length * effective_mbs,
+                config.llm_arch.hidden_size,
+            ]
+            ub_quant_modes = [UserBufferQuantizationMode.NONE]
+
+            initialize_ub(
+                shape=input_shape,
+                tp_size=lp.tp,
+                quantization_modes=ub_quant_modes,
+                ub_cfgs={},
+                bootstrap_backend='nccl',
+            )
+            if dist.get_rank() == 0:
+                logger.info(
+                    f"TE UB initialized: shape={input_shape}, tp_size={lp.tp}"
+                )
+        except Exception as e:
+            if dist.get_rank() == 0:
+                logger.warning(f"Failed to initialize TE UB for tp_comm_overlap: {e}")
+            # If UB init fails, disable tp_comm_overlap to avoid crash
+            # (the model config is created later, so we'll need a flag)
+
     language_model_spec = _get_language_model_spec(config.llm_arch, llm_pg)
     vision_submodule_spec = _get_vision_submodules_spec(
         config.encoder_arch,
@@ -212,19 +374,61 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
         module_to_grid_map={ENCODER_NAME: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid},
     )
 
-    mimo_model = MimoModel(mimo_config)
+    mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp)
     mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
     mimo_model.model_type = ModelType.encoder_or_decoder
 
     # Wrap submodules with DDP (per-module process groups)
-    ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+    # LLM: default bucket_size (40M), standard overlap
+    llm_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True, use_distributed_optimizer=True
     )
+
+    # Encoder: use num_distributed_optimizer_instances = encoder DP size so
+    # each rank holds fully-replicated optimizer states for the small encoder,
+    # eliminating the param AllGather before every forward pass.
+    encoder_dp_size = ep.dp
+    # Tunable: num_distributed_optimizer_instances for encoder.
+    # instances=1: fully sharded (max AllGather, min memory)
+    # instances=dp_size: fully replicated (no AllGather, max memory)
+    # For 1B encoder at DP=8: instances>1 regresses (shards too small).
+    # For 6B encoder at DP=4: may help (larger shards, more AllGather to save).
+    encoder_num_instances = 1
+    encoder_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True,
+        bucket_size=200_000_000,
+        use_distributed_optimizer=True,
+        num_distributed_optimizer_instances=encoder_num_instances,
+    )
+
+    # Create hierarchical process groups for multi-instance encoder optimizer
+    if encoder_num_instances > 1:
+        intra_dp_group, inter_group, intra_dist_opt_group = (
+            _create_dist_opt_instance_groups(encoder_grid, encoder_num_instances)
+        )
+        # Set groups on encoder_pg for DDP init (setup_process_groups_for_ddp)
+        encoder_pg.intra_dp_cp = intra_dp_group
+        encoder_pg.intra_expt_dp = intra_dp_group
+        encoder_pg.inter_dist_opt = inter_group
+        # Set intra_dist_opt for optimizer (setup_process_groups_for_optimizer)
+        encoder_pg.intra_dist_opt = intra_dist_opt_group
+
+        # Store intra_dist_opt on the grid so the MIMO optimizer
+        # (_get_pg_collection_for_optimizer) can propagate it to the
+        # optimizer's pg_collection without access to the DDP pg.
+        encoder_grid._dist_opt_intra_dist_opt_group = intra_dist_opt_group
+
+        if dist.get_rank() == 0:
+            logger.info(
+                f"Encoder distributed optimizer: {encoder_num_instances} instances, "
+                f"intra_dp_size={encoder_dp_size // encoder_num_instances}, "
+                f"inter_size={encoder_num_instances}"
+            )
 
     if mimo_model.language_model is not None:
         mimo_model.language_model = DistributedDataParallel(
             config=mimo_model.language_model.config,
-            ddp_config=ddp_config,
+            ddp_config=llm_ddp_config,
             module=mimo_model.language_model,
             pg_collection=llm_pg,
         )
@@ -234,7 +438,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
         if submodule is not None:
             mimo_model.modality_submodules[ENCODER_NAME] = DistributedDataParallel(
                 config=submodule.encoders['clip_encoder'].config,
-                ddp_config=ddp_config,
+                ddp_config=encoder_ddp_config,
                 module=submodule,
                 pg_collection=encoder_pg,
             )
@@ -606,7 +810,15 @@ def run_benchmark(
                 )
                 save_analysis(report, analysis_path)
                 print(report)
-                print(f"\nAnalysis saved to {analysis_path}")
+
+                # Chrome trace JSON (full timeline + memory events)
+                trace_path = os.path.join(
+                    results_dir,
+                    f"{config.experiment.name}_trace_{profile_steps[0]}-{profile_steps[1]}.json",
+                )
+                profiler_ctx.export_chrome_trace(trace_path)
+                print(f"\nPhase report: {analysis_path}")
+                print(f"Chrome trace: {trace_path} ({os.path.getsize(trace_path) / 1e6:.0f} MB)")
 
     # 7. Summary
     summary = monitor.get_summary()

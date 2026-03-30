@@ -357,16 +357,25 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 module = mimo_model.modality_submodules[module_name]
 
             if module is not None:
-                assert (
-                    not hasattr(module, 'ddp_config')
-                    or module.ddp_config is None
-                    or module.ddp_config.num_distributed_optimizer_instances == 1
-                ), (
-                    "MIMO optimizer does not yet support "
-                    "num_distributed_optimizer_instances > 1. "
-                    f"Module '{module_name}' has "
-                    f"{module.ddp_config.num_distributed_optimizer_instances} instances."
-                )
+                # When num_distributed_optimizer_instances > 1, the DDP wrapper
+                # holds the hierarchical intra/inter groups created during model
+                # setup.  Copy them onto the optimizer's pg_collection so that
+                # setup_process_groups_for_optimizer can find them.
+                if (
+                    hasattr(module, 'ddp_config')
+                    and module.ddp_config is not None
+                    and module.ddp_config.num_distributed_optimizer_instances > 1
+                ):
+                    pg_collection.intra_dp_cp = module.intra_dp_cp_group
+                    pg_collection.intra_expt_dp = module.intra_expt_dp_group
+                    pg_collection.inter_dist_opt = module.inter_dist_opt_group
+                    # intra_dist_opt spans model-parallel dims x intra-DP.
+                    # The training harness stores this on the grid as a custom
+                    # attribute (_dist_opt_intra_dist_opt_group) since it cannot
+                    # be derived from the grid's standard PG enumeration.
+                    if hasattr(grid, '_dist_opt_intra_dist_opt_group'):
+                        pg_collection.intra_dist_opt = grid._dist_opt_intra_dist_opt_group
+
                 optimizer = get_megatron_optimizer(
                     config=config,
                     model_chunks=[module],
