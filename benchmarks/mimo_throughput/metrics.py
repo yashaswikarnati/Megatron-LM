@@ -65,16 +65,18 @@ class PerformanceMonitor:
         """
         cfg = self.config
         gbs = cfg.global_batch_size
+        num_images = cfg.data.num_images_per_sample
 
-        # Encoder FLOPs
+        # Encoder FLOPs — scaled by num_images_per_sample
+        # The encoder processes num_images * GBS images per microbatch
         enc_params = self._estimate_params(
             cfg.encoder_arch.num_layers,
             cfg.encoder_arch.hidden_size,
             cfg.encoder_arch.vocab_size,
         )
-        enc_flops_per_mb = 6 * enc_params * cfg.encoder_arch.seq_length * gbs
+        enc_flops_per_mb = 6 * enc_params * cfg.encoder_arch.seq_length * gbs * num_images
 
-        # LLM FLOPs
+        # LLM FLOPs — seq_length includes all image tokens
         llm_params = self._estimate_params(
             cfg.llm_arch.num_layers,
             cfg.llm_arch.hidden_size,
@@ -198,6 +200,7 @@ class PerformanceMonitor:
                 'data': {
                     'micro_batch_size': self.config.data.micro_batch_size,
                     'num_microbatches': self.config.data.num_microbatches,
+                    'num_images_per_sample': self.config.data.num_images_per_sample,
                     'global_batch_size': self.config.global_batch_size,
                 },
                 'total_flops_per_iteration': self.total_flops,

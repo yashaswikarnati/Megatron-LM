@@ -37,6 +37,7 @@ class DataSpec:
     micro_batch_size: int  # per LLM DP replica
     num_microbatches: int
     image_token_id: int = 32000
+    num_images_per_sample: int = 1  # images per text sample; scales encoder batch
 
 
 @dataclass(frozen=True)
@@ -82,11 +83,37 @@ class BenchmarkConfig:
             f"!= LLM world_size ({self.llm_parallel.world_size})"
         )
 
-        # Global batch must be divisible by both encoder and LLM DP
+        # Global batch must be divisible by LLM DP (always true by construction)
         gbs = self.global_batch_size
-        assert gbs % self.encoder_parallel.dp == 0, (
-            f"Global batch {gbs} not divisible by encoder DP {self.encoder_parallel.dp}"
-        )
         assert gbs % self.llm_parallel.dp == 0, (
             f"Global batch {gbs} not divisible by LLM DP {self.llm_parallel.dp}"
         )
+
+        # For encoder DP: with multi-image, images from one LLM sample can be
+        # split across encoder DP ranks. The real constraint is that the total
+        # encoder batch (num_images * mbs) is divisible by the fan-in scale,
+        # which is checked below. The old GBS % enc_dp check was overly strict
+        # for num_images > 1.
+        enc_dp = self.encoder_parallel.dp
+        llm_dp = self.llm_parallel.dp
+        total_encoder_samples = self.data.num_images_per_sample * gbs
+        assert total_encoder_samples % enc_dp == 0, (
+            f"Total encoder samples (num_images={self.data.num_images_per_sample} * GBS={gbs}"
+            f" = {total_encoder_samples}) not divisible by encoder DP {enc_dp}"
+        )
+
+        # Multi-image: total image tokens must fit in LLM seq_length
+        total_image_tokens = self.data.num_images_per_sample * self.encoder_arch.seq_length
+        assert total_image_tokens <= self.llm_arch.seq_length, (
+            f"num_images({self.data.num_images_per_sample}) * enc_seq({self.encoder_arch.seq_length})"
+            f" = {total_image_tokens} exceeds llm_seq({self.llm_arch.seq_length})"
+        )
+
+        # Fan-in: encoder batch (num_images * mbs) must be divisible by scale
+        if enc_dp > llm_dp:
+            scale = enc_dp // llm_dp
+            encoder_batch = self.data.num_images_per_sample * self.data.micro_batch_size
+            assert encoder_batch % scale == 0, (
+                f"num_images({self.data.num_images_per_sample}) * mbs({self.data.micro_batch_size})"
+                f" = {encoder_batch} not divisible by fan-in scale {scale}"
+            )

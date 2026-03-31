@@ -528,6 +528,7 @@ def run_benchmark(
         vocab_size=config.llm_arch.vocab_size,
         image_token_id=config.data.image_token_id,
         encoder_name=ENCODER_NAME,
+        num_images_per_sample=config.data.num_images_per_sample,
     )
 
     # 4. Optimizer
