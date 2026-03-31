@@ -64,7 +64,7 @@ ENCODER_NAME = "images"
 # ---------------------------------------------------------------------------
 
 
-def _get_language_model_spec(arch, pg_collection):
+def _get_language_model_spec(arch, pg_collection, sequence_parallel=False):
     """Build ModuleSpec for the GPT language model."""
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
@@ -86,26 +86,29 @@ def _get_language_model_spec(arch, pg_collection):
         gradient_accumulation_fusion=True,
         bias_dropout_fusion=True,
         bias_activation_fusion=True,
-        sequence_parallel=tp_size > 1,
-        tp_comm_overlap=tp_size > 1,
+        sequence_parallel=sequence_parallel,
+        tp_comm_overlap=sequence_parallel,
+        # RS pipelined overlap is incompatible with the current TE config
+        # (crashes with "split_overlap_rs: Invalid type"). AG overlap works.
         tp_comm_overlap_rs_dgrad=False,
         tp_comm_overlap_rs=False,
     )
-    return ModuleSpec(
-        module=GPTModel,
-        params={
-            "config": lm_config,
-            "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
-            "vocab_size": arch.vocab_size,
-            "max_sequence_length": arch.seq_length,
-            "pre_process": (pp_rank == 0),
-            "post_process": (pp_rank == pp_size - 1),
-            "pg_collection": pg_collection,
-            # Disable SP scatter in embedding — MIMO's align_embeddings needs the
-            # full [S, B, H] sequence. We scatter to SP region after alignment.
-            "scatter_embedding_sequence_parallel": False,
-        },
-    )
+
+    gpt_params = {
+        "config": lm_config,
+        "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
+        "vocab_size": arch.vocab_size,
+        "max_sequence_length": arch.seq_length,
+        "pre_process": (pp_rank == 0),
+        "post_process": (pp_rank == pp_size - 1),
+        "pg_collection": pg_collection,
+    }
+    if sequence_parallel:
+        # MIMO aligns embeddings on the full [S,B,H] sequence before scattering,
+        # so the embedding layer must not scatter internally. Default is True.
+        gpt_params["scatter_embedding_sequence_parallel"] = False
+
+    return ModuleSpec(module=GPTModel, params=gpt_params)
 
 
 def _get_vision_submodules_spec(arch, language_hidden_size, pg_collection):
@@ -253,9 +256,11 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
     encoder_pg = pg_manager.get_pg_collection(encoder_grid, is_language_model=False)
     llm_pg = pg_manager.get_pg_collection(llm_grid, is_language_model=True)
 
-    _init_sequence_parallel(llm_pg, config, lp, ep)
+    use_sp = getattr(config, 'sequence_parallel', lp.tp > 1)
+    if use_sp:
+        _init_sequence_parallel(llm_pg, config, lp, ep)
 
-    language_model_spec = _get_language_model_spec(config.llm_arch, llm_pg)
+    language_model_spec = _get_language_model_spec(config.llm_arch, llm_pg, sequence_parallel=use_sp)
     vision_submodule_spec = _get_vision_submodules_spec(
         config.encoder_arch,
         language_hidden_size=config.llm_arch.hidden_size,
