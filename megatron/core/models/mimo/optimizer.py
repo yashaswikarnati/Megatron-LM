@@ -338,14 +338,31 @@ def _create_dist_opt_instance_groups(grid, num_instances):
 def _get_pg_collection_for_optimizer(grid, num_dist_opt_instances=1) -> ProcessGroupCollection:
     """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
 
-    Assumes standard groups are pre-created in the grid via grid.create_pg().
-    When ``num_dist_opt_instances > 1``, creates hierarchical intra/inter groups
-    for partial optimizer sharding.
+    Fetches process groups required by the optimizer from the grid. When
+    ``num_dist_opt_instances > 1``, additionally creates hierarchical
+    intra/inter groups for partial optimizer sharding.
+
+    The following groups must be pre-created in the grid before calling this function::
+
+        grid.create_pg(["dp"])
+        grid.create_pg(["dp", "cp"])
+        grid.create_pg(["tp"])
+        grid.create_pg(["pp"])
+        grid.create_pg(["tp", "pp"])
+        grid.create_pg(["tp", "ep", "pp"])
+        grid.create_pg(["dp", "ep"])
+        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
 
     Args:
         grid: HyperCommGrid with pre-created process groups.
         num_dist_opt_instances: Number of distributed optimizer instances.
             1 = fully sharded across DP (default). >1 = partial sharding.
+
+    Returns:
+        ProcessGroupCollection containing optimizer-required groups:
+        - dp, dp_cp, tp, pp, mp, tp_ep_pp, expt_dp: standard groups
+        - intra_dist_opt: grad-stats reduction group (spans MP × intra-DP)
+        - intra_dp_cp, intra_expt_dp, inter_dist_opt: only when instances > 1
     """
     pg = ProcessGroupCollection()
 
