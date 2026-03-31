@@ -665,10 +665,16 @@ class MimoModel(MegatronModule):
         self._record_mem("mimo::align_embeddings")
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
-        # 3. If sharding is needed, apply PartitionAdapter.
-        # For SP-only: embeddings stay in [S, B, H], shard() scatters along dim 0 → [S/TP, B, H]
-        # For CP (with or without SP): transpose to [B, S, H] for get_batch_on_this_cp_rank,
-        #   then transpose back after sharding.
+        # 3. Scatter to sequence-parallel / context-parallel regions if needed.
+        #
+        # PartitionAdapter.shard() handles both SP and CP scattering. However the
+        # expected input layout differs:
+        #   SP-only:  [S, B, H] — shard() scatters along dim 0 → [S/TP, B, H]
+        #   CP (+SP): [B, S, H] — shard() uses get_batch_on_this_cp_rank
+        #
+        # The original code always transposed to [B, S, H] which breaks SP-only
+        # because shard()'s seq_dim=0 check (partition/utils.py:156) would see B
+        # instead of S, failing the "S % TP == 0" assertion.
         if self.partition_adapter is not None:
             lm = unwrap_model(self.language_model)
             sp_only = (
@@ -676,7 +682,6 @@ class MimoModel(MegatronModule):
                 and lm.config.context_parallel_size <= 1
             )
             if not sp_only:
-                # CP path: transpose to [B, S, H]
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
             combined_embeddings, labels, loss_mask, _, packed_seq_params = (
@@ -690,7 +695,6 @@ class MimoModel(MegatronModule):
             )
 
             if not sp_only and combined_embeddings is not None:
-                # CP path: transpose back to [S/cp, B, H]
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
         # 5. Forward pass through language model
