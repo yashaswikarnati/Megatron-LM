@@ -58,12 +58,13 @@ logger = logging.getLogger(__name__)
 ENCODER_NAME = "images"
 
 
+
 # ---------------------------------------------------------------------------
 # Model spec helpers (mirrors test_mimo_colocated_e2e.py patterns)
 # ---------------------------------------------------------------------------
 
 
-def _get_language_model_spec(arch, pg_collection):
+def _get_language_model_spec(arch, pg_collection, sequence_parallel=False):
     """Build ModuleSpec for the GPT language model."""
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
@@ -82,19 +83,28 @@ def _get_language_model_spec(arch, pg_collection):
         bf16=True,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='te',
+        gradient_accumulation_fusion=True,
+        bias_dropout_fusion=True,
+        bias_activation_fusion=True,
+        sequence_parallel=sequence_parallel,
+        tp_comm_overlap=sequence_parallel,
     )
-    return ModuleSpec(
-        module=GPTModel,
-        params={
-            "config": lm_config,
-            "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
-            "vocab_size": arch.vocab_size,
-            "max_sequence_length": arch.seq_length,
-            "pre_process": (pp_rank == 0),
-            "post_process": (pp_rank == pp_size - 1),
-            "pg_collection": pg_collection,
-        },
-    )
+
+    gpt_params = {
+        "config": lm_config,
+        "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
+        "vocab_size": arch.vocab_size,
+        "max_sequence_length": arch.seq_length,
+        "pre_process": (pp_rank == 0),
+        "post_process": (pp_rank == pp_size - 1),
+        "pg_collection": pg_collection,
+    }
+    if sequence_parallel:
+        # MIMO aligns embeddings on the full [S,B,H] sequence before scattering,
+        # so the embedding layer must not scatter internally. Default is True.
+        gpt_params["scatter_embedding_sequence_parallel"] = False
+
+    return ModuleSpec(module=GPTModel, params=gpt_params)
 
 
 def _get_vision_submodules_spec(arch, language_hidden_size, pg_collection):
@@ -169,6 +179,50 @@ def _get_vision_submodules_spec(arch, language_hidden_size, pg_collection):
 # ---------------------------------------------------------------------------
 
 
+def _setup_encoder_dist_opt_groups(encoder_grid, encoder_pg, num_instances):
+    """Wire hierarchical process groups onto encoder pg_collection for DDP init."""
+    from megatron.core.models.mimo.optimizer import _create_dist_opt_instance_groups
+
+    intra_dp_group, inter_group, intra_dist_opt_group = (
+        _create_dist_opt_instance_groups(encoder_grid, num_instances)
+    )
+    encoder_pg.intra_dp_cp = intra_dp_group
+    encoder_pg.intra_expt_dp = intra_dp_group
+    encoder_pg.inter_dist_opt = inter_group
+    encoder_pg.intra_dist_opt = intra_dist_opt_group
+
+
+def _init_sequence_parallel(llm_pg, config, lp, ep):
+    """Initialize RNG tracker, global memory buffer, and TE UB for sequence parallelism."""
+    from megatron.core.parallel_state import _set_global_memory_buffer
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    llm_tp_rank = dist.get_rank(llm_pg.tp)
+    model_parallel_cuda_manual_seed(seed=12345, tp_rank=llm_tp_rank, ep_rank=0, etp_rank=0)
+    _set_global_memory_buffer()
+
+    if lp.tp > 1:
+        try:
+            from transformer_engine.pytorch.module.base import (
+                UserBufferQuantizationMode,
+                initialize_ub,
+            )
+
+            effective_mbs = config.data.micro_batch_size
+            if lp.dp > ep.dp:
+                effective_mbs = config.data.micro_batch_size * (lp.dp // ep.dp)
+            initialize_ub(
+                shape=[config.llm_arch.seq_length * effective_mbs, config.llm_arch.hidden_size],
+                tp_size=lp.tp,
+                quantization_modes=[UserBufferQuantizationMode.NONE],
+                ub_cfgs={},
+                bootstrap_backend='nccl',
+            )
+        except Exception as e:
+            if dist.get_rank() == 0:
+                logger.warning(f"TE UB init failed (tp_comm_overlap disabled): {e}")
+
+
 def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
     """Create a MIMO model with DDP wrapping and process groups.
 
@@ -198,7 +252,11 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
     encoder_pg = pg_manager.get_pg_collection(encoder_grid, is_language_model=False)
     llm_pg = pg_manager.get_pg_collection(llm_grid, is_language_model=True)
 
-    language_model_spec = _get_language_model_spec(config.llm_arch, llm_pg)
+    use_sp = getattr(config, 'sequence_parallel', False)
+    if use_sp:
+        _init_sequence_parallel(llm_pg, config, lp, ep)
+
+    language_model_spec = _get_language_model_spec(config.llm_arch, llm_pg, sequence_parallel=use_sp)
     vision_submodule_spec = _get_vision_submodules_spec(
         config.encoder_arch,
         language_hidden_size=config.llm_arch.hidden_size,
@@ -212,19 +270,31 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
         module_to_grid_map={ENCODER_NAME: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid},
     )
 
-    mimo_model = MimoModel(mimo_config)
+    mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp)
     mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
     mimo_model.model_type = ModelType.encoder_or_decoder
 
-    # Wrap submodules with DDP (per-module process groups)
-    ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+    llm_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True, use_distributed_optimizer=True
     )
+
+    encoder_num_instances = getattr(config, 'encoder_num_dist_opt_instances', 1)
+    encoder_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True,
+        bucket_size=200_000_000,
+        use_distributed_optimizer=True,
+        num_distributed_optimizer_instances=encoder_num_instances,
+    )
+
+    if encoder_num_instances > 1:
+        _setup_encoder_dist_opt_groups(
+            encoder_grid, encoder_pg, encoder_num_instances
+        )
 
     if mimo_model.language_model is not None:
         mimo_model.language_model = DistributedDataParallel(
             config=mimo_model.language_model.config,
-            ddp_config=ddp_config,
+            ddp_config=llm_ddp_config,
             module=mimo_model.language_model,
             pg_collection=llm_pg,
         )
@@ -234,7 +304,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
         if submodule is not None:
             mimo_model.modality_submodules[ENCODER_NAME] = DistributedDataParallel(
                 config=submodule.encoders['clip_encoder'].config,
-                ddp_config=ddp_config,
+                ddp_config=encoder_ddp_config,
                 module=submodule,
                 pg_collection=encoder_pg,
             )
@@ -606,7 +676,15 @@ def run_benchmark(
                 )
                 save_analysis(report, analysis_path)
                 print(report)
-                print(f"\nAnalysis saved to {analysis_path}")
+
+                # Chrome trace JSON (full timeline + memory events)
+                trace_path = os.path.join(
+                    results_dir,
+                    f"{config.experiment.name}_trace_{profile_steps[0]}-{profile_steps[1]}.json",
+                )
+                profiler_ctx.export_chrome_trace(trace_path)
+                print(f"\nPhase report: {analysis_path}")
+                print(f"Chrome trace: {trace_path} ({os.path.getsize(trace_path) / 1e6:.0f} MB)")
 
     # 7. Summary
     summary = monitor.get_summary()
