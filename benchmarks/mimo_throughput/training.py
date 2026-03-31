@@ -252,7 +252,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
     encoder_pg = pg_manager.get_pg_collection(encoder_grid, is_language_model=False)
     llm_pg = pg_manager.get_pg_collection(llm_grid, is_language_model=True)
 
-    use_sp = getattr(config, 'sequence_parallel', lp.tp > 1)
+    use_sp = getattr(config, 'sequence_parallel', False)
     if use_sp:
         _init_sequence_parallel(llm_pg, config, lp, ep)
 
