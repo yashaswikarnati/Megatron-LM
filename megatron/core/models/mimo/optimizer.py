@@ -282,53 +282,91 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     return (0, pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
-def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
+def _create_dist_opt_instance_groups(grid, num_instances):
+    """Create hierarchical process groups for multi-instance distributed optimizer.
+
+    Mirrors ``parallel_state._initialize_expert_data_parallel_groups`` (lines 1291-1313)
+    but operates on a HyperCommGrid instead of global state.
+
+    Args:
+        grid: HyperCommGrid with at least a ``dp`` dimension.
+        num_instances: Number of optimizer instances (must divide dp_size).
+
+    Returns:
+        (intra_dp_group, inter_group, intra_dist_opt_group) for the calling rank.
+    """
+    from megatron.core.parallel_state import create_hierarchical_groups
+
+    rank = dist.get_rank()
+    dp_size = grid.shape[grid.dim_names.index('dp')]
+    assert dp_size % num_instances == 0
+    intra_size = dp_size // num_instances
+
+    intra_dp_group = None
+    inter_group = None
+    for dp_ranks in grid.get_rank_enum('dp'):
+        hierarchical_groups, _ = create_hierarchical_groups(
+            rank, dp_ranks, [intra_size, num_instances], group_desc="DIST_OPT_INSTANCE"
+        )
+        if rank in dp_ranks:
+            intra_dp_group = hierarchical_groups[0]
+            inter_group = hierarchical_groups[1]
+
+    # intra_dist_opt spans model-parallel dims × intra-DP (for grad-stats reduction).
+    tp_rank_groups = grid.get_rank_enum('tp')
+    rank_to_mp_peers = {}
+    for tp_ranks in tp_rank_groups:
+        for r in tp_ranks:
+            rank_to_mp_peers[r] = tp_ranks
+
+    intra_dist_opt_group = None
+    seen = set()
+    representative_dp_ranks = grid.get_rank_enum('dp')[0]
+    for start in range(0, len(representative_dp_ranks), intra_size):
+        intra_dp_ranks = representative_dp_ranks[start : start + intra_size]
+        all_ranks = sorted({r for dp_r in intra_dp_ranks for r in rank_to_mp_peers[dp_r]})
+        key = tuple(all_ranks)
+        if key not in seen:
+            seen.add(key)
+            group = dist.new_group(ranks=all_ranks)
+            if rank in all_ranks:
+                intra_dist_opt_group = group
+
+    return intra_dp_group, inter_group, intra_dist_opt_group
+
+
+def _get_pg_collection_for_optimizer(grid, num_dist_opt_instances=1) -> ProcessGroupCollection:
     """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
 
-    Only fetches process groups required by the optimizer. Assumes all groups
-    are pre-created in the grid via grid.create_pg() - does not create any new groups.
-
-    The following groups must be pre-created in the grid before calling this function:
-        grid.create_pg(["dp"])
-        grid.create_pg(["dp", "cp"])
-        grid.create_pg(["tp"])
-        grid.create_pg(["pp"])
-        grid.create_pg(["tp", "pp"])
-        grid.create_pg(["tp", "ep", "pp"])
-        grid.create_pg(["dp", "ep"])
-        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+    Assumes standard groups are pre-created in the grid via grid.create_pg().
+    When ``num_dist_opt_instances > 1``, creates hierarchical intra/inter groups
+    for partial optimizer sharding.
 
     Args:
         grid: HyperCommGrid with pre-created process groups.
-
-    Returns:
-        ProcessGroupCollection containing optimizer-required groups:
-        - dp: Data parallel group
-        - dp_cp: Data parallel with context parallel
-        - tp: Tensor parallel group
-        - mp: Model parallel group (tp × pp)
-        - tp_ep_pp: Expert tensor-model-pipeline group
-        - expt_dp: Expert data parallel group
+        num_dist_opt_instances: Number of distributed optimizer instances.
+            1 = fully sharded across DP (default). >1 = partial sharding.
     """
     pg = ProcessGroupCollection()
 
-    # Core groups needed by optimizer and checkpointing
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
     pg.tp = grid.get_pg("tp")
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
-
-    # Expert groups
     pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
     pg.expt_dp = grid.get_pg(["dp", "ep"])
 
-    # Distributed optimizer grad stats group: must span all dimensions so grad norm
-    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
-    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
-    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
-    # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
+    if num_dist_opt_instances > 1:
+        intra_dp, inter, intra_dist_opt = _create_dist_opt_instance_groups(
+            grid, num_dist_opt_instances
+        )
+        pg.intra_dp_cp = intra_dp
+        pg.intra_expt_dp = intra_dp
+        pg.inter_dist_opt = inter
+        pg.intra_dist_opt = intra_dist_opt
+    else:
+        pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
 
     return pg
 
@@ -348,39 +386,26 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
         is_active = grid.is_current_rank_in_grid()
 
         optimizer = None
-        pg_collection = _get_pg_collection_for_optimizer(grid)
 
+        # Determine num_distributed_optimizer_instances from the DDP-wrapped module.
+        num_dist_opt_instances = 1
         if is_active:
             if module_name == lang_key:
                 module = mimo_model.language_model
             else:
                 module = mimo_model.modality_submodules[module_name]
+            if module is not None and hasattr(module, 'ddp_config') and module.ddp_config:
+                num_dist_opt_instances = module.ddp_config.num_distributed_optimizer_instances
 
-            if module is not None:
-                # For num_distributed_optimizer_instances > 1, the DDP wrapper
-                # receives hierarchical groups via pg_collection (set during
-                # model setup in training.py). The optimizer needs the same
-                # groups. The source of truth is the pg_collection passed to DDP
-                # — we read them back from the DDP wrapper here because
-                # _get_pg_collection_for_optimizer only has the grid, and the
-                # grid stores only the intra_dist_opt group (via a custom attr).
-                if (
-                    hasattr(module, 'ddp_config')
-                    and module.ddp_config is not None
-                    and module.ddp_config.num_distributed_optimizer_instances > 1
-                ):
-                    pg_collection.intra_dp_cp = module.intra_dp_cp_group
-                    pg_collection.intra_expt_dp = module.intra_expt_dp_group
-                    pg_collection.inter_dist_opt = module.inter_dist_opt_group
-                    if hasattr(grid, '_dist_opt_intra_dist_opt_group'):
-                        pg_collection.intra_dist_opt = grid._dist_opt_intra_dist_opt_group
+        pg_collection = _get_pg_collection_for_optimizer(grid, num_dist_opt_instances)
 
-                optimizer = get_megatron_optimizer(
-                    config=config,
-                    model_chunks=[module],
-                    pg_collection=pg_collection,
-                    use_gloo_process_groups=False,
-                )
+        if is_active and module is not None:
+            optimizer = get_megatron_optimizer(
+                config=config,
+                model_chunks=[module],
+                pg_collection=pg_collection,
+                use_gloo_process_groups=False,
+            )
 
         module_infos[module_name] = ModuleOptimizerInfo(
             optimizer=optimizer, grid=grid, pg_collection=pg_collection, is_active=is_active

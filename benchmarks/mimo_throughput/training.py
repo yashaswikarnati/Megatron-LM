@@ -58,67 +58,6 @@ logger = logging.getLogger(__name__)
 ENCODER_NAME = "images"
 
 
-# ---------------------------------------------------------------------------
-# Distributed optimizer instance group helpers
-# ---------------------------------------------------------------------------
-
-
-def _create_dist_opt_instance_groups(grid, num_instances):
-    """Create hierarchical distributed optimizer instance groups from a HyperCommGrid.
-
-    Mirrors the logic in ``parallel_state._initialize_expert_data_parallel_groups``
-    (lines 1291-1313) but operates on a HyperCommGrid instead of global state.
-
-    Args:
-        grid: HyperCommGrid with at least a ``dp`` dimension.
-        num_instances: Number of distributed optimizer instances (must divide dp_size).
-
-    Returns:
-        (intra_dp_group, inter_group, intra_dist_opt_group) for the calling rank.
-    """
-    from megatron.core.parallel_state import create_hierarchical_groups
-
-    rank = dist.get_rank()
-    dp_size = grid.shape[grid.dim_names.index('dp')]
-    assert dp_size % num_instances == 0
-    intra_size = dp_size // num_instances
-
-    # Intra/inter DP groups — one set per TP group (matches parallel_state pattern).
-    intra_dp_group = None
-    inter_group = None
-    for dp_ranks in grid.get_rank_enum('dp'):
-        hierarchical_groups, _ = create_hierarchical_groups(
-            rank, dp_ranks, [intra_size, num_instances], group_desc="DIST_OPT_INSTANCE",
-        )
-        if rank in dp_ranks:
-            intra_dp_group = hierarchical_groups[0]
-            inter_group = hierarchical_groups[1]
-
-    # intra_dist_opt: spans all model-parallel dims × intra-DP (for grad-stats).
-    # Build by collecting, for each intra-DP slice, all MP peers of those DP ranks.
-    # This is order-independent — get_rank_enum returns groups whose membership is
-    # determined by the grid shape, not by dim_names ordering.
-    tp_rank_groups = grid.get_rank_enum('tp')
-    rank_to_mp_peers = {}
-    for tp_ranks in tp_rank_groups:
-        for r in tp_ranks:
-            rank_to_mp_peers[r] = tp_ranks
-
-    intra_dist_opt_group = None
-    seen = set()
-    representative_dp_ranks = grid.get_rank_enum('dp')[0]
-    for start in range(0, len(representative_dp_ranks), intra_size):
-        intra_dp_ranks = representative_dp_ranks[start : start + intra_size]
-        all_ranks = sorted({r for dp_r in intra_dp_ranks for r in rank_to_mp_peers[dp_r]})
-        key = tuple(all_ranks)
-        if key not in seen:
-            seen.add(key)
-            group = dist.new_group(ranks=all_ranks)
-            if rank in all_ranks:
-                intra_dist_opt_group = group
-
-    return intra_dp_group, inter_group, intra_dist_opt_group
-
 
 # ---------------------------------------------------------------------------
 # Model spec helpers (mirrors test_mimo_colocated_e2e.py patterns)
@@ -242,7 +181,9 @@ def _get_vision_submodules_spec(arch, language_hidden_size, pg_collection):
 
 
 def _setup_encoder_dist_opt_groups(encoder_grid, encoder_pg, num_instances):
-    """Wire hierarchical process groups for multi-instance encoder optimizer."""
+    """Wire hierarchical process groups onto encoder pg_collection for DDP init."""
+    from megatron.core.models.mimo.optimizer import _create_dist_opt_instance_groups
+
     intra_dp_group, inter_group, intra_dist_opt_group = (
         _create_dist_opt_instance_groups(encoder_grid, num_instances)
     )
@@ -250,10 +191,6 @@ def _setup_encoder_dist_opt_groups(encoder_grid, encoder_pg, num_instances):
     encoder_pg.intra_expt_dp = intra_dp_group
     encoder_pg.inter_dist_opt = inter_group
     encoder_pg.intra_dist_opt = intra_dist_opt_group
-    # The MIMO optimizer creates its own pg_collection from the grid. Store the
-    # intra_dist_opt group on the grid so _get_pg_collection_for_optimizer can
-    # propagate it without needing access to the DDP wrapper's pg_collection.
-    encoder_grid._dist_opt_intra_dist_opt_group = intra_dist_opt_group
 
 
 def _init_sequence_parallel(llm_pg, config, lp, ep):
