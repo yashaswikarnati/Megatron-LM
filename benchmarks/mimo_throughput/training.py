@@ -88,10 +88,6 @@ def _get_language_model_spec(arch, pg_collection, sequence_parallel=False):
         bias_activation_fusion=True,
         sequence_parallel=sequence_parallel,
         tp_comm_overlap=sequence_parallel,
-        # RS pipelined overlap is incompatible with the current TE config
-        # (crashes with "split_overlap_rs: Invalid type"). AG overlap works.
-        tp_comm_overlap_rs_dgrad=False,
-        tp_comm_overlap_rs=False,
     )
 
     gpt_params = {
