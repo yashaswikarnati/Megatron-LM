@@ -28,6 +28,7 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
+from megatron.core.models.mimo.config.memory_config import ModuleMemoryConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
@@ -263,11 +264,25 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
         pg_collection=encoder_pg,
     )
 
+    # Build memory_config from benchmark MemorySpec
+    memory_config = None
+    if config.memory is not None:
+        import dataclasses as _dc
+
+        memory_config = {}
+        if config.memory.encoder is not None:
+            memory_config[ENCODER_NAME] = ModuleMemoryConfig(**_dc.asdict(config.memory.encoder))
+        if config.memory.llm is not None:
+            memory_config[MIMO_LANGUAGE_MODULE_KEY] = ModuleMemoryConfig(
+                **_dc.asdict(config.memory.llm)
+            )
+
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec={ENCODER_NAME: vision_submodule_spec},
         special_token_ids={ENCODER_NAME: config.data.image_token_id},
         module_to_grid_map={ENCODER_NAME: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid},
+        memory_config=memory_config,
     )
 
     mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp)

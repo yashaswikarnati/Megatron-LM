@@ -57,6 +57,8 @@ def colocated_forward_backward_with_pp(
         full_encoder_input = _concat_encoder_inputs(all_batches, encoder_name)
         _slice_for_encoder_dp(full_encoder_input, encoder_grid, llm_grid)
 
+        mem_mgr = mimo_model.memory_manager
+
         with record_function("mimo::encoder_forward"):
             enc_out = mimo_model.encode_and_communicate({encoder_name: full_encoder_input})
 
@@ -81,26 +83,31 @@ def colocated_forward_backward_with_pp(
             )
             return output_tensor, partial(_loss_func, cached['loss_mask'])
 
-        with record_function("mimo::llm_forward"):
-            losses = schedules.forward_backward_pipelining_without_interleaving(
-                forward_step_func=_lm_forward_step,
-                data_iterator=cache_iter,
-                model=[mimo_model],
-                num_microbatches=num_microbatches,
-                forward_only=forward_only,
-                **schedule_kwargs,
-            )
+        # Suppress the schedule's off_interface.reset() during Phase 2 so
+        # Phase 3's encoder backward can still access offloaded tensors.
+        # The context manager resets after Phase 3 completes (or on exception).
+        with mem_mgr.deferred_offload_reset(mimo_model.config):
+            with record_function("mimo::llm_forward"):
+                losses = schedules.forward_backward_pipelining_without_interleaving(
+                    forward_step_func=_lm_forward_step,
+                    data_iterator=cache_iter,
+                    model=[mimo_model],
+                    num_microbatches=num_microbatches,
+                    forward_only=forward_only,
+                    **schedule_kwargs,
+                )
 
-        # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────────
-        # detached_full.grad was populated by Phase 2's per-microbatch LLM backward
-        # (accumulated across microbatch view slices on PP stage 0).
-        # Broadcast to PP stage 1+ then run one encoder backward for the full batch.
-        if not forward_only and enc_out:
-            _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
-            for key in enc_out:
-                grad = detached_full[key].grad
-                if grad is not None:
-                    torch.autograd.backward(enc_out[key], grad_tensors=grad)
+            # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────
+            # detached_full.grad was populated by Phase 2's per-microbatch LLM backward
+            # (accumulated across microbatch view slices on PP stage 0).
+            # Broadcast to PP stage 1+ then run one encoder backward for the full batch.
+            with record_function("mimo::encoder_backward"):
+                if not forward_only and enc_out:
+                    _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
+                    for key in enc_out:
+                        grad = detached_full[key].grad
+                        if grad is not None:
+                            torch.autograd.backward(enc_out[key], grad_tensors=grad)
 
     return losses
 

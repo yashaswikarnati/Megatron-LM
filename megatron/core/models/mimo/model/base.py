@@ -11,6 +11,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
+from megatron.core.models.mimo.memory_manager import MimoMemoryManager
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
@@ -113,10 +114,16 @@ class MimoModel(MegatronModule):
             )
             self.partition_adapter = PartitionAdapter(partition_config)
 
+        self.memory_manager = MimoMemoryManager(mimo_config)
+
         # Initialize modality submodules from specifications
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
         self._initialize_language_model()
+
+        # Enable schedule-level offload reset if any module uses offloading
+        if self.memory_manager.needs_offload_lifecycle:
+            self.config.fine_grained_activation_offloading = True
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
@@ -608,6 +615,8 @@ class MimoModel(MegatronModule):
 
         This is the original behavior, preserved for backward compatibility.
         """
+        self.memory_manager.init_offload()
+
         # If packing_kwargs is provided, construct PackedSeqParams
         packed_seq_params = None
         if packing_kwargs is not None:
@@ -657,10 +666,11 @@ class MimoModel(MegatronModule):
         # 2. Merge embeddings from different modalities
         logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
         with record_function("mimo::align_embeddings"):
-            combined_embeddings = self.align_embeddings_by_token_positions(
-                modality_embeddings=modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=self.special_token_ids,
+            combined_embeddings = self.memory_manager.forward_combined_embeddings(
+                self.align_embeddings_by_token_positions,
+                modality_embeddings,
+                input_ids,
+                self.special_token_ids,
             )
         self._record_mem("mimo::align_embeddings")
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
