@@ -223,24 +223,9 @@ class _ColocatedCommunicate(torch.autograd.Function):
         elif comm.is_fan_in():
             group = comm.get_all_gather_group()
             world_size = comm.get_all_gather_world_size()
-            batch_dim = ctx.batch_dim
-
-            # Use all_gather_into_tensor to write directly into a pre-allocated
-            # output buffer, avoiding the N intermediate tensors + torch.cat copy.
-            # all_gather_into_tensor concatenates along dim 0, so when batch_dim
-            # is not 0 we move it to dim 0 before gathering, then restore.
-            input_contig = tensor.contiguous()
-            if batch_dim != 0:
-                input_contig = input_contig.movedim(batch_dim, 0).contiguous()
-
-            out_shape = list(input_contig.shape)
-            out_shape[0] *= world_size
-            output = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
-            dist.all_gather_into_tensor(output, input_contig, group=group)
-
-            if batch_dim != 0:
-                output = output.movedim(0, batch_dim).contiguous()
-            return output
+            gathered_list = [torch.empty_like(tensor) for _ in range(world_size)]
+            dist.all_gather(gathered_list, tensor.contiguous(), group=group)
+            return torch.cat(gathered_list, dim=ctx.batch_dim)
 
         else:
             return tensor.contiguous()

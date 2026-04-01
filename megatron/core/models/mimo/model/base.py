@@ -11,6 +11,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
+from megatron.core.models.mimo.memory_manager import MimoMemoryManager
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
@@ -113,10 +114,16 @@ class MimoModel(MegatronModule):
             )
             self.partition_adapter = PartitionAdapter(partition_config)
 
+        self.memory_manager = MimoMemoryManager(mimo_config)
+
         # Initialize modality submodules from specifications
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
         self._initialize_language_model()
+
+        # Enable schedule-level offload reset if any module uses offloading
+        if self.memory_manager.needs_offload_lifecycle:
+            self.config.fine_grained_activation_offloading = True
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
@@ -608,6 +615,8 @@ class MimoModel(MegatronModule):
 
         This is the original behavior, preserved for backward compatibility.
         """
+        self.memory_manager.init_offload()
+
         # If packing_kwargs is provided, construct PackedSeqParams
         packed_seq_params = None
         if packing_kwargs is not None:
@@ -657,33 +666,21 @@ class MimoModel(MegatronModule):
         # 2. Merge embeddings from different modalities
         logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
         with record_function("mimo::align_embeddings"):
-            combined_embeddings = self.align_embeddings_by_token_positions(
-                modality_embeddings=modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=self.special_token_ids,
+            combined_embeddings = self.memory_manager.forward_combined_embeddings(
+                self.align_embeddings_by_token_positions,
+                modality_embeddings,
+                input_ids,
+                self.special_token_ids,
             )
         self._record_mem("mimo::align_embeddings")
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
-        # 3. Scatter to sequence-parallel / context-parallel regions if needed.
-        #
-        # PartitionAdapter.shard() handles both SP and CP scattering. However the
-        # expected input layout differs:
-        #   SP-only:  [S, B, H] — shard() scatters along dim 0 → [S/TP, B, H]
-        #   CP (+SP): [B, S, H] — shard() uses get_batch_on_this_cp_rank
-        #
-        # The original code always transposed to [B, S, H] which breaks SP-only
-        # because shard()'s seq_dim=0 check (partition/utils.py:156) would see B
-        # instead of S, failing the "S % TP == 0" assertion.
+        # 3. If sharding is needed, apply PartitionAdapter.
+        # combined_embeddings is [S, B, H]; transpose to [B, S, H] for shard() which expects
+        # batch-first layout (required by get_batch_on_this_cp_rank). After CP sharding each
+        # rank holds [B, S/cp, H]; transpose back to [S/cp, B, H] for the language model.
         if self.partition_adapter is not None:
-            lm = unwrap_model(self.language_model)
-            sp_only = (
-                getattr(lm.config, 'sequence_parallel', False)
-                and lm.config.context_parallel_size <= 1
-            )
-            if not sp_only:
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
-
+            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [B, S, H]
             combined_embeddings, labels, loss_mask, _, packed_seq_params = (
                 self.partition_adapter.shard(
                     embeddings=combined_embeddings,
@@ -693,8 +690,9 @@ class MimoModel(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
             )
-
-            if not sp_only and combined_embeddings is not None:
+            # shard() returns embeddings in [B, S/cp, H]; transpose to [S/cp, B, H]
+            # which is what the language model expects.
+            if combined_embeddings is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
         # 5. Forward pass through language model

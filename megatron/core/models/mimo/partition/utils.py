@@ -178,9 +178,7 @@ class PartitionAdapter:
             )
 
         if self.cfg.seq_parallel and embeddings is not None:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
-                embeddings, group=self.cfg.tp_group
-            )
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
 
         return embeddings, labels, loss_mask, attention_mask, packed_seq_params
 

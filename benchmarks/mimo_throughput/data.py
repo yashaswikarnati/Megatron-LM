@@ -30,7 +30,6 @@ class SyntheticVLMIterator:
         vocab_size: int,
         image_token_id: int = 32000,
         encoder_name: str = "images",
-        num_images_per_sample: int = 1,
     ):
         self.encoder_hidden_size = encoder_hidden_size
         self.image_seq_length = image_seq_length
@@ -39,8 +38,6 @@ class SyntheticVLMIterator:
         self.vocab_size = vocab_size
         self.image_token_id = image_token_id
         self.encoder_name = encoder_name
-        self.num_images_per_sample = num_images_per_sample
-        self.total_image_tokens = num_images_per_sample * image_seq_length
 
     def __iter__(self):
         return self
@@ -51,32 +48,28 @@ class SyntheticVLMIterator:
         Returns:
             Dict with input_ids, labels, loss_mask, position_ids, and modality_inputs.
         """
-        # Encoder hidden states: [image_seq_length, num_images * micro_batch_size, hidden]
-        # With num_images_per_sample > 1, the encoder processes more images than
-        # there are text samples — this is the multi-image VLM case.
-        encoder_batch = self.num_images_per_sample * self.micro_batch_size
+        # Encoder hidden states: [image_seq_length, micro_batch_size, encoder_hidden_size]
         encoder_hidden_states = torch.randn(
             self.image_seq_length,
-            encoder_batch,
+            self.micro_batch_size,
             self.encoder_hidden_size,
             device='cuda',
             dtype=torch.bfloat16,
         )
 
-        # Input IDs: first total_image_tokens are image_token_id, rest are text
+        # Input IDs: first image_seq_length tokens are image_token_id, rest are random vocab
         image_tokens = torch.full(
-            (self.micro_batch_size, self.total_image_tokens),
+            (self.micro_batch_size, self.image_seq_length),
             self.image_token_id,
             dtype=torch.long,
             device='cuda',
         )
         # Text tokens in [1, vocab_size) with image_token_id excluded
         upper = min(self.image_token_id, self.vocab_size)
-        text_len = self.total_seq_length - self.total_image_tokens
         text_tokens = torch.randint(
             1,
             upper,
-            (self.micro_batch_size, text_len),
+            (self.micro_batch_size, self.total_seq_length - self.image_seq_length),
             dtype=torch.long,
             device='cuda',
         )
