@@ -675,12 +675,25 @@ class MimoModel(MegatronModule):
         self._record_mem("mimo::align_embeddings")
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
-        # 3. If sharding is needed, apply PartitionAdapter.
-        # combined_embeddings is [S, B, H]; transpose to [B, S, H] for shard() which expects
-        # batch-first layout (required by get_batch_on_this_cp_rank). After CP sharding each
-        # rank holds [B, S/cp, H]; transpose back to [S/cp, B, H] for the language model.
+        # 3. Scatter to sequence-parallel / context-parallel regions if needed.
+        #
+        # PartitionAdapter.shard() handles both SP and CP scattering. However the
+        # expected input layout differs:
+        #   SP-only:  [S, B, H] — shard() scatters along dim 0 → [S/TP, B, H]
+        #   CP (+SP): [B, S, H] — shard() uses get_batch_on_this_cp_rank
+        #
+        # The original code always transposed to [B, S, H] which breaks SP-only
+        # because shard()'s seq_dim=0 check (partition/utils.py:156) would see B
+        # instead of S, failing the "S % TP == 0" assertion.
         if self.partition_adapter is not None:
-            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [B, S, H]
+            lm = unwrap_model(self.language_model)
+            sp_only = (
+                getattr(lm.config, 'sequence_parallel', False)
+                and lm.config.context_parallel_size <= 1
+            )
+            if not sp_only:
+                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
             combined_embeddings, labels, loss_mask, _, packed_seq_params = (
                 self.partition_adapter.shard(
                     embeddings=combined_embeddings,
@@ -690,9 +703,8 @@ class MimoModel(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
             )
-            # shard() returns embeddings in [B, S/cp, H]; transpose to [S/cp, B, H]
-            # which is what the language model expects.
-            if combined_embeddings is not None:
+
+            if not sp_only and combined_embeddings is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
         # 5. Forward pass through language model
