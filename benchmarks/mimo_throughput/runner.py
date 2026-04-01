@@ -173,6 +173,13 @@ def main():
         default=None,
         help='Iteration range to profile, e.g. "5-7" (0-based). Requires --profile.',
     )
+    parser.add_argument(
+        '--profile-memory',
+        action='store_true',
+        default=False,
+        help='Capture GPU memory snapshot for one post-warmup iteration. '
+        'Generates interactive HTML timeline and flamegraph SVG.',
+    )
     args = parser.parse_args()
 
     if not args.config and not args.configs_dir:
@@ -202,7 +209,10 @@ def main():
         if rank == 0:
             logger.info(f"Running single experiment: {config.experiment.name}")
         summary = run_benchmark(
-            config, profile_steps=profile_steps, results_dir=args.results_dir
+            config,
+            profile_steps=profile_steps,
+            profile_memory=args.profile_memory,
+            results_dir=args.results_dir,
         )
         if rank == 0:
             _save_result(summary, config, args.results_dir)
@@ -218,7 +228,10 @@ def main():
             if rank == 0:
                 logger.info(f"--- Running experiment: {cfg.experiment.name} ---")
             summary = run_benchmark(
-                cfg, profile_steps=profile_steps, results_dir=args.results_dir
+                cfg,
+                profile_steps=profile_steps,
+                profile_memory=args.profile_memory,
+                results_dir=args.results_dir,
             )
             if rank == 0:
                 _save_result(summary, cfg, args.results_dir)

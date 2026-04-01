@@ -125,9 +125,6 @@ def _get_vision_submodules_spec(arch, language_hidden_size, pg_collection):
         pipeline_model_parallel_size=1,
         pipeline_dtype=torch.bfloat16,
         bf16=True,
-        recompute_granularity='full',
-        recompute_method='uniform',
-        recompute_num_layers=arch.num_layers,
     )
 
     proj_cfg = TransformerConfig(
@@ -497,9 +494,52 @@ def _compute_effective_mbs(config: BenchmarkConfig, encoder_grid, llm_grid):
     return mbs
 
 
+def _save_memory_profile(config: BenchmarkConfig, rank: int, results_dir: str):
+    """Capture and save GPU memory profiling artifacts.
+
+    Generates three files per rank:
+    - Pickle snapshot (for pytorch.org/memory_viz upload)
+    - Interactive HTML timeline (trace_plot)
+    - Flamegraph SVG (current memory attribution)
+    """
+    import torch.cuda._memory_viz as memory_viz
+
+    os.makedirs(results_dir, exist_ok=True)
+    prefix = os.path.join(results_dir, f"{config.experiment.name}_memory_rank{rank}")
+
+    # 1. Dump pickle snapshot
+    pickle_path = f"{prefix}_snapshot.pickle"
+    torch.cuda.memory._dump_snapshot(pickle_path)
+
+    # 2. Generate interactive HTML timeline
+    snapshot = torch.cuda.memory._snapshot()
+    html_path = f"{prefix}_timeline.html"
+    with open(html_path, "w") as f:
+        f.write(memory_viz.trace_plot(snapshot))
+
+    # 3. Generate flamegraph SVG (current memory attribution by stack)
+    try:
+        svg_content = memory_viz.memory(snapshot)
+        svg_path = f"{prefix}_flamegraph.svg"
+        with open(svg_path, "w") as f:
+            f.write(svg_content)
+    except Exception as e:
+        svg_path = "(failed)"
+        if rank == 0:
+            logger.warning(f"Flamegraph generation failed: {e}")
+
+    if rank == 0:
+        peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+        logger.info(
+            f"Memory profile saved (peak {peak_gb:.1f}GB): "
+            f"pickle={pickle_path}, html={html_path}, svg={svg_path}"
+        )
+
+
 def run_benchmark(
     config: BenchmarkConfig,
     profile_steps: tuple[int, int] | None = None,
+    profile_memory: bool = False,
     results_dir: str = "./results",
 ) -> dict:
     """Run benchmark for a single configuration.
@@ -511,6 +551,8 @@ def run_benchmark(
         config: Fully validated BenchmarkConfig.
         profile_steps: Optional (start, end) tuple of 0-based iteration indices
             to profile with torch.profiler. None means no profiling.
+        profile_memory: If True, capture GPU memory snapshot for one post-warmup
+            iteration. Generates interactive HTML timeline and flamegraph SVG.
         results_dir: Directory to save profiler output when profiling is enabled.
 
     Returns:
@@ -583,6 +625,10 @@ def run_benchmark(
             with_flops=True,
         )
 
+    # Memory profiling: capture one post-warmup iteration
+    mem_profile_iter = config.experiment.warmup_iterations if profile_memory else -1
+    mem_snapshot_done = False
+
     for i in range(num_iterations):
         # Enter profiler for the profiled range
         in_profile_range = (
@@ -590,6 +636,13 @@ def run_benchmark(
         )
         if in_profile_range and i == profile_steps[0] and profiler_ctx is not None:
             profiler_ctx.__enter__()
+
+        # Start memory recording for the target iteration
+        if profile_memory and i == mem_profile_iter and not mem_snapshot_done:
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.memory._record_memory_history(
+                enabled="all", context="all", stacks="python", max_entries=100000,
+            )
 
         monitor.start_iteration()
 
@@ -647,6 +700,13 @@ def run_benchmark(
         t_opt_ms = (time.time() - t_opt_start) * 1000.0
 
         metrics = monitor.end_iteration(fwd_bwd_ms=t_fwd_bwd_ms, opt_step_ms=t_opt_ms)
+
+        # Capture memory snapshot after the profiled iteration
+        if profile_memory and i == mem_profile_iter and not mem_snapshot_done:
+            mem_snapshot_done = True
+            torch.cuda.synchronize()
+            _save_memory_profile(config, rank, results_dir)
+            torch.cuda.memory._record_memory_history(enabled=None)
 
         if rank == 0 and (i + 1) % config.experiment.log_interval == 0:
             warmup_tag = " (warmup)" if (i + 1) <= config.experiment.warmup_iterations else ""
