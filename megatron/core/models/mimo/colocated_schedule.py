@@ -63,10 +63,13 @@ def colocated_forward_backward_with_pp(
             enc_out = mimo_model.encode_and_communicate({encoder_name: full_encoder_input})
 
         # Detach: sever autograd link to encoder so Phase 2 has no encoder collectives.
+        # Microbatch slices are views into detached_full — their .grad accumulates
+        # into detached_full.grad automatically via PyTorch's view gradient semantics.
         detached_full = {k: v.detach().requires_grad_(True) for k, v in enc_out.items()}
         lm_data = _build_lm_microbatches(detached_full, all_batches, num_microbatches)
 
         # ── Phase 2: LLM 1F1B pipeline ──────────────────────────────────────
+        # Only LLM P2P communication (within PP group). No encoder collectives.
         cache_iter = iter(lm_data)
 
         def _lm_forward_step(data_iterator_unused, model, *args):
@@ -95,6 +98,9 @@ def colocated_forward_backward_with_pp(
                 )
 
             # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────
+            # detached_full.grad was populated by Phase 2's per-microbatch LLM backward
+            # (accumulated across microbatch view slices on PP stage 0).
+            # Broadcast to PP stage 1+ then run one encoder backward for the full batch.
             with record_function("mimo::encoder_backward"):
                 if not forward_only and enc_out:
                     _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
