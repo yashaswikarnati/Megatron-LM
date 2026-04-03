@@ -10,6 +10,7 @@ are all handled here. The entry point is ``run_benchmark(config)``.
 """
 
 import gc
+import json
 import logging
 import os
 import time
@@ -22,6 +23,7 @@ os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -34,6 +36,7 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.timers import Timers
 from megatron.core.transformer.enums import ModelType
@@ -385,6 +388,201 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
 
 
 # ---------------------------------------------------------------------------
+# Homogeneous baseline: parallel_state, no grids, single DDP
+# ---------------------------------------------------------------------------
+
+
+def create_mimo_model_homo(config: BenchmarkConfig):
+    """Create MIMO model using parallel_state (no grids) for ablation baseline.
+
+    Encoder lives on PP stage 0 only. Single DDP wraps the entire model.
+    Uses get_megatron_optimizer (not get_mimo_optimizer) since there are no grids.
+    """
+    lp = config.llm_parallel
+
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=lp.tp,
+        pipeline_model_parallel_size=lp.pp,
+    )
+
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    add_encoder = (pp_rank == 0) if lp.pp > 1 else True
+
+    # Clear NVTE env vars (same as colocated path)
+    os.environ.pop('NVTE_FLASH_ATTN', None)
+    os.environ.pop('NVTE_FUSED_ATTN', None)
+    os.environ.pop('NVTE_UNFUSED_ATTN', None)
+    torch.manual_seed(12345)
+
+    # Build language model spec using parallel_state dimensions
+    lm_config = TransformerConfig(
+        num_layers=config.llm_arch.num_layers,
+        hidden_size=config.llm_arch.hidden_size,
+        num_attention_heads=config.llm_arch.num_attention_heads,
+        use_cpu_initialization=True,
+        variable_seq_lengths=True,
+        moe_token_dispatcher_type='alltoall',
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        pipeline_dtype=torch.bfloat16,
+        bf16=True,
+        cross_entropy_loss_fusion=True,
+        cross_entropy_fusion_impl='te',
+        gradient_accumulation_fusion=True,
+        bias_dropout_fusion=True,
+        bias_activation_fusion=True,
+    )
+    language_model_spec = ModuleSpec(
+        module=GPTModel,
+        params={
+            "config": lm_config,
+            "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
+            "vocab_size": config.llm_arch.vocab_size,
+            "max_sequence_length": config.llm_arch.seq_length,
+            "pre_process": (pp_rank == 0),
+            "post_process": (pp_rank == pp_size - 1),
+            "pg_collection": None,
+        },
+    )
+
+    # Build vision spec (only on PP stage 0)
+    vision_spec = {}
+    special_tokens = {}
+    if add_encoder:
+        from megatron.core.transformer.transformer_block import TransformerBlock
+
+        enc_arch = config.encoder_arch
+        vision_config = TransformerConfig(
+            num_layers=enc_arch.num_layers,
+            hidden_size=enc_arch.hidden_size,
+            num_attention_heads=enc_arch.num_attention_heads,
+            use_cpu_initialization=True,
+            variable_seq_lengths=True,
+            moe_token_dispatcher_type='alltoall',
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=1,
+            pipeline_dtype=torch.bfloat16,
+            bf16=True,
+        )
+        proj_cfg = TransformerConfig(
+            num_layers=1, hidden_size=config.llm_arch.hidden_size, num_attention_heads=1
+        )
+        proj_cfg.ffn_hidden_size = config.llm_arch.hidden_size
+        proj_cfg.bias_activation_fusion = True
+        proj_cfg.add_bias_linear = True
+        proj_cfg.activation_func = torch.nn.functional.gelu
+
+        vision_spec[ENCODER_NAME] = ModuleSpec(
+            module=VisionModalitySubmodules,
+            submodules={
+                "encoders": {
+                    "clip_encoder": ModuleSpec(
+                        module=TransformerBlock,
+                        params={
+                            "config": vision_config,
+                            "spec": get_gpt_layer_with_transformer_engine_spec(),
+                            "pg_collection": None,
+                            "pre_process": True,
+                            "post_process": True,
+                        },
+                    )
+                },
+                "input_projections": [
+                    ModuleSpec(
+                        module=MultimodalProjector,
+                        params={
+                            "config": proj_cfg,
+                            "submodules": MLPSubmodules(
+                                linear_fc1=TEColumnParallelLinear,
+                                linear_fc2=TERowParallelLinear,
+                            ),
+                            "projector_type": "mlp",
+                            "input_size": enc_arch.hidden_size,
+                            "tp_group": parallel_state.get_tensor_model_parallel_group(),
+                        },
+                    )
+                ],
+            },
+        )
+        special_tokens = {ENCODER_NAME: config.data.image_token_id}
+
+    mimo_config = MimoModelConfig(
+        language_model_spec=language_model_spec,
+        modality_submodules_spec=vision_spec,
+        special_token_ids=special_tokens,
+        module_to_grid_map=None,
+    )
+
+    model = MimoModel(mimo_config)
+    model.to(torch.device("cuda")).to(torch.bfloat16)
+    model.model_type = ModelType.encoder_or_decoder
+
+    # finalize_model_grads needs these attributes on the unwrapped model
+    model.pre_process = (pp_rank == 0)
+    model.post_process = (pp_rank == pp_size - 1)
+    model.share_embeddings_and_output_weights = False
+
+    # Fix up PP flags (MimoModel defaults to lm_has_pp=False when grid_map is None)
+    if lp.pp > 1:
+        model.lm_has_pp = True
+        model.lm_is_first_pp_stage = (pp_rank == 0)
+        from megatron.core.models.mimo.config.role import ModuleStageInfo
+        model.role.modules[MIMO_LANGUAGE_MODULE_KEY] = ModuleStageInfo(
+            is_first_stage=(pp_rank == 0),
+            is_last_stage=(pp_rank == pp_size - 1),
+        )
+
+    # Single DDP wrapping the entire model (pg_collection=None -> parallel_state)
+    ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True, use_distributed_optimizer=True,
+    )
+    model = DistributedDataParallel(
+        config=model.config, ddp_config=ddp_config, module=model, pg_collection=None,
+    )
+
+    # Attach no_sync, finalize_grads, grad_scale for the schedule
+    @contextmanager
+    def no_sync_func():
+        with model.no_sync():
+            yield
+
+    def finalize_grads_func(*args, force_all_reduce=False, **kwargs):
+        finalize_model_grads(
+            [model], num_tokens=None, pg_collection=None,
+            force_all_reduce=force_all_reduce,
+        )
+
+    model.config.no_sync_func = no_sync_func
+    model.config.finalize_model_grads_func = finalize_grads_func
+    model.config.grad_scale_func = lambda loss: (
+        torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
+        if isinstance(loss, (int, float))
+        else loss
+    )
+
+    # Optimizer (parallel_state fallback via pg_collection=None)
+    opt_config = OptimizerConfig(
+        optimizer='adam', lr=1e-4, weight_decay=0.01, clip_grad=1.0,
+        bf16=True, use_distributed_optimizer=True,
+    )
+    optimizer = get_megatron_optimizer(
+        config=opt_config, model_chunks=[model], pg_collection=None,
+        use_gloo_process_groups=True,
+    )
+
+    return model, optimizer
+
+
+def forward_step_homo(data_iterator, model):
+    """Forward step for homo PP. The model handles stage routing internally."""
+    batch = next(data_iterator)
+    output_tensor, loss_mask = model(**batch)
+    return output_tensor, partial(loss_func, loss_mask)
+
+
+# ---------------------------------------------------------------------------
 # Forward step (PP=1 path only; PP>1 uses colocated_schedule internally)
 # ---------------------------------------------------------------------------
 
@@ -567,32 +765,41 @@ def run_benchmark(
     """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    is_homo = (config.pp_mode == "homo")
 
     if rank == 0:
-        logger.info(f"Starting benchmark: {config.experiment.name}")
+        logger.info(f"Starting benchmark: {config.experiment.name} (pp_mode={config.pp_mode})")
 
-    # 1. Process groups
-    pg_manager = ProcessGroupManager()
-
-    # 1b. Optional pipeline timers (profiling only -- adds cuda.synchronize() overhead)
+    # 1. Process groups + model + optimizer (homo vs colocated paths)
     pipeline_timers = None
     if config.pipeline_timers:
-        # log_level=2 captures forward-compute and backward-compute (they use log_level=2)
-        # log_option='all' reports per-rank times (not just max/min)
         pipeline_timers = Timers(log_level=2, log_option='all')
         if rank == 0:
             logger.info("Pipeline timers created (log_level=2, log_option='all')")
 
-    # 2. Model + context
-    mimo_model, ctx = create_mimo_model(config, pg_manager, timers=pipeline_timers)
+    pg_manager = None
+    if is_homo:
+        # Homo baseline: parallel_state, encoder on PP stage 0, single DDP
+        mimo_model, optimizer = create_mimo_model_homo(config)
+        encoder_grid = llm_grid = llm_pg = None
+        effective_mbs = config.data.micro_batch_size
+    else:
+        # Colocated hetero: grid-based, encoder on all ranks
+        pg_manager = ProcessGroupManager()
+        mimo_model, ctx = create_mimo_model(config, pg_manager, timers=pipeline_timers)
+        encoder_grid = ctx['encoder_grid']
+        llm_grid = ctx['llm_grid']
+        llm_pg = ctx['llm_pg']
+        effective_mbs = _compute_effective_mbs(config, encoder_grid, llm_grid)
 
-    encoder_grid = ctx['encoder_grid']
-    llm_grid = ctx['llm_grid']
-    llm_pg = ctx['llm_pg']
+        # Optimizer (colocated path)
+        opt_config = OptimizerConfig(
+            optimizer='adam', lr=1e-4, weight_decay=0.01, clip_grad=1.0,
+            bf16=True, use_distributed_optimizer=True,
+        )
+        optimizer = get_mimo_optimizer(mimo_model, opt_config)
 
     # 3. Data iterator
-    effective_mbs = _compute_effective_mbs(config, encoder_grid, llm_grid)
-
     data_iter = SyntheticVLMIterator(
         encoder_hidden_size=config.encoder_arch.hidden_size,
         image_seq_length=config.encoder_arch.seq_length,
@@ -603,17 +810,6 @@ def run_benchmark(
         encoder_name=ENCODER_NAME,
         num_images_per_sample=config.data.num_images_per_sample,
     )
-
-    # 4. Optimizer
-    opt_config = OptimizerConfig(
-        optimizer='adam',
-        lr=1e-4,
-        weight_decay=0.01,
-        clip_grad=1.0,
-        bf16=True,
-        use_distributed_optimizer=True,
-    )
-    optimizer = get_mimo_optimizer(mimo_model, opt_config)
 
     # 5. Performance monitor
     monitor = PerformanceMonitor(config, world_size)
@@ -651,8 +847,10 @@ def run_benchmark(
     # Determine PP stage for timer logging
     pp_stage = None
     if pipeline_timers is not None:
-        if config.llm_has_pp:
-            pp_group = ctx['llm_grid'].get_pg("pp")
+        if is_homo and config.llm_has_pp:
+            pp_stage = parallel_state.get_pipeline_model_parallel_rank()
+        elif config.llm_has_pp and llm_grid is not None:
+            pp_group = llm_grid.get_pg("pp")
             pp_stage = pp_group.rank()
         else:
             pp_stage = 0
@@ -678,7 +876,31 @@ def run_benchmark(
         torch.cuda.synchronize()
         t_fwd_bwd_start = time.time()
 
-        if config.llm_has_pp:
+        if is_homo:
+            # Homo baseline: standard Megatron schedules, no grids
+            from megatron.core.pipeline_parallel import schedules
+
+            if config.llm_has_pp:
+                losses = schedules.forward_backward_pipelining_without_interleaving(
+                    forward_step_func=forward_step_homo,
+                    data_iterator=data_iter,
+                    model=[mimo_model],
+                    num_microbatches=config.data.num_microbatches,
+                    seq_length=config.llm_arch.seq_length,
+                    micro_batch_size=effective_mbs,
+                    forward_only=False,
+                )
+            else:
+                losses = schedules.forward_backward_no_pipelining(
+                    forward_step_func=forward_step_homo,
+                    data_iterator=data_iter,
+                    model=[mimo_model],
+                    num_microbatches=config.data.num_microbatches,
+                    seq_length=config.llm_arch.seq_length,
+                    micro_batch_size=effective_mbs,
+                    forward_only=False,
+                )
+        elif config.llm_has_pp:
             from megatron.core.models.mimo.colocated_schedule import (
                 colocated_forward_backward_with_pp,
             )
@@ -853,6 +1075,9 @@ def run_benchmark(
     del mimo_model
     torch.cuda.empty_cache()
     gc.collect()
-    pg_manager.destroy_all()
+    if is_homo:
+        parallel_state.destroy_model_parallel()
+    else:
+        pg_manager.destroy_all()
 
     return summary
