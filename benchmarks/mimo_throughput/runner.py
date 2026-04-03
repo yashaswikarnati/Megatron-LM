@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import csv
+import dataclasses
 import json
 import logging
 import os
@@ -114,6 +115,7 @@ def aggregate_results_csv(results_dir: str, output_path: str = None):
             # Data
             'micro_batch_size': data_cfg.get('micro_batch_size', ''),
             'num_microbatches': data_cfg.get('num_microbatches', ''),
+            'dp_batch_size': data_cfg.get('dp_batch_size', ''),
             'global_batch_size': data_cfg.get('global_batch_size', ''),
             # Metrics
             'median_tflops_per_gpu': _fmt(summary.get('median_tflops_per_gpu')),
@@ -180,6 +182,14 @@ def main():
         help='Capture GPU memory snapshot for one post-warmup iteration. '
         'Generates interactive HTML timeline and flamegraph SVG.',
     )
+    parser.add_argument(
+        '--pipeline-timers',
+        action='store_true',
+        default=False,
+        help='Enable Megatron per-microbatch forward-compute/backward-compute timers. '
+        'WARNING: introduces cuda.synchronize() calls that affect throughput. '
+        'Use only for profiling, not for benchmark measurements.',
+    )
     args = parser.parse_args()
 
     if not args.config and not args.configs_dir:
@@ -202,12 +212,20 @@ def main():
 
     rank = dist.get_rank()
 
+    def _apply_cli_overrides(cfg: BenchmarkConfig) -> BenchmarkConfig:
+        """Apply CLI flag overrides to a loaded config (frozen dataclass)."""
+        if args.pipeline_timers and not cfg.pipeline_timers:
+            cfg = dataclasses.replace(cfg, pipeline_timers=True)
+        return cfg
+
     if args.config:
         # Single experiment
-        config = load_config(args.config)
+        config = _apply_cli_overrides(load_config(args.config))
         config.validate()
         if rank == 0:
             logger.info(f"Running single experiment: {config.experiment.name}")
+            if config.pipeline_timers:
+                logger.info("  Pipeline timers ENABLED (profiling mode)")
         summary = run_benchmark(
             config,
             profile_steps=profile_steps,
@@ -224,9 +242,12 @@ def main():
             logger.info(f"Loaded {len(configs)} experiment configs from {args.configs_dir}")
 
         for cfg in configs:
+            cfg = _apply_cli_overrides(cfg)
             cfg.validate()
             if rank == 0:
                 logger.info(f"--- Running experiment: {cfg.experiment.name} ---")
+                if cfg.pipeline_timers:
+                    logger.info("  Pipeline timers ENABLED (profiling mode)")
             summary = run_benchmark(
                 cfg,
                 profile_steps=profile_steps,

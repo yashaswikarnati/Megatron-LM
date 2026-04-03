@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch.profiler import record_function
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
@@ -417,8 +418,16 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
         pg_collection = _get_pg_collection_for_optimizer(grid, num_dist_opt_instances)
 
         if is_active and module is not None:
+            # Use per-module optimizer config if encoder has non-distributed optimizer
+            module_opt_config = config
+            if module_name != lang_key:
+                if module is not None and hasattr(module, 'ddp_config') and module.ddp_config:
+                    if not module.ddp_config.use_distributed_optimizer:
+                        module_opt_config = deepcopy(config)
+                        module_opt_config.use_distributed_optimizer = False
+
             optimizer = get_megatron_optimizer(
-                config=config,
+                config=module_opt_config,
                 model_chunks=[module],
                 pg_collection=pg_collection,
                 use_gloo_process_groups=False,

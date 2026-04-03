@@ -55,26 +55,27 @@ class PerformanceMonitor:
     def _compute_total_flops(self) -> int:
         """Compute total FLOPs per iteration across all modules.
 
-        For each module: flops = 6 * params * seq_length * global_batch_size
+        For each module per microbatch:
+            flops = 6 * params * seq_length * dp_batch_size
         (factor of 6 = 2 for multiply-add in forward, x3 for forward + backward)
 
-        Total = sum of all modules x num_microbatches.
+        Total = sum of all modules × num_microbatches.
 
         Returns:
-            Total FLOPs for one full training iteration.
+            Total FLOPs for one full training iteration (all microbatches).
         """
         cfg = self.config
-        gbs = cfg.global_batch_size
+        dp_bs = cfg.dp_batch_size  # mbs × llm_dp (samples per microbatch)
         num_images = cfg.data.num_images_per_sample
 
         # Encoder FLOPs — scaled by num_images_per_sample
-        # The encoder processes num_images * GBS images per microbatch
+        # The encoder processes num_images × dp_batch_size images per microbatch
         enc_params = self._estimate_params(
             cfg.encoder_arch.num_layers,
             cfg.encoder_arch.hidden_size,
             cfg.encoder_arch.vocab_size,
         )
-        enc_flops_per_mb = 6 * enc_params * cfg.encoder_arch.seq_length * gbs * num_images
+        enc_flops_per_mb = 6 * enc_params * cfg.encoder_arch.seq_length * dp_bs * num_images
 
         # LLM FLOPs — seq_length includes all image tokens
         llm_params = self._estimate_params(
@@ -82,7 +83,7 @@ class PerformanceMonitor:
             cfg.llm_arch.hidden_size,
             cfg.llm_arch.vocab_size,
         )
-        llm_flops_per_mb = 6 * llm_params * cfg.llm_arch.seq_length * gbs
+        llm_flops_per_mb = 6 * llm_params * cfg.llm_arch.seq_length * dp_bs
 
         total_per_mb = enc_flops_per_mb + llm_flops_per_mb
         return total_per_mb * cfg.data.num_microbatches
@@ -109,7 +110,7 @@ class PerformanceMonitor:
         elapsed = time.time() - self._iter_start
 
         cfg = self.config
-        total_samples = cfg.global_batch_size * cfg.data.num_microbatches
+        total_samples = cfg.global_batch_size  # mbs × llm_dp × nmb
 
         tflops_per_gpu = self.total_flops / (elapsed * 1e12 * self.world_size)
         tokens_per_sec = (total_samples * cfg.llm_arch.seq_length) / elapsed
@@ -201,6 +202,7 @@ class PerformanceMonitor:
                     'micro_batch_size': self.config.data.micro_batch_size,
                     'num_microbatches': self.config.data.num_microbatches,
                     'num_images_per_sample': self.config.data.num_images_per_sample,
+                    'dp_batch_size': self.config.dp_batch_size,
                     'global_batch_size': self.config.global_batch_size,
                 },
                 'total_flops_per_iteration': self.total_flops,
@@ -208,5 +210,10 @@ class PerformanceMonitor:
             'summary': self.get_summary(exclude_warmup=True),
             'history': self.history,
         }
+
+        # Include pipeline timer data if collected
+        if hasattr(self, 'pipeline_timer_history') and self.pipeline_timer_history:
+            data['pipeline_timers'] = self.pipeline_timer_history
+
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)

@@ -35,6 +35,7 @@ from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.timers import Timers
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -65,7 +66,7 @@ ENCODER_NAME = "images"
 # ---------------------------------------------------------------------------
 
 
-def _get_language_model_spec(arch, pg_collection, sequence_parallel=False):
+def _get_language_model_spec(arch, pg_collection, sequence_parallel=False, timers=None):
     """Build ModuleSpec for the GPT language model."""
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
@@ -89,6 +90,7 @@ def _get_language_model_spec(arch, pg_collection, sequence_parallel=False):
         bias_activation_fusion=True,
         sequence_parallel=sequence_parallel,
         tp_comm_overlap=sequence_parallel,
+        timers=timers,
     )
 
     gpt_params = {
@@ -221,12 +223,13 @@ def _init_sequence_parallel(llm_pg, config, lp, ep):
                 logger.warning(f"TE UB init failed (tp_comm_overlap disabled): {e}")
 
 
-def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
+def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, timers=None):
     """Create a MIMO model with DDP wrapping and process groups.
 
     Args:
         config: BenchmarkConfig with architecture and parallelism specs.
         pg_manager: ProcessGroupManager for grid and PG lifecycle.
+        timers: Optional Timers instance for pipeline profiling.
 
     Returns:
         Tuple of (mimo_model, context_dict) where context_dict contains:
@@ -254,7 +257,9 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
     if use_sp:
         _init_sequence_parallel(llm_pg, config, lp, ep)
 
-    language_model_spec = _get_language_model_spec(config.llm_arch, llm_pg, sequence_parallel=use_sp)
+    language_model_spec = _get_language_model_spec(
+        config.llm_arch, llm_pg, sequence_parallel=use_sp, timers=timers,
+    )
     vision_submodule_spec = _get_vision_submodules_spec(
         config.encoder_arch,
         language_hidden_size=config.llm_arch.hidden_size,
@@ -291,10 +296,12 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager):
     )
 
     encoder_num_instances = getattr(config, 'encoder_num_dist_opt_instances', 1)
+    encoder_use_dist_opt = getattr(config, 'encoder_use_distributed_optimizer', True)
     encoder_ddp_config = DistributedDataParallelConfig(
         overlap_grad_reduce=True,
+        overlap_param_gather=True,
         bucket_size=200_000_000,
-        use_distributed_optimizer=True,
+        use_distributed_optimizer=encoder_use_dist_opt,
         num_distributed_optimizer_instances=encoder_num_instances,
     )
 
@@ -567,8 +574,17 @@ def run_benchmark(
     # 1. Process groups
     pg_manager = ProcessGroupManager()
 
+    # 1b. Optional pipeline timers (profiling only -- adds cuda.synchronize() overhead)
+    pipeline_timers = None
+    if config.pipeline_timers:
+        # log_level=2 captures forward-compute and backward-compute (they use log_level=2)
+        # log_option='all' reports per-rank times (not just max/min)
+        pipeline_timers = Timers(log_level=2, log_option='all')
+        if rank == 0:
+            logger.info("Pipeline timers created (log_level=2, log_option='all')")
+
     # 2. Model + context
-    mimo_model, ctx = create_mimo_model(config, pg_manager)
+    mimo_model, ctx = create_mimo_model(config, pg_manager, timers=pipeline_timers)
 
     encoder_grid = ctx['encoder_grid']
     llm_grid = ctx['llm_grid']
@@ -629,6 +645,18 @@ def run_benchmark(
     mem_profile_iter = config.experiment.warmup_iterations if profile_memory else -1
     mem_snapshot_done = False
 
+    # Pipeline timer history: per-iteration, per-rank collected times
+    pipeline_timer_history = [] if pipeline_timers is not None else None
+
+    # Determine PP stage for timer logging
+    pp_stage = None
+    if pipeline_timers is not None:
+        if config.llm_has_pp:
+            pp_group = ctx['llm_grid'].get_pg("pp")
+            pp_stage = pp_group.rank()
+        else:
+            pp_stage = 0
+
     for i in range(num_iterations):
         # Enter profiler for the profiled range
         in_profile_range = (
@@ -688,6 +716,47 @@ def run_benchmark(
 
         torch.cuda.synchronize()
         t_fwd_bwd_ms = (time.time() - t_fwd_bwd_start) * 1000.0
+
+        # --- Collect pipeline timer data (if enabled) ---
+        if pipeline_timers is not None:
+            timer_names = []
+            if 'forward-compute' in pipeline_timers._timers:
+                timer_names.append('forward-compute')
+            if 'backward-compute' in pipeline_timers._timers:
+                timer_names.append('backward-compute')
+            if 'forward-backward' in pipeline_timers._timers:
+                timer_names.append('forward-backward')
+
+            # Read elapsed times locally (no cross-rank comm) and reset for next iter
+            local_times = {}
+            for name in timer_names:
+                # elapsed() returns seconds, reset=True clears for next iteration
+                local_times[name] = pipeline_timers._timers[name].elapsed(reset=True) * 1000.0
+
+            pipeline_timer_history.append({
+                'iteration': i + 1,
+                'rank': rank,
+                'pp_stage': pp_stage,
+                'forward_compute_ms': local_times.get('forward-compute', 0.0),
+                'backward_compute_ms': local_times.get('backward-compute', 0.0),
+                'forward_backward_ms': local_times.get('forward-backward', 0.0),
+                'num_microbatches': config.data.num_microbatches,
+            })
+
+            # Log per-rank timer output
+            if (i + 1) % config.experiment.log_interval == 0:
+                nmb = config.data.num_microbatches
+                fwd_ms = local_times.get('forward-compute', 0.0)
+                bwd_ms = local_times.get('backward-compute', 0.0)
+                fb_ms = local_times.get('forward-backward', 0.0)
+                fwd_per_mb = fwd_ms / nmb if nmb > 0 else 0.0
+                bwd_per_mb = bwd_ms / nmb if nmb > 0 else 0.0
+                print(
+                    f"[Rank {rank}, PP stage {pp_stage}] "
+                    f"forward-compute: {fwd_ms:.1f} ms total, {fwd_per_mb:.1f} ms/mb | "
+                    f"backward-compute: {bwd_ms:.1f} ms total, {bwd_per_mb:.1f} ms/mb | "
+                    f"forward-backward: {fb_ms:.1f} ms ({nmb} microbatches)"
+                )
 
         # --- Phase: optimizer_step ---
         torch.cuda.synchronize()
@@ -764,6 +833,10 @@ def run_benchmark(
 
     # 7. Summary
     summary = monitor.get_summary()
+
+    # Attach pipeline timer data to monitor for JSON serialization
+    if pipeline_timer_history:
+        monitor.pipeline_timer_history = pipeline_timer_history
 
     if rank == 0:
         logger.info(

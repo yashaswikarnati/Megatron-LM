@@ -2,6 +2,7 @@
 
 """YAML config loading with baseline inheritance (deep merge) for MIMO benchmarks."""
 
+import dataclasses
 import os
 from typing import List
 
@@ -16,6 +17,10 @@ from .config import (
     ModuleMemorySpec,
     ParallelSpec,
 )
+
+# Top-level YAML sections that are parsed into nested dataclasses.
+# Any other top-level keys are forwarded as scalar kwargs to BenchmarkConfig.
+_NESTED_SECTIONS = {"experiment", "model", "parallelism", "data", "memory"}
 
 _BASELINE_FILENAME = "baseline.yaml"
 
@@ -58,6 +63,11 @@ def _build_config(raw: dict) -> BenchmarkConfig:
         llm_mem = ModuleMemorySpec(**mem_raw["llm"]) if "llm" in mem_raw else None
         memory = MemorySpec(encoder=enc_mem, llm=llm_mem)
 
+    # Forward any extra top-level YAML keys that match BenchmarkConfig fields.
+    # This lets new config knobs be added to BenchmarkConfig without touching the loader.
+    config_fields = {f.name for f in dataclasses.fields(BenchmarkConfig)}
+    extras = {k: raw[k] for k in raw if k not in _NESTED_SECTIONS and k in config_fields}
+
     return BenchmarkConfig(
         experiment=experiment,
         encoder_arch=encoder_arch,
@@ -66,6 +76,7 @@ def _build_config(raw: dict) -> BenchmarkConfig:
         llm_parallel=llm_parallel,
         data=data,
         memory=memory,
+        **extras,
     )
 
 

@@ -86,14 +86,23 @@ class BenchmarkConfig:
     llm_parallel: ParallelSpec
     data: DataSpec
     memory: Optional[MemorySpec] = None
+    encoder_num_dist_opt_instances: int = 1
+    encoder_use_distributed_optimizer: bool = True
+    pipeline_timers: bool = False  # Enable per-microbatch fwd/bwd timers (profiling only)
 
     @property
     def llm_has_pp(self) -> bool:
         return self.llm_parallel.pp > 1
 
     @property
-    def global_batch_size(self) -> int:
+    def dp_batch_size(self) -> int:
+        """Samples per microbatch across all DP ranks: mbs × llm_dp."""
         return self.data.micro_batch_size * self.llm_parallel.dp
+
+    @property
+    def global_batch_size(self) -> int:
+        """Total samples per optimizer step: mbs × llm_dp × num_microbatches."""
+        return self.dp_batch_size * self.data.num_microbatches
 
     def validate(self):
         """Validate cross-field constraints across the benchmark configuration."""
@@ -109,10 +118,10 @@ class BenchmarkConfig:
             f"!= LLM world_size ({self.llm_parallel.world_size})"
         )
 
-        # Global batch must be divisible by LLM DP (always true by construction)
-        gbs = self.global_batch_size
-        assert gbs % self.llm_parallel.dp == 0, (
-            f"Global batch {gbs} not divisible by LLM DP {self.llm_parallel.dp}"
+        # Per-microbatch samples must be divisible by LLM DP (always true by construction)
+        dp_bs = self.dp_batch_size
+        assert dp_bs % self.llm_parallel.dp == 0, (
+            f"dp_batch_size {dp_bs} not divisible by LLM DP {self.llm_parallel.dp}"
         )
 
         # For encoder DP: with multi-image, images from one LLM sample can be
@@ -122,9 +131,9 @@ class BenchmarkConfig:
         # for num_images > 1.
         enc_dp = self.encoder_parallel.dp
         llm_dp = self.llm_parallel.dp
-        total_encoder_samples = self.data.num_images_per_sample * gbs
+        total_encoder_samples = self.data.num_images_per_sample * dp_bs
         assert total_encoder_samples % enc_dp == 0, (
-            f"Total encoder samples (num_images={self.data.num_images_per_sample} * GBS={gbs}"
+            f"Total encoder samples (num_images={self.data.num_images_per_sample} * dp_batch_size={dp_bs}"
             f" = {total_encoder_samples}) not divisible by encoder DP {enc_dp}"
         )
 
