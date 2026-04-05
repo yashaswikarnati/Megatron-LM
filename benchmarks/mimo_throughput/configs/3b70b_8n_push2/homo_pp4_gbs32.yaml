@@ -1,0 +1,18 @@
+# Homo PP4 GBS32: smaller batch to reduce activation pressure on stage 0
+# TP8/PP4/DP2+SP, nmb=16/rank, warmup=3
+experiment:
+  name: 3b70b_homo_pp4_gbs32
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 2
+  llm:
+    tp: 8
+    dp: 2
+    pp: 4
+
+data:
+  num_microbatches: 16
+
+pp_mode: homo

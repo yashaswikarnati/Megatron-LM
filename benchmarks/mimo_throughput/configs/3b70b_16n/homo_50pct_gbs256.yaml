@@ -1,0 +1,6 @@
+# Homo 16N, 50% vision, GBS256
+experiment:
+  name: 3b70b_16n_homo_50pct_gbs256
+
+data:
+  num_microbatches: 128

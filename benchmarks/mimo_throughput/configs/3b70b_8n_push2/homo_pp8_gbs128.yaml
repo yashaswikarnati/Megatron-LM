@@ -1,0 +1,18 @@
+# Homo PP8/DP1+SP, GBS128, 8 nodes (64 GPUs)
+# 10 layers/stage, DP1 (no dist opt sharding), nmb=128/rank
+experiment:
+  name: 3b70b_homo_pp8_gbs128
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 1
+  llm:
+    tp: 8
+    dp: 1
+    pp: 8
+
+data:
+  num_microbatches: 128
+
+pp_mode: homo

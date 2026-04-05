@@ -1,0 +1,11 @@
+# PP2/DP4: less pipeline bubble, more DP sharding
+# TP8*PP2*DP4 = 64, enc TP4*DP16 = 64
+# GBS=16, nmb=4/rank, warmup=1
+experiment:
+  name: 3b70b_pp2_dp4
+
+parallelism:
+  llm:
+    tp: 8
+    dp: 4
+    pp: 2

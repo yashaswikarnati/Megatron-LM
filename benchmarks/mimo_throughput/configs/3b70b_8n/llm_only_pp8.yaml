@@ -1,0 +1,37 @@
+# LLM-only 70B, 8 nodes (64 GPUs), homo mode
+# TP8/DP1/PP8 — 10 layers per stage, dist opt with 1 instance
+experiment:
+  name: 70b_llm_only_pp8
+  num_iterations: 10
+  warmup_iterations: 3
+  log_interval: 1
+
+model:
+  encoder:
+    num_layers: 48
+    hidden_size: 2304
+    num_attention_heads: 32
+    seq_length: 1024
+  llm:
+    num_layers: 80
+    hidden_size: 8192
+    num_attention_heads: 64
+    vocab_size: 128000
+    seq_length: 8192
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 1
+  llm:
+    tp: 8
+    dp: 1
+    pp: 8
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 8
+  num_images_per_sample: 4
+
+pp_mode: homo
+encoder_param_offload: false

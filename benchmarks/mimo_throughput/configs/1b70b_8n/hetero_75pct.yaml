@@ -1,0 +1,45 @@
+# 1B ViT + 70B LLM, Hetero, 75% vision, 8 nodes (64 GPUs)
+# LLM: TP8/PP2/DP4+SP, Enc: TP8/DP8
+# 6 images × 1024 seq = 6144 tokens / 8192 = 75%, GBS=128
+experiment:
+  name: 1b70b_hetero_75pct
+  num_iterations: 10
+  warmup_iterations: 3
+  log_interval: 1
+
+model:
+  encoder:
+    num_layers: 40
+    hidden_size: 1408
+    num_attention_heads: 16
+    seq_length: 1024
+  llm:
+    num_layers: 80
+    hidden_size: 8192
+    num_attention_heads: 64
+    vocab_size: 128000
+    seq_length: 8192
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 8
+  llm:
+    tp: 8
+    dp: 4
+    pp: 2
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 32
+  num_images_per_sample: 6
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 40
+
+sequence_parallel: true
+pp_mode: colocated
+encoder_param_offload: false

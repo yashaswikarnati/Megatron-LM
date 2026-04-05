@@ -1,0 +1,13 @@
+# PP8 uneven (3+11×7), selective recompute (only attention core, not full layers)
+experiment:
+  name: 3b70b_homo_pp8_selective
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 48
+  llm:
+    recompute_granularity: selective
+
+first_pipeline_num_layers: 3

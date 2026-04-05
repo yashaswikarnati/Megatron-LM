@@ -1,0 +1,40 @@
+=== 4-node 3B+32B Offload Memory Fix Retest ===
+Job ID: 10814567
+Status: FAILED (OOM)
+Duration: 4m55s (including setup)
+Exit Code: 9 (SIGKILL from OOM)
+
+== OOM Details ==
+- OOM'd on iteration 1 (iter=0), during optimizer.step() -> get_grad_norm() -> all_reduce
+- The forward+backward pass completed successfully
+- The OOM occurred post-backward during the optimizer step's grad norm all-reduce
+- Affected nodes: pool0-00241 (ranks 0-3), pool0-00255 (ranks 16-19)
+
+== Offload Logs (rank_0) ==
+[OFFLOAD_PARAMS iter=0] 20.14 GB -> 17.02 GB (freed 3.11 GB)
+[RELOAD iter=0] 62.88 GB -> 65.99 GB (+3.11 GB)
+[RELOAD_SYNC iter=0] wait=0.00 ms (0 = fully overlapped)
+
+== Memory Timeline (rank_0, encoder-hosting ranks) ==
+- After model init:      20.14 GB
+- After encoder offload: 17.02 GB (freed 3.11 GB encoder params)
+- After backward (pre-reload): 62.88 GB  
+- After encoder reload:  65.99 GB (+3.11 GB)
+- Peak at OOM:           >80 GB (OOM during optimizer step)
+
+== Memory Timeline (rank_4, LLM-only ranks) ==
+- After model init:      18.65 GB
+- After encoder offload: 15.54 GB (freed 3.11 GB)
+- After backward (pre-reload): 42.08 GB
+- After encoder reload:  45.20 GB (+3.11 GB)
+
+== Analysis ==
+The memory fix freed encoder_input/modality_inputs after Phase 1, but the OOM still occurs.
+The bottleneck is on encoder-hosting ranks (0-3, 16-19) which hit 62.88 GB after backward,
+then 65.99 GB after reload, and then OOM during optimizer step (grad norm all-reduce + optimizer state updates).
+
+The ~720 MB savings from freeing input data is not enough. The encoder-hosting ranks need
+~14+ GB more headroom (from 65.99 GB they still need optimizer states + grad norm compute).
+
+Key insight: rank_4 (LLM-only PP rank) peaks at 45.20 GB - well within 80 GB H100 budget.
+The problem is exclusively on ranks that host BOTH encoder + LLM (ranks 0-3, 16-19).

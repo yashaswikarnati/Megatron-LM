@@ -1,0 +1,15 @@
+# PP8 uneven (3+11×7), block recompute first 6 of 11 layers
+experiment:
+  name: 3b70b_homo_pp8_block6
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 48
+  llm:
+    recompute_granularity: full
+    recompute_method: block
+    recompute_num_layers: 6
+
+first_pipeline_num_layers: 3

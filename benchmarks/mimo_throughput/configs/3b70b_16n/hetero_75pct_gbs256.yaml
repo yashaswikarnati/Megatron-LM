@@ -1,0 +1,7 @@
+# Hetero 16N, 75% vision, GBS256
+experiment:
+  name: 3b70b_16n_hetero_75pct_gbs256
+
+data:
+  num_microbatches: 32
+  num_images_per_sample: 12

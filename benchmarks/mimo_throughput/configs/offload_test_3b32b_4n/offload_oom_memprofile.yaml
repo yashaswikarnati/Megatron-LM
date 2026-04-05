@@ -1,0 +1,8 @@
+# OOM memory profile: full nmb=64 config that OOMs — capture snapshot at OOM point
+experiment:
+  name: 3b32b_4n_offload_oom_memprofile
+  num_iterations: 5
+  warmup_iterations: 0
+  log_interval: 1
+
+encoder_param_offload: true

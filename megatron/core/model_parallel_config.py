@@ -133,6 +133,11 @@ class ModelParallelConfig:
        gradients are to be synchronized.
     """
 
+    pre_cooldown_func: Optional[Callable] = None
+    """Optional callback invoked before cooldown backward passes in 1F1B pipeline.
+       Used by colocated MIMO to start async encoder param reload during cooldown.
+    """
+
     param_sync_func: Optional[Callable] = None
     """Function that launches asynchronous parameter synchronizations (e.g. distributed optimizer
        parameter all-gathers). The function should take one argument: an iterable of parameters to

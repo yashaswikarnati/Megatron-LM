@@ -1,0 +1,7 @@
+# Homo 16N, 75% vision, GBS128
+experiment:
+  name: 3b70b_16n_homo_75pct_gbs128
+
+data:
+  num_microbatches: 64
+  num_images_per_sample: 12

@@ -1,0 +1,12 @@
+# PP8 uneven (3+11×7), NO LLM recompute at all — encoder recompute only
+# This tests: does encoder recompute alone + uneven split fit?
+experiment:
+  name: 3b70b_homo_pp8_block0
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 48
+
+first_pipeline_num_layers: 3

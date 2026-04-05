@@ -1,0 +1,8 @@
+# Baseline with profiler enabled (captures iteration 4-5)
+experiment:
+  name: offload_3b32b_baseline_profile
+  num_iterations: 10
+  warmup_iterations: 3
+  log_interval: 1
+
+encoder_param_offload: false

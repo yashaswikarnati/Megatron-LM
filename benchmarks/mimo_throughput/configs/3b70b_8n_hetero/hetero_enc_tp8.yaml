@@ -1,0 +1,11 @@
+# Hetero: encoder TP8/DP8, LLM TP8/PP4/DP2+SP
+# Encoder TP matches LLM TP (simplest bridge comm)
+experiment:
+  name: 3b70b_hetero_enc_tp8
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 8
+
+pp_mode: colocated

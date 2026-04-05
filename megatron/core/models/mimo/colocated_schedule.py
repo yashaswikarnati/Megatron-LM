@@ -68,6 +68,21 @@ def colocated_forward_backward_with_pp(
         detached_full = {k: v.detach().requires_grad_(True) for k, v in enc_out.items()}
         lm_data = _build_lm_microbatches(detached_full, all_batches, num_microbatches)
 
+        # Free encoder data no longer needed during the LLM phase.
+        # enc_out must stay alive for Phase 3 backward (autograd.backward).
+        # full_encoder_input (concatenated encoder pixel data) is consumed.
+        # all_batches modality_inputs (raw pixel data) are consumed — only text
+        # fields (input_ids, labels, etc.) are still referenced by lm_data.
+        del full_encoder_input
+        for batch in all_batches:
+            batch.pop('modality_inputs', None)
+
+        # Async offload encoder params to CPU (opt states offloaded separately
+        # after optimizer.step in the training loop for better overlap).
+        offloader = getattr(mimo_model, '_encoder_offloader', None)
+        if offloader is not None:
+            offloader.offload_params()
+
         # ── Phase 2: LLM 1F1B pipeline ──────────────────────────────────────
         # Only LLM P2P communication (within PP group). No encoder collectives.
         cache_iter = iter(lm_data)
@@ -82,6 +97,10 @@ def colocated_forward_backward_with_pp(
                 encoder_embeddings=cached['encoder_embeddings'],
             )
             return output_tensor, partial(_loss_func, cached['loss_mask'])
+
+        # Wire pre_cooldown_func so reload starts during 1F1B cooldown (PP>1).
+        if offloader is not None:
+            mimo_model.config.pre_cooldown_func = offloader.reload
 
         # Suppress the schedule's off_interface.reset() during Phase 2 so
         # Phase 3's encoder backward can still access offloaded tensors.
@@ -102,6 +121,9 @@ def colocated_forward_backward_with_pp(
             # (accumulated across microbatch view slices on PP stage 0).
             # Broadcast to PP stage 1+ then run one encoder backward for the full batch.
             with record_function("mimo::encoder_backward"):
+                if offloader is not None:
+                    offloader.reload_sync()
+
                 if not forward_only and enc_out:
                     _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
                     for key in enc_out:

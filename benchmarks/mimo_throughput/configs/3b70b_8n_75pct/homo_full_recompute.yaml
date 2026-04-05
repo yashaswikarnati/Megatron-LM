@@ -1,0 +1,32 @@
+# Homo PP8 uneven (3+11×7) + full uniform LLM recompute, 75% vision
+experiment:
+  name: 3b70b_75pct_homo_full_recompute
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 1
+  llm:
+    tp: 8
+    dp: 1
+    pp: 8
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 128
+  num_images_per_sample: 12
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 48
+  llm:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 11
+
+sequence_parallel: true
+pp_mode: homo
+first_pipeline_num_layers: 3
+encoder_param_offload: false

@@ -1,0 +1,17 @@
+# Hetero: encoder TP4/DP16, LLM TP8/PP4/DP2+SP
+# Lower encoder TP → more encoder compute per rank, bigger offload savings
+# mbs=2/nmb=4 to satisfy enc_dp divisibility (GBS unchanged at 16)
+experiment:
+  name: 3b70b_hetero_enc_tp4
+
+parallelism:
+  encoder:
+    tp: 4
+    dp: 16
+
+data:
+  micro_batch_size: 2
+  num_microbatches: 4
+  num_images_per_sample: 4
+
+pp_mode: colocated

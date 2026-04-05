@@ -1,0 +1,44 @@
+# 3B ViT + 32B LLM, 4 nodes (32 GPUs)
+# Encoder: TP4/DP8/PP1, LLM: TP4/DP2/PP4
+# Encoder: full recompute (48 layers). LLM: no recompute.
+# mbs=1, nmb=64, GBS=128, 50% vision (4 images, enc_seq=1024, llm_seq=8192)
+experiment:
+  name: 3b32b_4n_recompute_no_offload
+  num_iterations: 10
+  warmup_iterations: 3
+  log_interval: 1
+
+model:
+  encoder:
+    num_layers: 48
+    hidden_size: 2304
+    num_attention_heads: 32
+    seq_length: 1024
+  llm:
+    num_layers: 64
+    hidden_size: 6144
+    num_attention_heads: 48
+    vocab_size: 128000
+    seq_length: 8192
+
+parallelism:
+  encoder:
+    tp: 4
+    dp: 8
+  llm:
+    tp: 4
+    dp: 2
+    pp: 4
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 64
+  num_images_per_sample: 4
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 48
+
+encoder_param_offload: false

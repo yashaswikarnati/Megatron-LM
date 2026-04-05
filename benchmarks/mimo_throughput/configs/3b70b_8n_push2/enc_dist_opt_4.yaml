@@ -1,0 +1,5 @@
+# Encoder dist opt instances=4
+experiment:
+  name: 3b70b_enc_dist_opt_4
+
+encoder_num_dist_opt_instances: 4

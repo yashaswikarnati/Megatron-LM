@@ -288,6 +288,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
         special_token_ids={ENCODER_NAME: config.data.image_token_id},
         module_to_grid_map={ENCODER_NAME: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid},
         memory_config=memory_config,
+        encoder_param_offload=getattr(config, 'encoder_param_offload', False),
     )
 
     mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp)
@@ -330,6 +331,12 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
                 module=submodule,
                 pg_collection=encoder_pg,
             )
+
+    # Enable encoder param offload if configured (must happen after DDP wrapping).
+    if getattr(config, 'encoder_param_offload', False) and ENCODER_NAME in mimo_model.modality_submodules:
+        encoder_ddp = mimo_model.modality_submodules[ENCODER_NAME]
+        if encoder_ddp is not None:
+            mimo_model.enable_encoder_offload(encoder_ddp)
 
     # Attach no_sync / finalize_grads / grad_scale to the config
     @contextmanager
@@ -392,7 +399,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
 # ---------------------------------------------------------------------------
 
 
-def create_mimo_model_homo(config: BenchmarkConfig):
+def create_mimo_model_homo(config: BenchmarkConfig, timers=None):
     """Create MIMO model using parallel_state (no grids) for ablation baseline.
 
     Encoder lives on PP stage 0 only. Single DDP wraps the entire model.
@@ -416,7 +423,38 @@ def create_mimo_model_homo(config: BenchmarkConfig):
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
     torch.manual_seed(12345)
 
-    # Build language model spec using parallel_state dimensions
+    # Initialize sequence parallel (RNG tracker, TE userbuffers).
+    # Note: global memory buffer is already set by initialize_model_parallel above.
+    use_sp = getattr(config, 'sequence_parallel', False)
+    if use_sp:
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        model_parallel_cuda_manual_seed(seed=12345, tp_rank=tp_rank, ep_rank=0, etp_rank=0)
+
+        if lp.tp > 1:
+            try:
+                from transformer_engine.pytorch.module.base import (
+                    UserBufferQuantizationMode,
+                    initialize_ub,
+                )
+                initialize_ub(
+                    shape=[config.llm_arch.seq_length * config.data.micro_batch_size,
+                           config.llm_arch.hidden_size],
+                    tp_size=lp.tp,
+                    quantization_modes=[UserBufferQuantizationMode.NONE],
+                    ub_cfgs={},
+                    bootstrap_backend='nccl',
+                )
+            except Exception as e:
+                if dist.get_rank() == 0:
+                    logger.warning(f"TE UB init failed (tp_comm_overlap disabled): {e}")
+
+    # Build language model spec using parallel_state dimensions.
+    # NOTE: LLM recompute is applied via memory_config -> MimoMemoryManager._apply(),
+    # NOT inline here. This avoids double-apply conflicts.
+    first_pp_layers = getattr(config, 'first_pipeline_num_layers', None)
+
     lm_config = TransformerConfig(
         num_layers=config.llm_arch.num_layers,
         hidden_size=config.llm_arch.hidden_size,
@@ -428,24 +466,31 @@ def create_mimo_model_homo(config: BenchmarkConfig):
         pipeline_model_parallel_size=pp_size,
         pipeline_dtype=torch.bfloat16,
         bf16=True,
+        sequence_parallel=use_sp,
+        tp_comm_overlap=use_sp,
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='te',
         gradient_accumulation_fusion=True,
         bias_dropout_fusion=True,
         bias_activation_fusion=True,
+        num_layers_in_first_pipeline_stage=first_pp_layers,
+        timers=timers,
     )
-    language_model_spec = ModuleSpec(
-        module=GPTModel,
-        params={
-            "config": lm_config,
-            "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
-            "vocab_size": config.llm_arch.vocab_size,
-            "max_sequence_length": config.llm_arch.seq_length,
-            "pre_process": (pp_rank == 0),
-            "post_process": (pp_rank == pp_size - 1),
-            "pg_collection": None,
-        },
-    )
+    gpt_params = {
+        "config": lm_config,
+        "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
+        "vocab_size": config.llm_arch.vocab_size,
+        "max_sequence_length": config.llm_arch.seq_length,
+        "pre_process": (pp_rank == 0),
+        "post_process": (pp_rank == pp_size - 1),
+        "pg_collection": None,
+    }
+    # With SP, MIMO aligns embeddings on full [S,B,H] before scattering,
+    # so the embedding layer must not scatter internally.
+    if use_sp:
+        gpt_params["scatter_embedding_sequence_parallel"] = False
+
+    language_model_spec = ModuleSpec(module=GPTModel, params=gpt_params)
 
     # Build vision spec (only on PP stage 0)
     vision_spec = {}
@@ -508,11 +553,24 @@ def create_mimo_model_homo(config: BenchmarkConfig):
         )
         special_tokens = {ENCODER_NAME: config.data.image_token_id}
 
+    # Build memory_config for encoder recompute (same as colocated path)
+    memory_config = None
+    if config.memory is not None:
+        import dataclasses as _dc
+        memory_config = {}
+        if config.memory.encoder is not None:
+            memory_config[ENCODER_NAME] = ModuleMemoryConfig(**_dc.asdict(config.memory.encoder))
+        if config.memory.llm is not None:
+            memory_config[MIMO_LANGUAGE_MODULE_KEY] = ModuleMemoryConfig(
+                **_dc.asdict(config.memory.llm)
+            )
+
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec=vision_spec,
         special_token_ids=special_tokens,
         module_to_grid_map=None,
+        memory_config=memory_config,
     )
 
     model = MimoModel(mimo_config)
@@ -536,7 +594,9 @@ def create_mimo_model_homo(config: BenchmarkConfig):
 
     # Single DDP wrapping the entire model (pg_collection=None -> parallel_state)
     ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=True, use_distributed_optimizer=True,
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        use_distributed_optimizer=True,
     )
     model = DistributedDataParallel(
         config=model.config, ddp_config=ddp_config, module=model, pg_collection=None,
@@ -741,6 +801,42 @@ def _save_memory_profile(config: BenchmarkConfig, rank: int, results_dir: str):
         )
 
 
+def _save_oom_snapshot(results_dir: str, rank: int):
+    """Dump memory snapshot on OOM for post-mortem analysis.
+
+    Generates the same artifacts as _save_memory_profile but with an 'oom_'
+    prefix. Only useful when _record_memory_history was started before the OOM.
+    """
+    try:
+        import torch.cuda._memory_viz as memory_viz
+
+        os.makedirs(results_dir, exist_ok=True)
+        prefix = os.path.join(results_dir, f"oom_rank{rank}")
+
+        torch.cuda.memory._dump_snapshot(f"{prefix}_snapshot.pickle")
+
+        snapshot = torch.cuda.memory._snapshot()
+        with open(f"{prefix}_timeline.html", "w") as f:
+            f.write(memory_viz.trace_plot(snapshot))
+
+        try:
+            with open(f"{prefix}_flamegraph.svg", "w") as f:
+                f.write(memory_viz.memory(snapshot))
+        except Exception:
+            pass
+
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+        peak_gb = torch.cuda.max_memory_allocated() / 1024**3
+        print(
+            f"[OOM SNAPSHOT rank={rank}] peak={peak_gb:.1f}GB "
+            f"saved to {prefix}_*.{{pickle,html,svg}}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[OOM SNAPSHOT rank={rank}] failed: {e}", flush=True)
+
+
 def run_benchmark(
     config: BenchmarkConfig,
     profile_steps: tuple[int, int] | None = None,
@@ -780,7 +876,7 @@ def run_benchmark(
     pg_manager = None
     if is_homo:
         # Homo baseline: parallel_state, encoder on PP stage 0, single DDP
-        mimo_model, optimizer = create_mimo_model_homo(config)
+        mimo_model, optimizer = create_mimo_model_homo(config, timers=pipeline_timers)
         encoder_grid = llm_grid = llm_pg = None
         effective_mbs = config.data.micro_batch_size
     else:
@@ -798,6 +894,12 @@ def run_benchmark(
             bf16=True, use_distributed_optimizer=True,
         )
         optimizer = get_mimo_optimizer(mimo_model, opt_config)
+
+        # Register encoder optimizer with offloader for state offload.
+        if mimo_model._encoder_offloader is not None:
+            encoder_opt_info = optimizer.module_infos.get(ENCODER_NAME)
+            if encoder_opt_info is not None and encoder_opt_info.optimizer is not None:
+                mimo_model._encoder_offloader.set_optimizer(encoder_opt_info.optimizer)
 
     # 3. Data iterator
     data_iter = SyntheticVLMIterator(
@@ -837,9 +939,29 @@ def run_benchmark(
             with_flops=True,
         )
 
-    # Memory profiling: capture one post-warmup iteration
+    # Memory profiling: capture one post-warmup iteration.
+    # When enabled, also records from the start to capture OOM snapshots.
     mem_profile_iter = config.experiment.warmup_iterations if profile_memory else -1
     mem_snapshot_done = False
+    if profile_memory:
+        # Start recording from the beginning to capture full timeline including OOM.
+        torch.cuda.memory._record_memory_history(
+            enabled="all", context="all", stacks="python", max_entries=500000,
+        )
+        # Set env var so PyTorch auto-dumps snapshot on OOM (2.x+).
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+            os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "") + ",expandable_segments:True"
+        ).lstrip(",")
+        # Also register a manual OOM dump via signal handler for SIGTERM.
+        import signal
+        _orig_sigterm = signal.getsignal(signal.SIGTERM)
+        def _sigterm_handler(signum, frame):
+            _save_oom_snapshot(results_dir, rank)
+            if callable(_orig_sigterm) and _orig_sigterm not in (signal.SIG_DFL, signal.SIG_IGN):
+                _orig_sigterm(signum, frame)
+            else:
+                raise SystemExit(128 + signum)
+        signal.signal(signal.SIGTERM, _sigterm_handler)
 
     # Pipeline timer history: per-iteration, per-rank collected times
     pipeline_timer_history = [] if pipeline_timers is not None else None
@@ -855,7 +977,8 @@ def run_benchmark(
         else:
             pp_stage = 0
 
-    for i in range(num_iterations):
+    try:
+     for i in range(num_iterations):
         # Enter profiler for the profiled range
         in_profile_range = (
             profile_steps is not None and profile_steps[0] <= i <= profile_steps[1]
@@ -863,14 +986,20 @@ def run_benchmark(
         if in_profile_range and i == profile_steps[0] and profiler_ctx is not None:
             profiler_ctx.__enter__()
 
-        # Start memory recording for the target iteration
+        # Reset peak stats for the target profiling iteration
         if profile_memory and i == mem_profile_iter and not mem_snapshot_done:
             torch.cuda.reset_peak_memory_stats()
-            torch.cuda.memory._record_memory_history(
-                enabled="all", context="all", stacks="python", max_entries=100000,
-            )
 
         monitor.start_iteration()
+
+        # Log per-rank memory before forward (captures model init + optimizer state growth)
+        if i < 3 or i % 10 == 0:
+            peak_gb = torch.cuda.max_memory_allocated() / 1e9
+            alloc_gb = torch.cuda.memory_allocated() / 1e9
+            print(
+                f"[MEM rank={rank} iter={i+1} pre_fwd] peak={peak_gb:.2f}GB alloc={alloc_gb:.2f}GB",
+                flush=True,
+            )
 
         # --- Phase: forward_backward ---
         torch.cuda.synchronize()
@@ -987,8 +1116,22 @@ def run_benchmark(
         optimizer.step()
         optimizer.zero_grad()
 
+        # Offload encoder optimizer states to CPU after step completes.
+        # D2H overlaps with next iteration's encoder forward.
+        if getattr(mimo_model, '_encoder_offloader', None) is not None:
+            mimo_model._encoder_offloader.offload_opt_states()
+
         torch.cuda.synchronize()
         t_opt_ms = (time.time() - t_opt_start) * 1000.0
+
+        # Log per-rank peak memory (first 3 iterations + every 10th)
+        if i < 3 or i % 10 == 0:
+            peak_gb = torch.cuda.max_memory_allocated() / 1e9
+            alloc_gb = torch.cuda.memory_allocated() / 1e9
+            print(
+                f"[MEM rank={rank} iter={i+1} post_step] peak={peak_gb:.2f}GB alloc={alloc_gb:.2f}GB",
+                flush=True,
+            )
 
         metrics = monitor.end_iteration(fwd_bwd_ms=t_fwd_bwd_ms, opt_step_ms=t_opt_ms)
 
@@ -1052,6 +1195,11 @@ def run_benchmark(
                 profiler_ctx.export_chrome_trace(trace_path)
                 print(f"\nPhase report: {analysis_path}")
                 print(f"Chrome trace: {trace_path} ({os.path.getsize(trace_path) / 1e6:.0f} MB)")
+
+    except torch.cuda.OutOfMemoryError:
+        if profile_memory:
+            _save_oom_snapshot(results_dir, rank)
+        raise
 
     # 7. Summary
     summary = monitor.get_summary()

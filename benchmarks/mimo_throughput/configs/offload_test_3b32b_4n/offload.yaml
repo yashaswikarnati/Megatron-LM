@@ -1,0 +1,5 @@
+# Same as baseline but with encoder param offload enabled
+experiment:
+  name: 3b32b_4n_recompute_with_offload
+
+encoder_param_offload: true

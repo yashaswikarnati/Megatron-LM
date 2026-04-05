@@ -1,0 +1,5 @@
+# 3B ViT + 70B LLM, colocated, WITH offload, 8 nodes (64 GPUs)
+experiment:
+  name: 3b70b_with_offload_nmb4
+
+encoder_param_offload: true
