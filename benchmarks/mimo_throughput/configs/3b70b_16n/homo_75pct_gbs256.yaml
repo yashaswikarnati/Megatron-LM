@@ -1,7 +1,49 @@
 # Homo 16N, 75% vision, GBS256
+# TP8/PP8/DP2+SP, uneven 3+11x7, block3 recompute
 experiment:
   name: 3b70b_16n_homo_75pct_gbs256
+  num_iterations: 10
+  warmup_iterations: 3
+  log_interval: 1
+
+model:
+  encoder:
+    num_layers: 48
+    hidden_size: 2304
+    num_attention_heads: 32
+    seq_length: 512
+  llm:
+    num_layers: 80
+    hidden_size: 8192
+    num_attention_heads: 64
+    vocab_size: 128000
+    seq_length: 8192
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 2
+  llm:
+    tp: 8
+    dp: 2
+    pp: 8
 
 data:
+  micro_batch_size: 1
   num_microbatches: 128
   num_images_per_sample: 12
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 48
+  llm:
+    recompute_granularity: full
+    recompute_method: block
+    recompute_num_layers: 3
+
+sequence_parallel: true
+pp_mode: homo
+first_pipeline_num_layers: 3
+encoder_param_offload: false

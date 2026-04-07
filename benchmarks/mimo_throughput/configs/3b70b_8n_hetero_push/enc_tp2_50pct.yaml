@@ -1,7 +1,6 @@
-# Homo 16N, 50% vision, GBS256
-# TP8/PP8/DP2+SP, uneven 3+11x7, block3 recompute
+# Hetero enc TP2/DP32, 50% vision, 8 images × 512 seq = 4096 tokens
 experiment:
-  name: 3b70b_16n_homo_50pct_gbs256
+  name: 3b70b_hetero_enc_tp2_50pct
   num_iterations: 10
   warmup_iterations: 3
   log_interval: 1
@@ -21,16 +20,16 @@ model:
 
 parallelism:
   encoder:
-    tp: 8
-    dp: 2
+    tp: 2
+    dp: 32
   llm:
     tp: 8
-    dp: 2
-    pp: 8
+    dp: 4
+    pp: 2
 
 data:
   micro_batch_size: 1
-  num_microbatches: 128
+  num_microbatches: 32
   num_images_per_sample: 8
 
 memory:
@@ -38,12 +37,7 @@ memory:
     recompute_granularity: full
     recompute_method: uniform
     recompute_num_layers: 48
-  llm:
-    recompute_granularity: full
-    recompute_method: block
-    recompute_num_layers: 3
 
 sequence_parallel: true
-pp_mode: homo
-first_pipeline_num_layers: 3
+pp_mode: colocated
 encoder_param_offload: false

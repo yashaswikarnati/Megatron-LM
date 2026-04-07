@@ -1,17 +1,16 @@
-# Hetero 16N, 75% vision, GBS128
-# LLM: TP8/PP2/DP8+SP, Enc: TP4/DP32
+# 1B+70B Hetero enc TP1/DP64, 50% vision, 16 images × 256 seq
 experiment:
-  name: 3b70b_16n_hetero_75pct_gbs128
+  name: 1b70b_hetero_tp1_50pct
   num_iterations: 10
   warmup_iterations: 3
   log_interval: 1
 
 model:
   encoder:
-    num_layers: 48
-    hidden_size: 2304
-    num_attention_heads: 32
-    seq_length: 512
+    num_layers: 40
+    hidden_size: 1408
+    num_attention_heads: 16
+    seq_length: 256
   llm:
     num_layers: 80
     hidden_size: 8192
@@ -21,23 +20,23 @@ model:
 
 parallelism:
   encoder:
-    tp: 4
-    dp: 32
+    tp: 1
+    dp: 64
   llm:
     tp: 8
-    dp: 8
+    dp: 4
     pp: 2
 
 data:
   micro_batch_size: 1
-  num_microbatches: 16
-  num_images_per_sample: 12
+  num_microbatches: 32
+  num_images_per_sample: 16
 
 memory:
   encoder:
     recompute_granularity: full
     recompute_method: uniform
-    recompute_num_layers: 48
+    recompute_num_layers: 40
 
 sequence_parallel: true
 pp_mode: colocated
