@@ -68,6 +68,9 @@ class EncoderDDPOffloader:
         # Iteration counter for logging (first 3 iterations + every 10th).
         self._iter = 0
 
+        # CUDA events for measuring async transfer durations (reported at reload_sync).
+        self._timing_events: Dict[str, Tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+
     def set_optimizer(self, encoder_optimizer) -> None:
         """Bind the encoder optimizer for state offloading."""
         self._optimizer = encoder_optimizer
@@ -89,7 +92,8 @@ class EncoderDDPOffloader:
         if self._params_offloaded:
             return
 
-        if self._should_log():
+        log = self._should_log()
+        if log:
             logger.info(
                 "[OFFLOAD_PARAMS iter=%d] mem=%.2f GB — starting async D2H",
                 self._iter, torch.cuda.memory_allocated() / 1e9,
@@ -100,9 +104,16 @@ class EncoderDDPOffloader:
         all_buffers = self._all_buffers()
 
         # Param D2H on copy_stream.
+        if log:
+            t0 = torch.cuda.Event(enable_timing=True)
+            t0.record(self._copy_stream)
         with torch.cuda.stream(self._copy_stream):
             for buffer in all_buffers:
                 buffer.offload_to_cpu(move_params=True, move_grads=False)
+        if log:
+            t1 = torch.cuda.Event(enable_timing=True)
+            t1.record(self._copy_stream)
+            self._timing_events['offload_params'] = (t0, t1)
 
         # Free grad buffer instantly (stale, no copy needed).
         for i, buffer in enumerate(all_buffers):
@@ -129,7 +140,8 @@ class EncoderDDPOffloader:
         if not gpu_tensors:
             return
 
-        if self._should_log():
+        log = self._should_log()
+        if log:
             logger.info(
                 "[OFFLOAD_OPT iter=%d] mem=%.2f GB — starting async D2H (%d tensors)",
                 self._iter, torch.cuda.memory_allocated() / 1e9, len(gpu_tensors),
@@ -140,9 +152,16 @@ class EncoderDDPOffloader:
         self._copy_stream.wait_stream(torch.cuda.current_stream())
 
         # Async D2H on copy_stream.
+        if log:
+            t0 = torch.cuda.Event(enable_timing=True)
+            t0.record(self._copy_stream)
         with torch.cuda.stream(self._copy_stream):
             for gpu_t, cpu_t in zip(gpu_tensors, pinned):
                 cpu_t.copy_(gpu_t, non_blocking=True)
+        if log:
+            t1 = torch.cuda.Event(enable_timing=True)
+            t1.record(self._copy_stream)
+            self._timing_events['offload_opt'] = (t0, t1)
 
         # Free GPU storage (allocator tracks copy_stream dependency).
         self._opt_offload_info.clear()
@@ -162,7 +181,8 @@ class EncoderDDPOffloader:
 
         Call from ``pre_cooldown_func`` — the H2D overlaps with cooldown BWDs.
         """
-        if self._should_log():
+        log = self._should_log()
+        if log:
             logger.info(
                 "[RELOAD iter=%d] mem=%.2f GB — starting async H2D",
                 self._iter, torch.cuda.memory_allocated() / 1e9,
@@ -180,6 +200,9 @@ class EncoderDDPOffloader:
 
         self._copy_stream.wait_stream(torch.cuda.current_stream())
 
+        if log:
+            t0 = torch.cuda.Event(enable_timing=True)
+            t0.record(self._copy_stream)
         with torch.cuda.stream(self._copy_stream):
             # Param H2D.
             if self._params_offloaded:
@@ -191,6 +214,10 @@ class EncoderDDPOffloader:
                 for gpu_t, cpu_t, orig_size in self._opt_offload_info:
                     gpu_t.storage().resize_(orig_size)
                     gpu_t.copy_(cpu_t, non_blocking=True)
+        if log:
+            t1 = torch.cuda.Event(enable_timing=True)
+            t1.record(self._copy_stream)
+            self._timing_events['reload'] = (t0, t1)
 
         if self._opt_offloaded:
             self._opt_offload_info.clear()
@@ -198,7 +225,12 @@ class EncoderDDPOffloader:
         self._params_offloaded = False
 
     def reload_sync(self) -> None:
-        """Wait for async H2D to complete.  Call before encoder backward."""
+        """Wait for async H2D to complete.  Call before encoder backward.
+
+        Also reports transfer durations for all async ops this iteration
+        (offload_params, offload_opt, reload) using CUDA events recorded
+        on copy_stream — no extra synchronization beyond the wait_stream.
+        """
         log = self._should_log()
         if log:
             t0 = torch.cuda.Event(enable_timing=True)
@@ -210,9 +242,18 @@ class EncoderDDPOffloader:
         if log:
             t1.record()
             t1.synchronize()
+
+            # All copy_stream events are now complete — safe to query.
+            parts = []
+            for name in ('offload_params', 'offload_opt', 'reload'):
+                if name in self._timing_events:
+                    ev_start, ev_end = self._timing_events[name]
+                    parts.append(f"{name}={ev_start.elapsed_time(ev_end):.2f}ms")
+            self._timing_events.clear()
+
             logger.info(
-                "[RELOAD_SYNC iter=%d] wait=%.2f ms (0 = fully overlapped)",
-                self._iter, t0.elapsed_time(t1),
+                "[RELOAD_SYNC iter=%d] wait=%.2f ms (0=fully overlapped) | %s",
+                self._iter, t0.elapsed_time(t1), ", ".join(parts) if parts else "no transfers",
             )
 
         self._iter += 1
