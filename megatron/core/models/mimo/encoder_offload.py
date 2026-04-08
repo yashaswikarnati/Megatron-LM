@@ -89,9 +89,11 @@ class EncoderDDPOffloader:
         if self._params_offloaded:
             return
 
-        log = self._should_log()
-        if log:
-            mem_before = torch.cuda.memory_allocated() / 1e9
+        if self._should_log():
+            logger.info(
+                "[OFFLOAD_PARAMS iter=%d] mem=%.2f GB — starting async D2H",
+                self._iter, torch.cuda.memory_allocated() / 1e9,
+            )
 
         self._copy_stream.wait_stream(torch.cuda.current_stream())
 
@@ -110,13 +112,6 @@ class EncoderDDPOffloader:
 
         self._params_offloaded = True
 
-        if log:
-            mem_after = torch.cuda.memory_allocated() / 1e9
-            logger.info(
-                "[OFFLOAD_PARAMS iter=%d] %.2f GB -> %.2f GB (freed %.2f GB)",
-                self._iter, mem_before, mem_after, mem_before - mem_after,
-            )
-
     # ------------------------------------------------------------------
     # Optimizer state offload / reload (after opt.step / before opt.step)
     # ------------------------------------------------------------------
@@ -130,13 +125,15 @@ class EncoderDDPOffloader:
         if self._optimizer is None or self._opt_offloaded:
             return
 
-        log = self._should_log()
-        if log:
-            mem_before = torch.cuda.memory_allocated() / 1e9
-
         gpu_tensors = self._collect_optimizer_gpu_tensors()
         if not gpu_tensors:
             return
+
+        if self._should_log():
+            logger.info(
+                "[OFFLOAD_OPT iter=%d] mem=%.2f GB — starting async D2H (%d tensors)",
+                self._iter, torch.cuda.memory_allocated() / 1e9, len(gpu_tensors),
+            )
 
         pinned = self._ensure_pinned_buffers(gpu_tensors)
 
@@ -156,14 +153,6 @@ class EncoderDDPOffloader:
 
         self._opt_offloaded = True
 
-        if log:
-            mem_after = torch.cuda.memory_allocated() / 1e9
-            logger.info(
-                "[OFFLOAD_OPT iter=%d] %.2f GB -> %.2f GB (freed %.2f GB, %d tensors)",
-                self._iter, mem_before, mem_after, mem_before - mem_after,
-                len(self._opt_offload_info),
-            )
-
     # ------------------------------------------------------------------
     # Reload (all at once, before encoder backward)
     # ------------------------------------------------------------------
@@ -173,9 +162,11 @@ class EncoderDDPOffloader:
 
         Call from ``pre_cooldown_func`` — the H2D overlaps with cooldown BWDs.
         """
-        log = self._should_log()
-        if log:
-            mem_before = torch.cuda.memory_allocated() / 1e9
+        if self._should_log():
+            logger.info(
+                "[RELOAD iter=%d] mem=%.2f GB — starting async H2D",
+                self._iter, torch.cuda.memory_allocated() / 1e9,
+            )
 
         all_buffers = self._all_buffers()
 
@@ -205,13 +196,6 @@ class EncoderDDPOffloader:
             self._opt_offload_info.clear()
             self._opt_offloaded = False
         self._params_offloaded = False
-
-        if log:
-            mem_after = torch.cuda.memory_allocated() / 1e9
-            logger.info(
-                "[RELOAD iter=%d] %.2f GB -> %.2f GB (+%.2f GB)",
-                self._iter, mem_before, mem_after, mem_after - mem_before,
-            )
 
     def reload_sync(self) -> None:
         """Wait for async H2D to complete.  Call before encoder backward."""
