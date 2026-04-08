@@ -84,7 +84,9 @@ def colocated_forward_backward_with_pp(
 
         # Async offload encoder params to CPU (opt states offloaded separately
         # after optimizer.step in the training loop for better overlap).
-        if offloader is not None:
+        # Skip offload during forward_only (eval/inference) — no LLM backward
+        # means pre_cooldown_func won't fire, leaving params stranded on CPU.
+        if offloader is not None and not forward_only:
             offloader.offload_params()
             offloader.offload_opt_states()  # no-op after iter 0 (training loop handles it)
 

@@ -143,11 +143,16 @@ class MimoModel(MegatronModule):
             "colocated 3-phase schedule which separates encoder forward/backward with "
             "a LLM pipeline phase to overlap D2H/H2D transfers."
         )
-        for mod in self.modality_submodules.values():
-            if isinstance(mod, DistributedDataParallel):
-                self._encoder_offloader = EncoderDDPOffloader(mod)
-                return self._encoder_offloader
-        return None
+        ddp_encoders = [
+            mod for mod in self.modality_submodules.values()
+            if isinstance(mod, DistributedDataParallel)
+        ]
+        assert len(ddp_encoders) == 1, (
+            f"encoder_offload expects exactly one DDP-wrapped encoder, "
+            f"found {len(ddp_encoders)}"
+        )
+        self._encoder_offloader = EncoderDDPOffloader(ddp_encoders[0])
+        return self._encoder_offloader
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
