@@ -20,7 +20,9 @@ import torch
 import torch.distributed as dist
 from torch.profiler import record_function
 
+from megatron.core.distributed import DistributedDataParallel
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.mimo.encoder_offload import EncoderDDPOffloader
 from megatron.core.pipeline_parallel import schedules
 
 
@@ -49,6 +51,19 @@ def colocated_forward_backward_with_pp(
     """
     pp_group = llm_grid.get_pg("pp") if llm_grid and 'pp' in llm_grid.dim_names else None
     is_pp_first = pp_group is None or pp_group.rank() == 0
+
+    # ── Encoder offload setup (from config, before any phases) ──────────
+    offloader = getattr(mimo_model, '_encoder_offloader', None)
+    if offloader is None and getattr(mimo_model.mimo_config, 'encoder_param_offload', False):
+        # Find the DDP-wrapped encoder submodule.
+        for name, mod in mimo_model.modality_submodules.items():
+            if isinstance(mod, DistributedDataParallel):
+                offloader = EncoderDDPOffloader(mod)
+                mimo_model._encoder_offloader = offloader
+                break
+
+    if offloader is not None:
+        mimo_model.config.pre_cooldown_func = offloader.reload
 
     with record_function("mimo::forward_backward"):
         # ── Phase 1: Encoder forward on full batch (one pass) ────────────────
@@ -79,7 +94,6 @@ def colocated_forward_backward_with_pp(
 
         # Async offload encoder params to CPU (opt states offloaded separately
         # after optimizer.step in the training loop for better overlap).
-        offloader = getattr(mimo_model, '_encoder_offloader', None)
         if offloader is not None:
             offloader.offload_params()
 
@@ -97,10 +111,6 @@ def colocated_forward_backward_with_pp(
                 encoder_embeddings=cached['encoder_embeddings'],
             )
             return output_tensor, partial(_loss_func, cached['loss_mask'])
-
-        # Wire pre_cooldown_func so reload starts during 1F1B cooldown (PP>1).
-        if offloader is not None:
-            mimo_model.config.pre_cooldown_func = offloader.reload
 
         # Suppress the schedule's off_interface.reset() during Phase 2 so
         # Phase 3's encoder backward can still access offloaded tensors.

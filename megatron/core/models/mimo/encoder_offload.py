@@ -20,7 +20,7 @@ Timeline::
     optimizer.step()
     offload_opt_states()         # async D2H opt states → overlaps with encoder fwd
     encoder_forward()            # compute overlaps with opt state D2H
-    offload_params()             # async D2H params only (~1.5 GB, not 2.1 GB)
+    offload_params()             # async D2H params only
     LLM pipeline                 # param D2H finishes quickly, less allocator stall
     pre_cooldown → reload()      # async H2D params + opt states
     reload_sync()                # wait for all H2D
@@ -85,9 +85,8 @@ class EncoderDDPOffloader:
     def offload_params(self) -> None:
         """Async D2H offload of DDP params + free grads.  Returns immediately.
 
-        Only offloads params (not optimizer states).  The D2H is ~1.5 GB for a
-        3B encoder at TP4, completing in ~50 ms on PCIe — much less allocator
-        stall than offloading params + opt states together.
+        Only offloads params (not optimizer states) — less allocator stall
+        than offloading params + opt states together.
         """
         if self._params_offloaded:
             return
@@ -257,15 +256,6 @@ class EncoderDDPOffloader:
             )
 
         self._iter += 1
-
-    # ------------------------------------------------------------------
-    # Legacy convenience (offload everything in one call)
-    # ------------------------------------------------------------------
-
-    def offload(self) -> None:
-        """Offload params + opt states in one call (legacy API)."""
-        self.offload_params()
-        self.offload_opt_states()
 
     # ------------------------------------------------------------------
     # Internal helpers
