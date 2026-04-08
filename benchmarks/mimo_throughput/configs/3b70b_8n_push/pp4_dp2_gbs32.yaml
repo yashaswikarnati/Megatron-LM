@@ -1,9 +1,0 @@
-# PP4/DP2 + GBS32: same PP, double GBS for better pipeline fill
-# nmb=16/rank, warmup=3
-experiment:
-  name: 3b70b_pp4_dp2_gbs32
-
-data:
-  micro_batch_size: 1
-  num_microbatches: 16
-  num_images_per_sample: 8

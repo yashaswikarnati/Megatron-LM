@@ -1,5 +1,0 @@
-# Same as baseline but with encoder param offload
-experiment:
-  name: offload_3b32b_offload
-
-encoder_param_offload: true

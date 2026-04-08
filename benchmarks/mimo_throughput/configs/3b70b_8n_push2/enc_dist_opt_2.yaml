@@ -1,6 +1,0 @@
-# Encoder dist opt instances=2 (independent experiment from mbs/gbs push)
-# Same GBS64 PP2/DP4 config, just change encoder optimizer sharding
-experiment:
-  name: 3b70b_enc_dist_opt_2
-
-encoder_num_dist_opt_instances: 2

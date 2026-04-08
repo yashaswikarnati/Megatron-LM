@@ -1,8 +1,0 @@
-# Offload v2 with profiler
-experiment:
-  name: offload_3b32b_v2_profile
-  num_iterations: 10
-  warmup_iterations: 3
-  log_interval: 1
-
-encoder_param_offload: true

@@ -1,8 +1,0 @@
-# MBS2: double micro-batch size (same GBS=64, nmb=8/rank)
-# More compute per microbatch, better GPU utilization
-experiment:
-  name: 3b70b_mbs2
-
-data:
-  micro_batch_size: 2
-  num_microbatches: 8
