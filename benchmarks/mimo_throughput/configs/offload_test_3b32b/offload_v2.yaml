@@ -1,5 +1,0 @@
-# Offload v2: split lifecycle (params separate from opt states)
-experiment:
-  name: offload_3b32b_v2
-
-encoder_param_offload: true

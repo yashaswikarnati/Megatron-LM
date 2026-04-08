@@ -1,9 +1,0 @@
-# Config 3: Homo TP8/PP2/DP4+SP, 75% vision (12 images x 512 = 6144 tokens)
-# Higher vision ratio — tests memory pressure with more encoder work
-experiment:
-  name: 3b70b_homo_fixed_pp2_dp4_75pct
-
-data:
-  micro_batch_size: 1
-  num_microbatches: 32
-  num_images_per_sample: 12

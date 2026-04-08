@@ -86,12 +86,8 @@ class BenchmarkConfig:
     llm_parallel: ParallelSpec
     data: DataSpec
     memory: Optional[MemorySpec] = None
-    pp_mode: str = "colocated"  # "colocated" (hetero grids) or "homo" (parallel_state)
     encoder_num_dist_opt_instances: int = 1
     encoder_use_distributed_optimizer: bool = True
-    encoder_param_offload: bool = False  # Offload encoder params + opt states to CPU between phases
-    sequence_parallel: bool = False  # Enable sequence parallelism for LLM
-    first_pipeline_num_layers: Optional[int] = None  # Uneven PP: fewer LLM layers on first stage (for encoder)
     pipeline_timers: bool = False  # Enable per-microbatch fwd/bwd timers (profiling only)
 
     @property
@@ -110,32 +106,17 @@ class BenchmarkConfig:
 
     def validate(self):
         """Validate cross-field constraints across the benchmark configuration."""
-        assert self.pp_mode in ("colocated", "homo"), (
-            f"pp_mode must be 'colocated' or 'homo', got '{self.pp_mode}'"
-        )
-
         # Encoder must be PP=1
         assert self.encoder_parallel.pp == 1, "Encoder must have PP=1"
 
-        if self.pp_mode == "homo":
-            # Homo: encoder shares TP/DP with LLM (lives only on PP stage 0)
-            assert self.encoder_parallel.tp == self.llm_parallel.tp, (
-                f"Homo mode requires encoder TP ({self.encoder_parallel.tp}) "
-                f"== LLM TP ({self.llm_parallel.tp})"
-            )
-            assert self.encoder_parallel.dp == self.llm_parallel.dp, (
-                f"Homo mode requires encoder DP ({self.encoder_parallel.dp}) "
-                f"== LLM DP ({self.llm_parallel.dp})"
-            )
-        else:
-            # Colocated: all GPUs accounted for: encoder TP*DP == LLM TP*DP*PP
-            assert (
-                self.encoder_parallel.tp * self.encoder_parallel.dp
-                == self.llm_parallel.world_size
-            ), (
-                f"Encoder world_size ({self.encoder_parallel.tp * self.encoder_parallel.dp}) "
-                f"!= LLM world_size ({self.llm_parallel.world_size})"
-            )
+        # All GPUs accounted for: encoder TP*DP == LLM TP*DP*PP
+        assert (
+            self.encoder_parallel.tp * self.encoder_parallel.dp
+            == self.llm_parallel.world_size
+        ), (
+            f"Encoder world_size ({self.encoder_parallel.tp * self.encoder_parallel.dp}) "
+            f"!= LLM world_size ({self.llm_parallel.world_size})"
+        )
 
         # Per-microbatch samples must be divisible by LLM DP (always true by construction)
         dp_bs = self.dp_batch_size
