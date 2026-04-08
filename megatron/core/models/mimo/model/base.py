@@ -11,6 +11,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
+from megatron.core.models.mimo.encoder_offload import EncoderDDPOffloader
 from megatron.core.models.mimo.memory_manager import MimoMemoryManager
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -124,6 +125,29 @@ class MimoModel(MegatronModule):
         # Enable schedule-level offload reset if any module uses offloading
         if self.memory_manager.needs_offload_lifecycle:
             self.config.fine_grained_activation_offloading = True
+
+        # Encoder DDP buffer offloader — lazily initialized after DDP wrapping.
+        self._encoder_offloader = None
+
+    def get_encoder_offloader(self):
+        """Return the encoder offloader, creating it on first call if config enables it.
+
+        Must be called after encoder submodules are DDP-wrapped.
+        """
+        if self._encoder_offloader is not None:
+            return self._encoder_offloader
+        if not getattr(self.mimo_config, 'encoder_offload', False):
+            return None
+        assert self.lm_has_pp, (
+            "encoder_offload requires LLM PP > 1. The offload lifecycle relies on the "
+            "colocated 3-phase schedule which separates encoder forward/backward with "
+            "a LLM pipeline phase to overlap D2H/H2D transfers."
+        )
+        for mod in self.modality_submodules.values():
+            if isinstance(mod, DistributedDataParallel):
+                self._encoder_offloader = EncoderDDPOffloader(mod)
+                return self._encoder_offloader
+        return None
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.

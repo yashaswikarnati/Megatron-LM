@@ -288,6 +288,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
         special_token_ids={ENCODER_NAME: config.data.image_token_id},
         module_to_grid_map={ENCODER_NAME: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid},
         memory_config=memory_config,
+        encoder_offload=config.encoder_offload,
     )
 
     mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp)
@@ -778,6 +779,7 @@ def run_benchmark(
             logger.info("Pipeline timers created (log_level=2, log_option='all')")
 
     pg_manager = None
+    offloader = None  # Only used in colocated path with PP > 1
     if is_homo:
         # Homo baseline: parallel_state, encoder on PP stage 0, single DDP
         mimo_model, optimizer = create_mimo_model_homo(config)
@@ -798,6 +800,13 @@ def run_benchmark(
             bf16=True, use_distributed_optimizer=True,
         )
         optimizer = get_mimo_optimizer(mimo_model, opt_config)
+
+        # Wire encoder optimizer into offloader for opt state offload/reload.
+        offloader = mimo_model.get_encoder_offloader()
+        if offloader is not None:
+            enc_info = optimizer.module_infos.get(ENCODER_NAME)
+            if enc_info is not None and enc_info.optimizer is not None:
+                offloader.set_optimizer(enc_info.optimizer)
 
     # 3. Data iterator
     data_iter = SyntheticVLMIterator(

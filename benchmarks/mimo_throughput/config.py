@@ -89,6 +89,7 @@ class BenchmarkConfig:
     pp_mode: str = "colocated"  # "colocated" (hetero grids) or "homo" (parallel_state)
     encoder_num_dist_opt_instances: int = 1
     encoder_use_distributed_optimizer: bool = True
+    encoder_offload: bool = False  # Offload encoder DDP params + optimizer states to CPU
     pipeline_timers: bool = False  # Enable per-microbatch fwd/bwd timers (profiling only)
 
     @property
@@ -113,6 +114,12 @@ class BenchmarkConfig:
 
         # Encoder must be PP=1
         assert self.encoder_parallel.pp == 1, "Encoder must have PP=1"
+
+        # Encoder offload requires colocated mode with LLM PP > 1
+        if self.encoder_offload:
+            assert self.pp_mode == "colocated" and self.llm_parallel.pp > 1, (
+                "encoder_offload requires colocated mode with LLM PP > 1"
+            )
 
         if self.pp_mode == "homo":
             # Homo: encoder shares TP/DP with LLM (lives only on PP stage 0)

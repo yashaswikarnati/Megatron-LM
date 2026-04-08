@@ -50,6 +50,11 @@ def colocated_forward_backward_with_pp(
     pp_group = llm_grid.get_pg("pp") if llm_grid and 'pp' in llm_grid.dim_names else None
     is_pp_first = pp_group is None or pp_group.rank() == 0
 
+    # ── Encoder offload setup (from config, before any phases) ──────────
+    offloader = mimo_model.get_encoder_offloader()
+    if offloader is not None:
+        mimo_model.config.pre_cooldown_func = offloader.reload
+
     with record_function("mimo::forward_backward"):
         # ── Phase 1: Encoder forward on full batch (one pass) ────────────────
         # All ranks participate (encoder is PP=1, communicate is collective).
@@ -59,6 +64,12 @@ def colocated_forward_backward_with_pp(
 
         mem_mgr = mimo_model.memory_manager
 
+        # Async offload optimizer states BEFORE encoder forward so D2H
+        # overlaps with encoder compute. Skip during forward_only — no
+        # backward means pre_cooldown_func won't fire to reload.
+        if offloader is not None and not forward_only:
+            offloader.offload_opt_states()
+
         with record_function("mimo::encoder_forward"):
             enc_out = mimo_model.encode_and_communicate({encoder_name: full_encoder_input})
 
@@ -67,6 +78,19 @@ def colocated_forward_backward_with_pp(
         # into detached_full.grad automatically via PyTorch's view gradient semantics.
         detached_full = {k: v.detach().requires_grad_(True) for k, v in enc_out.items()}
         lm_data = _build_lm_microbatches(detached_full, all_batches, num_microbatches)
+
+        # Free encoder data no longer needed during the LLM phase.
+        # enc_out must stay alive for Phase 3 backward (autograd.backward).
+        # full_encoder_input (concatenated encoder pixel data) is consumed.
+        # all_batches modality_inputs (raw pixel data) are consumed — only text
+        # fields (input_ids, labels, etc.) are still referenced by lm_data.
+        del full_encoder_input
+        for batch in all_batches:
+            batch.pop('modality_inputs', None)
+
+        # Async offload encoder params after forward (not needed until backward).
+        if offloader is not None and not forward_only:
+            offloader.offload_params()
 
         # ── Phase 2: LLM 1F1B pipeline ──────────────────────────────────────
         # Only LLM P2P communication (within PP group). No encoder collectives.
@@ -102,6 +126,9 @@ def colocated_forward_backward_with_pp(
             # (accumulated across microbatch view slices on PP stage 0).
             # Broadcast to PP stage 1+ then run one encoder backward for the full batch.
             with record_function("mimo::encoder_backward"):
+                if offloader is not None:
+                    offloader.reload_sync()
+
                 if not forward_only and enc_out:
                     _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first)
                     for key in enc_out:

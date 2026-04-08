@@ -2311,6 +2311,8 @@ def forward_backward_pipelining_without_interleaving(
 
     # Run cooldown backward passes.
     if not forward_only:
+        if getattr(config, 'pre_cooldown_func', None) is not None:
+            config.pre_cooldown_func()
         for i in range(num_warmup_microbatches):
 
             # Enable async grad reduction in the last backward pass
