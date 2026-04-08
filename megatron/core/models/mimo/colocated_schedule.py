@@ -86,6 +86,7 @@ def colocated_forward_backward_with_pp(
         # after optimizer.step in the training loop for better overlap).
         if offloader is not None:
             offloader.offload_params()
+            offloader.offload_opt_states()  # no-op after iter 0 (training loop handles it)
 
         # ── Phase 2: LLM 1F1B pipeline ──────────────────────────────────────
         # Only LLM P2P communication (within PP group). No encoder collectives.
