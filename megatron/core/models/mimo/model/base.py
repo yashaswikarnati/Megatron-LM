@@ -11,6 +11,7 @@ from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
+from megatron.core.models.mimo.encoder_offload import EncoderDDPOffloader
 from megatron.core.models.mimo.memory_manager import MimoMemoryManager
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -125,9 +126,23 @@ class MimoModel(MegatronModule):
         if self.memory_manager.needs_offload_lifecycle:
             self.config.fine_grained_activation_offloading = True
 
-        # Encoder DDP buffer offloader — set by colocated_schedule when
-        # encoder_param_offload is enabled in config.
+        # Encoder DDP buffer offloader — lazily initialized after DDP wrapping.
         self._encoder_offloader = None
+
+    def get_encoder_offloader(self):
+        """Return the encoder offloader, creating it on first call if config enables it.
+
+        Must be called after encoder submodules are DDP-wrapped.
+        """
+        if self._encoder_offloader is not None:
+            return self._encoder_offloader
+        if not getattr(self.mimo_config, 'encoder_offload', False):
+            return None
+        for mod in self.modality_submodules.values():
+            if isinstance(mod, DistributedDataParallel):
+                self._encoder_offloader = EncoderDDPOffloader(mod)
+                return self._encoder_offloader
+        return None
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
@@ -223,13 +238,13 @@ class MimoModel(MegatronModule):
             else:
                 raise ValueError(f"No special token ID defined for modality {modality_name}")
 
-            # Validate token counts match embeddings
+            # Validate on GPU without CPU sync (torch.debugging only, no .item())
             num_tokens = mask.sum()
             expected = modality_emb.size(0)
             if torch.is_grad_enabled():
-                assert num_tokens.item() == expected, (
-                    f"{modality_name} token count mismatch: "
-                    f"mask has {num_tokens.item()} tokens but embeddings have {expected}"
+                # Fast GPU-side check: avoid .item() which forces CPU-GPU sync
+                torch._assert(
+                    num_tokens == expected, f"{modality_name} token count mismatch with embeddings"
                 )
 
             expanded_mask = mask.unsqueeze(-1).expand_as(combined_embeddings)

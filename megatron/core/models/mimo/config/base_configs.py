@@ -47,6 +47,6 @@ class MimoModelConfig:
     module_to_grid_map: Optional[Dict[str, HyperCommGrid]] = None
     kv_format: str = "sbhd"
     memory_config: Optional[Dict[str, ModuleMemoryConfig]] = None
-    encoder_param_offload: bool = False
+    encoder_offload: bool = False
     """If True, offload encoder DDP params + optimizer states to CPU after encoder
     forward and reload before encoder backward. Frees GPU memory during LLM phase."""

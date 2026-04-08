@@ -20,9 +20,7 @@ import torch
 import torch.distributed as dist
 from torch.profiler import record_function
 
-from megatron.core.distributed import DistributedDataParallel
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.mimo.encoder_offload import EncoderDDPOffloader
 from megatron.core.pipeline_parallel import schedules
 
 
@@ -53,15 +51,7 @@ def colocated_forward_backward_with_pp(
     is_pp_first = pp_group is None or pp_group.rank() == 0
 
     # ── Encoder offload setup (from config, before any phases) ──────────
-    offloader = getattr(mimo_model, '_encoder_offloader', None)
-    if offloader is None and getattr(mimo_model.mimo_config, 'encoder_param_offload', False):
-        # Find the DDP-wrapped encoder submodule.
-        for name, mod in mimo_model.modality_submodules.items():
-            if isinstance(mod, DistributedDataParallel):
-                offloader = EncoderDDPOffloader(mod)
-                mimo_model._encoder_offloader = offloader
-                break
-
+    offloader = mimo_model.get_encoder_offloader()
     if offloader is not None:
         mimo_model.config.pre_cooldown_func = offloader.reload
 
