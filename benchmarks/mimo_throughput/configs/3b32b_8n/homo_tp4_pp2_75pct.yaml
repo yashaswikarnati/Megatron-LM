@@ -1,0 +1,43 @@
+# 3B+32B Homo TP4/PP2/DP8+SP, 75% vision, 8N
+experiment:
+  name: 3b32b_homo_tp4_pp2_75pct
+  num_iterations: 10
+  warmup_iterations: 3
+  log_interval: 1
+
+model:
+  encoder:
+    num_layers: 48
+    hidden_size: 2304
+    num_attention_heads: 32
+    seq_length: 1024
+  llm:
+    num_layers: 64
+    hidden_size: 6144
+    num_attention_heads: 48
+    vocab_size: 128000
+    seq_length: 8192
+
+parallelism:
+  encoder:
+    tp: 4
+    dp: 8
+  llm:
+    tp: 4
+    dp: 8
+    pp: 2
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 16
+  num_images_per_sample: 6
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 48
+
+sequence_parallel: true
+pp_mode: homo
+encoder_param_offload: false

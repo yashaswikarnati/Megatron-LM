@@ -1,0 +1,44 @@
+# 1B+32B Hetero enc TP1/DP64, LLM TP4/PP1/DP16+SP, 50%
+# Zero encoder TP comm, natural enc_seq=1024
+experiment:
+  name: 1b32b_hetero_tp1_pp1_50pct
+  num_iterations: 10
+  warmup_iterations: 3
+  log_interval: 1
+
+model:
+  encoder:
+    num_layers: 40
+    hidden_size: 1408
+    num_attention_heads: 16
+    seq_length: 1024
+  llm:
+    num_layers: 64
+    hidden_size: 6144
+    num_attention_heads: 48
+    vocab_size: 128000
+    seq_length: 8192
+
+parallelism:
+  encoder:
+    tp: 1
+    dp: 64
+  llm:
+    tp: 4
+    dp: 16
+    pp: 1
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 8
+  num_images_per_sample: 4
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 40
+
+sequence_parallel: true
+pp_mode: colocated
+encoder_param_offload: false

@@ -1,0 +1,7 @@
+# MBS2 + GBS128: double both (nmb=16/rank)
+experiment:
+  name: 3b70b_mbs2_gbs128
+
+data:
+  micro_batch_size: 2
+  num_microbatches: 16

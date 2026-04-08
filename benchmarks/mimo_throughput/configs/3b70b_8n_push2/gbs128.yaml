@@ -1,0 +1,6 @@
+# GBS128: double the batch (nmb=32/rank)
+experiment:
+  name: 3b70b_gbs128
+
+data:
+  num_microbatches: 32

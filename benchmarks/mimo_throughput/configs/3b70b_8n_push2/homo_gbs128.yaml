@@ -1,0 +1,11 @@
+# Homo baseline: same PP2/DP4+SP config but homo mode (encoder same parallelism as LLM)
+# TP8/PP2/DP4, GBS128, mbs=1, 8 images * 512 seq = 50% vision
+experiment:
+  name: 3b70b_homo_gbs128
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 4
+
+pp_mode: homo

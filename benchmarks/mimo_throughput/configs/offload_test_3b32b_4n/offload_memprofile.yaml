@@ -1,0 +1,13 @@
+# Memory profile run: reduced nmb to avoid OOM, warmup=1 so recording starts early
+experiment:
+  name: 3b32b_4n_offload_memprofile
+  num_iterations: 5
+  warmup_iterations: 1
+  log_interval: 1
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 32
+  num_images_per_sample: 4
+
+encoder_param_offload: true

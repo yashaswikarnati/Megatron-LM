@@ -1,0 +1,14 @@
+# Category 1: ViT-L (1.0B) + LLM-14B (14B) | Total ~15B | Ratio 0.07x
+# Ground truth from NMFW-58 model catalog
+model:
+  encoder:
+    num_layers: 40
+    hidden_size: 1408
+    num_attention_heads: 16
+    seq_length: 1024
+  llm:
+    num_layers: 48
+    hidden_size: 5120
+    num_attention_heads: 40
+    vocab_size: 128000
+    seq_length: 8192

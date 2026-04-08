@@ -1,0 +1,15 @@
+# PP2/DP4 + GBS32: less bubble + bigger batch
+# nmb=8/rank, warmup=1
+experiment:
+  name: 3b70b_pp2_dp4_gbs32
+
+parallelism:
+  llm:
+    tp: 8
+    dp: 4
+    pp: 2
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 16
+  num_images_per_sample: 8

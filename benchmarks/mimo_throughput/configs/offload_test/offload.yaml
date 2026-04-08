@@ -1,0 +1,5 @@
+# Offload: same config as baseline but with encoder param offload enabled
+experiment:
+  name: offload_test_offload
+
+encoder_param_offload: true

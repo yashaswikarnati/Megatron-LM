@@ -1,0 +1,17 @@
+# Enc TP4/DP16 + offload, 8 images * 512 seq = 4096 tokens
+experiment:
+  name: 3b70b_enc_tp4_offload
+
+parallelism:
+  encoder:
+    tp: 4
+    dp: 16
+
+model:
+  encoder:
+    seq_length: 512
+
+data:
+  num_images_per_sample: 8
+
+encoder_param_offload: true

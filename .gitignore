@@ -8,7 +8,6 @@ slurm*
 logs
 .vscode
 local/
-benchmarks/
 .gitmodules
 wandb/
 onelogger.log

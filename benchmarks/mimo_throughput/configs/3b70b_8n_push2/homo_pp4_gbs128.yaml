@@ -1,0 +1,18 @@
+# Homo PP4: more PP stages = fewer layers per stage = less memory
+# TP8/PP4/DP2+SP, GBS128, enc TP8/DP2 (same as LLM)
+experiment:
+  name: 3b70b_homo_pp4_gbs128
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 2
+  llm:
+    tp: 8
+    dp: 2
+    pp: 4
+
+data:
+  num_microbatches: 64
+
+pp_mode: homo

@@ -1,0 +1,62 @@
+16: GpuFreq=control_disabled
+16: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/models/mimo/config/base_configs.py:13: UserWarning: MimoModelConfig is experimental and still under active development. The API may change without notice in future releases.
+16:   class MimoModelConfig:
+16: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/transformer/transformer_config.py:1934: UserWarning: full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.
+16:   warnings.warn(
+16: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/benchmarks/mimo_throughput/training.py:294: UserWarning: MimoModel is experimental and still under active development. The API may change without notice in future releases.
+16:   mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp)
+16: 2026-04-05 22:42:14,713 [INFO] root: [Rank 16] ColocatedBridgeCommunicator: images(4TP/8DP) -> language(4TP/2DP), scale_factor=4.0
+16: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/models/mimo/submodules/vision.py:33: UserWarning: ModalitySubmodules is experimental and still under active development. The API may change without notice in future releases.
+16:   super().__init__(
+16: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/distributed/param_and_grad_buffer.py:1211: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+16:   if move_params and self.param_data is not None and self.param_data.storage().size() > 0:
+16: 2026-04-05 22:43:16,165 [INFO] megatron.core.models.mimo.encoder_offload: [OFFLOAD_PARAMS iter=0] 20.14 GB -> 17.02 GB (freed 3.11 GB)
+16: 2026-04-05 22:43:49,337 [INFO] megatron.core.models.mimo.encoder_offload: [RELOAD iter=0] 62.88 GB -> 65.99 GB (+3.11 GB)
+16: 2026-04-05 22:43:51,764 [INFO] megatron.core.models.mimo.encoder_offload: [RELOAD_SYNC iter=0] wait=0.00 ms (0 = fully overlapped)
+16: [rank16]: Traceback (most recent call last):
+16: [rank16]:   File "<frozen runpy>", line 198, in _run_module_as_main
+16: [rank16]:   File "<frozen runpy>", line 88, in _run_code
+16: [rank16]:   File "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/benchmarks/mimo_throughput/runner.py", line 271, in <module>
+16: [rank16]:     main()
+16: [rank16]:   File "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/benchmarks/mimo_throughput/runner.py", line 229, in main
+16: [rank16]:     summary = run_benchmark(
+16: [rank16]:               ^^^^^^^^^^^^^^
+16: [rank16]:   File "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/benchmarks/mimo_throughput/training.py", line 1054, in run_benchmark
+16: [rank16]:     optimizer.step()
+16: [rank16]:   File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+16: [rank16]:     return func(*args, **kwargs)
+16: [rank16]:            ^^^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/models/mimo/optimizer.py", line 88, in step
+16: [rank16]:     grad_norm = self.get_grad_norm()
+16: [rank16]:                 ^^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+16: [rank16]:     return func(*args, **kwargs)
+16: [rank16]:            ^^^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/models/mimo/optimizer.py", line 69, in get_grad_norm
+16: [rank16]:     module_norm = info.optimizer.get_grad_norm() or 0.0
+16: [rank16]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+16: [rank16]:     return func(*args, **kwargs)
+16: [rank16]:            ^^^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/optimizer/optimizer.py", line 1281, in get_grad_norm
+16: [rank16]:     return self.chained_optimizers[0].get_grad_norm()
+16: [rank16]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+16: [rank16]:     return func(*args, **kwargs)
+16: [rank16]:            ^^^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/optimizer/optimizer.py", line 199, in get_grad_norm
+16: [rank16]:     total_norm = get_grad_norm_fp32(
+16: [rank16]:                  ^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/public/Megatron-LM/.worktrees/encoder-offload-pr/megatron/core/optimizer/clip_grads.py", line 130, in get_grad_norm_fp32
+16: [rank16]:     torch.distributed.all_reduce(
+16: [rank16]:   File "/usr/local/lib/python3.12/dist-packages/torch/distributed/c10d_logger.py", line 83, in wrapper
+16: [rank16]:     return func(*args, **kwargs)
+16: [rank16]:            ^^^^^^^^^^^^^^^^^^^^^
+16: [rank16]:   File "/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py", line 3006, in all_reduce
+16: [rank16]:     work = group.allreduce([tensor], opts)
+16: [rank16]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+16: [rank16]: torch.distributed.DistBackendError: NCCL error in: /opt/pytorch/pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:93, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.29.2
+16: [rank16]: ncclUnhandledCudaError: Call to CUDA function failed.
+16: [rank16]: Last error:
+16: [rank16]: Cuda failure 2 'out of memory'
+16: [rank16]:[W405 22:43:56.669924107 ProcessGroupNCCL.cpp:1569] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

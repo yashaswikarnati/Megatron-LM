@@ -1,0 +1,43 @@
+# 1B+32B Homo TP4/PP1/DP16+SP, 50% vision, 8N
+experiment:
+  name: 1b32b_homo_tp4_50pct
+  num_iterations: 10
+  warmup_iterations: 3
+  log_interval: 1
+
+model:
+  encoder:
+    num_layers: 40
+    hidden_size: 1408
+    num_attention_heads: 16
+    seq_length: 1024
+  llm:
+    num_layers: 64
+    hidden_size: 6144
+    num_attention_heads: 48
+    vocab_size: 128000
+    seq_length: 8192
+
+parallelism:
+  encoder:
+    tp: 4
+    dp: 16
+  llm:
+    tp: 4
+    dp: 16
+    pp: 1
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 8
+  num_images_per_sample: 4
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 40
+
+sequence_parallel: true
+pp_mode: homo
+encoder_param_offload: false

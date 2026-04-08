@@ -1,0 +1,70 @@
+========================================================================
+MIMO PROFILE ANALYSIS
+========================================================================
+Config: offload_3b32b_baseline_profile | enc TP4/DP16 | llm TP4/DP4/PP4 | mbs=1 nmb=4
+
+─── PHASE TIMELINE (inclusive CUDA time) ───────────────────────────────
+
+Phase                                  CUDA ms   % iter   Calls    Avg ms
+────────────────────────────────────────────────────────────────────────
+encoder_forward                          463.5     7.6%       4    115.87
+text_embedding                            17.6     0.3%      16      1.10
+align_embeddings                          20.7     0.3%      16      1.29
+llm_forward                             5433.0    88.7%      20    271.65 ◄ longest
+optimizer_step                           184.0     3.0%       4     45.99
+encoder_backward                           3.7     0.1%       2      1.83
+────────────────────────────────────────────────────────────────────────
+SUM                                     6122.3
+
+(Wall-clock fwd_bwd from harness timers is the ground truth.
+ CUDA inclusive times may exceed wall-clock due to overlap.)
+
+─── OP-LEVEL BREAKDOWN (leaf ops, self CUDA time) ──────────────────────
+
+Category                CUDA ms   % total   Op count
+───────────────────────────────────────────────────
+Compute                  4025.9     32.4%       6296
+Communication            6619.4     53.2%       6114
+Elementwise               408.6      3.3%      11910
+Other                    1378.9     11.1%     116550
+───────────────────────────────────────────────────
+TOTAL                   12432.9    100.0%
+
+Collective             Total ms    Calls     Avg ms
+──────────────────────────────────────────────────
+AllReduce               1162.08     3664      0.317
+AllGather               1109.88      304      3.651
+ReduceScatter            411.35      222      1.853
+Broadcast                 10.98        8      1.373
+
+─── MEMORY ─────────────────────────────────────────────────────────────
+
+Peak GPU memory:  73.08 GB  (91% of 80 GB)
+Headroom:         6.9 GB
+
+Phase                                 Mem (GB)      Delta
+─────────────────────────────────────────────────────────
+text_embedding                           60.70    +60.70
+align_embeddings                         60.80     +0.09
+llm_forward                              72.81    +12.01 ◄ PEAK
+
+Top allocators                                             MB   Calls
+─────────────────────────────────────────────────────────────────────
+aten::empty                                          183286.1    7282
+aten::empty_strided                                   40355.7    2160
+## Call CompiledFxGraph fqizqy2jg3sh5dc6fkxeihw45k    37245.4     248
+## Call CompiledFxGraph fvy2ocwm5jcef7q6cx6idbkece    12888.0     256
+## Call CompiledFxGraph fs547jqctwbxz56tnklqhuwji5    12884.9     128
+## Call CompiledFxGraph fuvvviir4ylqqrxyhxdktw6adh    12884.9     128
+aten::resize_                                         11275.9     336
+aten::cat                                             11174.2     234
+aten::add                                             10406.1     500
+aten::gelu_backward                                    1811.9      96
+
+─── BOTTLENECK ASSESSMENT ──────────────────────────────────────────────
+
+COMMUNICATION-BOUND: 53% of CUDA time in collectives (6619ms). TP all-reduce is the dominant cost.
+COMPUTE UNDERUTILIZED: Only 32% of CUDA time in compute. Increase batch size or reduce communication.
+MEMORY PRESSURE: 73.1 GB peak. Consider activation recompute/offload to enable larger batch.
+ENCODER/LLM SPLIT: encoder=8%, llm=92% of model compute
+BRIDGE OVERHEAD: 0.00ms — negligible

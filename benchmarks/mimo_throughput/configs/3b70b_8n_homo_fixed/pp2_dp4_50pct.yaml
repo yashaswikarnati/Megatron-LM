@@ -1,0 +1,4 @@
+# Config 1: Homo TP8/PP2/DP4+SP, 50% vision
+# Same parallelism as hetero best — key question: does it fit for 70B?
+experiment:
+  name: 3b70b_homo_fixed_pp2_dp4_50pct

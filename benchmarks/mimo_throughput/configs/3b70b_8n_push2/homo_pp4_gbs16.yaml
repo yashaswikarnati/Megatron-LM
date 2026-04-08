@@ -1,0 +1,15 @@
+# Homo PP4 GBS16: minimum viable batch
+# TP8/PP4/DP2+SP, nmb=8/rank, warmup=3
+experiment:
+  name: 3b70b_homo_pp4_gbs16
+
+parallelism:
+  encoder:
+    tp: 8
+    dp: 2
+  llm:
+    tp: 8
+    dp: 2
+    pp: 4
+
+pp_mode: homo
