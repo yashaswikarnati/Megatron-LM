@@ -90,7 +90,6 @@ class BenchmarkConfig:
     encoder_num_dist_opt_instances: int = 1
     encoder_use_distributed_optimizer: bool = True
     encoder_offload: bool = False  # Offload encoder DDP params + optimizer states to CPU
-    sequence_parallel: bool = False  # Enable sequence parallelism for LLM
     pipeline_timers: bool = False  # Enable per-microbatch fwd/bwd timers (profiling only)
 
     @property
