@@ -996,6 +996,11 @@ def run_benchmark(
         optimizer.step()
         optimizer.zero_grad()
 
+        # Async offload encoder optimizer states — D2H overlaps with next
+        # iteration's encoder forward. Schedule has a fallback for iter 0.
+        if offloader is not None:
+            offloader.offload_opt_states()
+
         torch.cuda.synchronize()
         t_opt_ms = (time.time() - t_opt_start) * 1000.0
 
