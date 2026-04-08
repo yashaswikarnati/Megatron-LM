@@ -138,6 +138,11 @@ class MimoModel(MegatronModule):
             return self._encoder_offloader
         if not getattr(self.mimo_config, 'encoder_offload', False):
             return None
+        assert self.lm_has_pp, (
+            "encoder_offload requires LLM PP > 1. The offload lifecycle relies on the "
+            "colocated 3-phase schedule which separates encoder forward/backward with "
+            "a LLM pipeline phase to overlap D2H/H2D transfers."
+        )
         for mod in self.modality_submodules.values():
             if isinstance(mod, DistributedDataParallel):
                 self._encoder_offloader = EncoderDDPOffloader(mod)
