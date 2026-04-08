@@ -82,13 +82,12 @@ def colocated_forward_backward_with_pp(
         for batch in all_batches:
             batch.pop('modality_inputs', None)
 
-        # Async offload encoder params to CPU (opt states offloaded separately
-        # after optimizer.step in the training loop for better overlap).
-        # Skip offload during forward_only (eval/inference) — no LLM backward
-        # means pre_cooldown_func won't fire, leaving params stranded on CPU.
+        # Async offload encoder params + optimizer states to CPU.
+        # Skip during forward_only (eval/inference) — no LLM backward means
+        # pre_cooldown_func won't fire, leaving params stranded on CPU.
         if offloader is not None and not forward_only:
             offloader.offload_params()
-            offloader.offload_opt_states()  # no-op after iter 0 (training loop handles it)
+            offloader.offload_opt_states()
 
         # ── Phase 2: LLM 1F1B pipeline ──────────────────────────────────────
         # Only LLM P2P communication (within PP group). No encoder collectives.

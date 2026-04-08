@@ -996,10 +996,6 @@ def run_benchmark(
         optimizer.step()
         optimizer.zero_grad()
 
-        # Async offload encoder optimizer states after step (overlaps with next encoder fwd).
-        if offloader is not None:
-            offloader.offload_opt_states()
-
         torch.cuda.synchronize()
         t_opt_ms = (time.time() - t_opt_start) * 1000.0
 
