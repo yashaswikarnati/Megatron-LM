@@ -64,6 +64,12 @@ def colocated_forward_backward_with_pp(
 
         mem_mgr = mimo_model.memory_manager
 
+        # Async offload optimizer states BEFORE encoder forward so D2H
+        # overlaps with encoder compute. Skip during forward_only — no
+        # backward means pre_cooldown_func won't fire to reload.
+        if offloader is not None and not forward_only:
+            offloader.offload_opt_states()
+
         with record_function("mimo::encoder_forward"):
             enc_out = mimo_model.encode_and_communicate({encoder_name: full_encoder_input})
 
@@ -82,14 +88,9 @@ def colocated_forward_backward_with_pp(
         for batch in all_batches:
             batch.pop('modality_inputs', None)
 
-        # Async offload encoder params + optimizer states to CPU.
-        # Skip during forward_only (eval/inference) — no LLM backward means
-        # pre_cooldown_func won't fire, leaving params stranded on CPU.
-        # Opt states: on iter 1+ already offloaded by training loop (after
-        # optimizer.step, overlapping with encoder fwd). Iter 0 fallback here.
+        # Async offload encoder params after forward (not needed until backward).
         if offloader is not None and not forward_only:
             offloader.offload_params()
-            offloader.offload_opt_states()  # no-op on iter 1+ (_opt_offloaded=True)
 
         # ── Phase 2: LLM 1F1B pipeline ──────────────────────────────────────
         # Only LLM P2P communication (within PP group). No encoder collectives.
