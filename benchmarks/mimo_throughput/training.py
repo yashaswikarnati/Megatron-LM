@@ -288,6 +288,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
         special_token_ids={ENCODER_NAME: config.data.image_token_id},
         module_to_grid_map={ENCODER_NAME: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid},
         memory_config=memory_config,
+        encoder_offload=config.encoder_offload,
     )
 
     mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp)

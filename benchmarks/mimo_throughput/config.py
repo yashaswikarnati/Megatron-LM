@@ -89,6 +89,7 @@ class BenchmarkConfig:
     pp_mode: str = "colocated"  # "colocated" (hetero grids) or "homo" (parallel_state)
     encoder_num_dist_opt_instances: int = 1
     encoder_use_distributed_optimizer: bool = True
+    encoder_offload: bool = False  # Offload encoder DDP params + optimizer states to CPU
     pipeline_timers: bool = False  # Enable per-microbatch fwd/bwd timers (profiling only)
 
     @property
