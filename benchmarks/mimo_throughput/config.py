@@ -116,6 +116,12 @@ class BenchmarkConfig:
         # Encoder must be PP=1
         assert self.encoder_parallel.pp == 1, "Encoder must have PP=1"
 
+        # Encoder offload requires colocated mode with LLM PP > 1
+        if self.encoder_offload:
+            assert self.pp_mode == "colocated" and self.llm_parallel.pp > 1, (
+                "encoder_offload requires colocated mode with LLM PP > 1"
+            )
+
         if self.pp_mode == "homo":
             # Homo: encoder shares TP/DP with LLM (lives only on PP stage 0)
             assert self.encoder_parallel.tp == self.llm_parallel.tp, (

@@ -779,7 +779,7 @@ def run_benchmark(
             logger.info("Pipeline timers created (log_level=2, log_option='all')")
 
     pg_manager = None
-    offloader = None
+    offloader = None  # Only used in colocated path with PP > 1
     if is_homo:
         # Homo baseline: parallel_state, encoder on PP stage 0, single DDP
         mimo_model, optimizer = create_mimo_model_homo(config)
