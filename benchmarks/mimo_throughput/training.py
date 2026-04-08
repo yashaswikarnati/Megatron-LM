@@ -778,6 +778,7 @@ def run_benchmark(
             logger.info("Pipeline timers created (log_level=2, log_option='all')")
 
     pg_manager = None
+    offloader = None
     if is_homo:
         # Homo baseline: parallel_state, encoder on PP stage 0, single DDP
         mimo_model, optimizer = create_mimo_model_homo(config)
@@ -798,6 +799,13 @@ def run_benchmark(
             bf16=True, use_distributed_optimizer=True,
         )
         optimizer = get_mimo_optimizer(mimo_model, opt_config)
+
+        # Wire encoder optimizer into offloader for opt state offload/reload.
+        offloader = mimo_model.get_encoder_offloader()
+        if offloader is not None:
+            enc_info = optimizer.module_infos.get(ENCODER_NAME)
+            if enc_info is not None and enc_info.optimizer is not None:
+                offloader.set_optimizer(enc_info.optimizer)
 
     # 3. Data iterator
     data_iter = SyntheticVLMIterator(
@@ -986,6 +994,10 @@ def run_benchmark(
 
         optimizer.step()
         optimizer.zero_grad()
+
+        # Async offload encoder optimizer states after step (overlaps with next encoder fwd).
+        if offloader is not None:
+            offloader.offload_opt_states()
 
         torch.cuda.synchronize()
         t_opt_ms = (time.time() - t_opt_start) * 1000.0
