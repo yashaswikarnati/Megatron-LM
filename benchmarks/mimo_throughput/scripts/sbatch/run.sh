@@ -24,7 +24,7 @@
 #SBATCH --time=00:10:00
 #SBATCH --mem=0
 #SBATCH --partition=batch
-#SBATCH --account=coreai_dlalgo_genai
+#SBATCH --account=coreai_dlalgo_nemorl
 
 set -euo pipefail
 

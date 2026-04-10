@@ -90,6 +90,7 @@ class BenchmarkConfig:
     encoder_num_dist_opt_instances: int = 1
     encoder_use_distributed_optimizer: bool = True
     encoder_offload: bool = False  # Offload encoder DDP params + optimizer states to CPU
+    sequence_parallel: bool = True  # SP + tp_comm_overlap on LLM (should always be on for TP>1)
     pipeline_timers: bool = False  # Enable per-microbatch fwd/bwd timers (profiling only)
 
     @property
@@ -148,15 +149,20 @@ class BenchmarkConfig:
         )
 
         # For encoder DP: with multi-image, images from one LLM sample can be
-        # split across encoder DP ranks. The real constraint is that the total
-        # encoder batch (num_images * mbs) is divisible by the fan-in scale,
-        # which is checked below. The old GBS % enc_dp check was overly strict
-        # for num_images > 1.
+        # split across encoder DP ranks. At PP=1, each microbatch is processed
+        # independently so we check per-dp-batch. At PP>1, the colocated
+        # schedule concatenates ALL microbatches before distributing to encoder
+        # ranks, so the total (num_images * GBS) is the correct check.
         enc_dp = self.encoder_parallel.dp
         llm_dp = self.llm_parallel.dp
-        total_encoder_samples = self.data.num_images_per_sample * dp_bs
+        if self.llm_parallel.pp > 1:
+            total_encoder_samples = (self.data.num_images_per_sample
+                                     * self.global_batch_size)
+        else:
+            total_encoder_samples = self.data.num_images_per_sample * dp_bs
         assert total_encoder_samples % enc_dp == 0, (
-            f"Total encoder samples (num_images={self.data.num_images_per_sample} * dp_batch_size={dp_bs}"
+            f"Total encoder samples (num_images={self.data.num_images_per_sample}"
+            f" * {'GBS=' + str(self.global_batch_size) if self.llm_parallel.pp > 1 else 'dp_batch_size=' + str(dp_bs)}"
             f" = {total_encoder_samples}) not divisible by encoder DP {enc_dp}"
         )
 
@@ -167,11 +173,23 @@ class BenchmarkConfig:
             f" = {total_image_tokens} exceeds llm_seq({self.llm_arch.seq_length})"
         )
 
-        # Fan-in: encoder batch (num_images * mbs) must be divisible by scale
+        # Fan-in: encoder batch must be divisible by scale (enc_dp // llm_dp).
+        # At PP=1, forward_step processes one microbatch at a time → check per-mb.
+        # At PP>1, the colocated schedule concatenates ALL microbatches before
+        # slicing by scale, so the total batch (nmb * num_images * mbs) is the
+        # correct divisibility target.
         if enc_dp > llm_dp:
             scale = enc_dp // llm_dp
-            encoder_batch = self.data.num_images_per_sample * self.data.micro_batch_size
+            if self.llm_parallel.pp > 1:
+                encoder_batch = (self.data.num_images_per_sample
+                                 * self.data.micro_batch_size
+                                 * self.data.num_microbatches)
+            else:
+                encoder_batch = self.data.num_images_per_sample * self.data.micro_batch_size
             assert encoder_batch % scale == 0, (
-                f"num_images({self.data.num_images_per_sample}) * mbs({self.data.micro_batch_size})"
-                f" = {encoder_batch} not divisible by fan-in scale {scale}"
+                f"encoder_batch={encoder_batch} (num_images={self.data.num_images_per_sample}"
+                f" * mbs={self.data.micro_batch_size}"
+                f"{'* nmb=' + str(self.data.num_microbatches) if self.llm_parallel.pp > 1 else ''})"
+                f" not divisible by fan-in scale {scale}"
+                f" (enc_dp={enc_dp} / llm_dp={llm_dp})"
             )

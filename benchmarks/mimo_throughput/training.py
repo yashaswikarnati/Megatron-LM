@@ -256,7 +256,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
     encoder_pg = pg_manager.get_pg_collection(encoder_grid, is_language_model=False)
     llm_pg = pg_manager.get_pg_collection(llm_grid, is_language_model=True)
 
-    use_sp = getattr(config, 'sequence_parallel', False)
+    use_sp = config.sequence_parallel
     if use_sp:
         _init_sequence_parallel(llm_pg, config, lp, ep)
 
@@ -393,7 +393,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
 # ---------------------------------------------------------------------------
 
 
-def create_mimo_model_homo(config: BenchmarkConfig):
+def create_mimo_model_homo(config: BenchmarkConfig, timers=None):
     """Create MIMO model using parallel_state (no grids) for ablation baseline.
 
     Encoder lives on PP stage 0 only. Single DDP wraps the entire model.
@@ -417,6 +417,33 @@ def create_mimo_model_homo(config: BenchmarkConfig):
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
     torch.manual_seed(12345)
 
+    # Sequence parallel: init RNG tracker and TE UB
+    # Note: _set_global_memory_buffer() is already called by initialize_model_parallel() above
+    use_sp = config.sequence_parallel
+    if use_sp:
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        model_parallel_cuda_manual_seed(seed=12345, tp_rank=tp_rank, ep_rank=0, etp_rank=0)
+
+        if lp.tp > 1:
+            try:
+                from transformer_engine.pytorch.module.base import (
+                    UserBufferQuantizationMode,
+                    initialize_ub,
+                )
+                initialize_ub(
+                    shape=[config.llm_arch.seq_length * config.data.micro_batch_size,
+                           config.llm_arch.hidden_size],
+                    tp_size=lp.tp,
+                    quantization_modes=[UserBufferQuantizationMode.NONE],
+                    ub_cfgs={},
+                    bootstrap_backend='nccl',
+                )
+            except Exception as e:
+                if dist.get_rank() == 0:
+                    logger.warning(f"TE UB init failed (tp_comm_overlap disabled): {e}")
+
     # Build language model spec using parallel_state dimensions
     lm_config = TransformerConfig(
         num_layers=config.llm_arch.num_layers,
@@ -434,19 +461,22 @@ def create_mimo_model_homo(config: BenchmarkConfig):
         gradient_accumulation_fusion=True,
         bias_dropout_fusion=True,
         bias_activation_fusion=True,
+        sequence_parallel=use_sp,
+        tp_comm_overlap=use_sp,
+        timers=timers,
     )
-    language_model_spec = ModuleSpec(
-        module=GPTModel,
-        params={
-            "config": lm_config,
-            "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
-            "vocab_size": config.llm_arch.vocab_size,
-            "max_sequence_length": config.llm_arch.seq_length,
-            "pre_process": (pp_rank == 0),
-            "post_process": (pp_rank == pp_size - 1),
-            "pg_collection": None,
-        },
-    )
+    gpt_params = {
+        "config": lm_config,
+        "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
+        "vocab_size": config.llm_arch.vocab_size,
+        "max_sequence_length": config.llm_arch.seq_length,
+        "pre_process": (pp_rank == 0),
+        "post_process": (pp_rank == pp_size - 1),
+        "pg_collection": None,
+    }
+    if use_sp:
+        gpt_params["scatter_embedding_sequence_parallel"] = False
+    language_model_spec = ModuleSpec(module=GPTModel, params=gpt_params)
 
     # Build vision spec (only on PP stage 0)
     vision_spec = {}
@@ -509,11 +539,25 @@ def create_mimo_model_homo(config: BenchmarkConfig):
         )
         special_tokens = {ENCODER_NAME: config.data.image_token_id}
 
+    # Build memory_config from benchmark MemorySpec (same as colocated path)
+    memory_config = None
+    if config.memory is not None:
+        import dataclasses as _dc
+
+        memory_config = {}
+        if config.memory.encoder is not None:
+            memory_config[ENCODER_NAME] = ModuleMemoryConfig(**_dc.asdict(config.memory.encoder))
+        if config.memory.llm is not None:
+            memory_config[MIMO_LANGUAGE_MODULE_KEY] = ModuleMemoryConfig(
+                **_dc.asdict(config.memory.llm)
+            )
+
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec=vision_spec,
         special_token_ids=special_tokens,
         module_to_grid_map=None,
+        memory_config=memory_config,
     )
 
     model = MimoModel(mimo_config)
@@ -782,7 +826,7 @@ def run_benchmark(
     offloader = None  # Only used in colocated path with PP > 1
     if is_homo:
         # Homo baseline: parallel_state, encoder on PP stage 0, single DDP
-        mimo_model, optimizer = create_mimo_model_homo(config)
+        mimo_model, optimizer = create_mimo_model_homo(config, timers=pipeline_timers)
         encoder_grid = llm_grid = llm_pg = None
         effective_mbs = config.data.micro_batch_size
     else:
