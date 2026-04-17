@@ -453,7 +453,13 @@ class MockGrid:
         self.rank_offset = rank_offset
         self.size = size
         self.dim_names = dim_names or []
+        self._pp_rank = pp_rank
+        self._pp_size = pp_size
         self._pp_group = MockProcessGroup(pp_rank, pp_size)
+
+    @property
+    def shape(self):
+        return tuple(self._pp_size if d == "pp" else 1 for d in self.dim_names)
 
     def get_pg(self, dims):
         if dims == "pp":
