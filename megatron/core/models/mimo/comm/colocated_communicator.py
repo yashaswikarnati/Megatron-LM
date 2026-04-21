@@ -136,14 +136,6 @@ class ColocatedBridgeCommunicator:
                 f"src={self.src_grid.rank_offset}, dest={self.dest_grid.rank_offset}"
             )
 
-        # Src (encoder) must be PP=1: encode_and_communicate runs on every
-        # rank synchronously and its collectives assume no PP staggering.
-        # Dest (LLM) PP>1 is allowed: the three-phase colocated schedule
-        # handles PP orchestration, and ranks sharing (llm_dp, llm_tp)
-        # across PP stages consume the same encoder slice — fan-in gather
-        # groups keyed by src (PP=1) position place each rank into exactly
-        # one group regardless of its llm_pp index, and the EQUAL path
-        # performs no collective at all.
         if 'pp' in self.src_grid.dim_names:
             src_pp = self.src_grid.shape[self.src_grid.dim_names.index('pp')]
             if src_pp != 1:
