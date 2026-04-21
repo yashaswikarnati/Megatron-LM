@@ -340,7 +340,11 @@ def get_mimo_model(
         module_to_grid_map=module_to_grid_map,
     )
 
-    mimo_model = MimoModel(mimo_config)
+    # Forward language_pg.cp/tp so PartitionAdapter binds to the test's CP
+    # group directly. Test grids skip parallel_state.initialize_model_parallel,
+    # so leaving these None routes through the uninitialised global and trips
+    # 'context parallel group is not initialized' under CP>1.
+    mimo_model = MimoModel(mimo_config, cp_group=language_pg.cp, tp_group=language_pg.tp)
     mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
 
     # Wrap with DDP (caller may override e.g. for heterogeneous-DP scaling).

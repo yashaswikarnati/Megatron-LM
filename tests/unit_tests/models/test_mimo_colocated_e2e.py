@@ -61,20 +61,25 @@ from tests.unit_tests.test_utilities import Utils
 logger = logging.getLogger(__name__)
 
 
-def loss_func(loss_mask, llm_dp_pg, output_tensor):
-    """Global-mean CE across the LLM DP group via all-reduced ``(num, den)``.
+def loss_func(loss_mask, llm_dp_cp_pg, output_tensor):
+    """Global-mean CE across the LLM DP*CP group via all-reduced ``(num, den)``.
 
     ``output_tensor`` is the per-token CE from
     ``GPTModel.compute_language_model_loss`` with shape ``[b, s]`` (the
     "actual Megatron cross entropy"). Masking ignored tokens, all-reducing
-    numerator and valid-token count across the LLM DP group, and dividing
-    is the exact distributed equivalent of full-batch
+    numerator and valid-token count across the LLM DP*CP group, and
+    dividing is the exact distributed equivalent of full-batch
     ``F.cross_entropy(..., reduction='mean')``.
 
-    The all-reduce is scoped to the **LLM DP group only** — never the
-    full dp*tp group. All TP ranks within a DP replica already hold the
-    identical per-token loss (since the LLM's output is TP-replicated),
-    so summing over TP peers would double-count.
+    The all-reduce is scoped to ``dp * cp`` — never the full dp*cp*tp
+    group. All TP ranks within a (dp, cp) slot already hold the identical
+    per-token loss (the LLM's output is TP-replicated), so summing over
+    TP peers would double-count. CP ranks, however, hold *disjoint*
+    sequence chunks of the same batch, so summing over CP is mandatory
+    for the per-token grad factor to equal ``1 / global_den`` — without
+    it, CP>1 under-counts tokens and every encoder gradient is scaled
+    by ``cp_size``. When ``cp == 1`` this PG is equivalent to the DP
+    group, so existing CP=1 tests are unaffected.
     """
     if output_tensor is None:
         return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
@@ -82,8 +87,8 @@ def loss_func(loss_mask, llm_dp_pg, output_tensor):
     masked = output_tensor.float() * loss_mask.float()
     local_num = masked.sum()
     local_den = loss_mask.float().sum()
-    dist.all_reduce(local_num, group=llm_dp_pg)
-    dist.all_reduce(local_den, group=llm_dp_pg)
+    dist.all_reduce(local_num, group=llm_dp_cp_pg)
+    dist.all_reduce(local_den, group=llm_dp_cp_pg)
     # clamp_min(1.0) guards against the pathological "all tokens masked"
     # batch. In normal training local_den > 0 on every rank, but a CE loss
     # that divides by zero crashes the entire step; better to return 0.
@@ -94,11 +99,13 @@ def loss_func(loss_mask, llm_dp_pg, output_tensor):
 def forward_step(data_iterator, model, encoder_grid, llm_grid, encoder_name):
     """Forward step with data slicing for heterogeneous DP."""
     batch = next(data_iterator) if data_iterator is not None else {'input_ids': None}
-    llm_dp_pg = llm_grid.get_pg("dp")
+    # Reduce the (num, den) loss statistics over dp*cp so CP>1 does not
+    # under-count tokens. Equivalent to the plain dp group when cp=1.
+    llm_dp_cp_pg = llm_grid.get_pg(["dp", "cp"])
 
     if batch.get('input_ids') is None:
         output_tensor, loss_mask = model(**batch)
-        return output_tensor, partial(loss_func, loss_mask, llm_dp_pg)
+        return output_tensor, partial(loss_func, loss_mask, llm_dp_cp_pg)
 
     encoder_dp = encoder_grid.get_pg("dp").size()
     llm_dp = llm_grid.get_pg("dp").size()
@@ -135,7 +142,7 @@ def forward_step(data_iterator, model, encoder_grid, llm_grid, encoder_name):
                 batch[key] = batch[key][start : start + slice_size].contiguous()
 
     output_tensor, loss_mask = model(**batch)
-    return output_tensor, partial(loss_func, loss_mask, llm_dp_pg)
+    return output_tensor, partial(loss_func, loss_mask, llm_dp_cp_pg)
 
 
 def run_colocated_test(
@@ -143,6 +150,7 @@ def run_colocated_test(
     encoder_dp,
     llm_tp,
     llm_dp,
+    llm_cp=1,
     hidden_size=256,
     num_layers=2,
     vocab_size=1000,
@@ -158,9 +166,10 @@ def run_colocated_test(
 
     encoder_name = "images"
 
-    # Both grids at offset=0 (colocated on same ranks)
+    # Both grids at offset=0 (colocated on same ranks). Encoder stays CP=1;
+    # LLM CP follows the parameter so tests can exercise the CP>1 backward.
     encoder_grid = create_hypercomm_grid(offset=0, tp=encoder_tp, cp=1, pp=1, dp=encoder_dp)
-    llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, cp=1, pp=1, dp=llm_dp)
+    llm_grid = create_hypercomm_grid(offset=0, tp=llm_tp, cp=llm_cp, pp=1, dp=llm_dp)
 
     # dist.new_group is a collective — create all embedding PGs up front.
     create_all_embedding_groups([encoder_grid, llm_grid])
@@ -409,4 +418,54 @@ class TestMimoColocatedE2E:
             seq_length=64,
             micro_batch_size=2,
             num_microbatches=4,
+        )
+
+    def test_colocated_fan_in_cp2_8gpu(self):
+        """Encoder TP2/DP4, LLM TP2/DP2/CP2 — fan-in with dest CP=2.
+
+        Exercises the real PartitionAdapter.shard path: the LLM's
+        context_parallel_size=2 config drives sequence sharding via
+        index_select, whose backward is zero-pad. The bridge communicator's
+        backward must therefore intra-CP all_reduce to return a full-sequence
+        gradient to the encoder — covered by this end-to-end path.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        run_colocated_test(
+            encoder_tp=2,
+            encoder_dp=4,
+            llm_tp=2,
+            llm_dp=2,
+            llm_cp=2,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            # seq_length must be divisible by 2*cp=4 (PartitionAdapter
+            # causal-load-balancing splits sequence into 2*cp chunks).
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=2,
+        )
+
+    def test_colocated_fan_out_cp2_8gpu(self):
+        """Encoder TP4/DP2, LLM TP1/DP4/CP2 — fan-out with dest CP=2.
+
+        Complements the fan-in CP test: exercises the per-CP-level fan-out
+        gather groups and the backward CP reduction for the narrow-adjoint
+        path.
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        run_colocated_test(
+            encoder_tp=4,
+            encoder_dp=2,
+            llm_tp=1,
+            llm_dp=4,
+            llm_cp=2,
+            hidden_size=256,
+            num_layers=2,
+            vocab_size=1000,
+            seq_length=64,
+            micro_batch_size=4,
+            num_microbatches=2,
         )
