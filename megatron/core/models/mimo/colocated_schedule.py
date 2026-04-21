@@ -78,14 +78,30 @@ def colocated_forward_backward_with_pp(
         )
         return output_tensor, partial(_loss_func, cached['loss_mask'])
 
-    losses = schedules.forward_backward_pipelining_without_interleaving(
-        forward_step_func=_lm_forward_step,
-        data_iterator=cache_iter,
-        model=[mimo_model],
-        num_microbatches=num_microbatches,
-        forward_only=forward_only,
-        **schedule_kwargs,
-    )
+    # Defer finalize until AFTER Phase 3. The inner PP schedule would call
+    # ``config.finalize_model_grads_func`` at end-of-schedule, which runs
+    # DDP ``finish_grad_sync`` on both the LLM and the encoder. At that
+    # point the encoder has zero grads (Phase 3 has not run yet), so its
+    # DP all-reduce operates on zeros and the Phase 3 grads that follow
+    # are never synced — ``finish_grad_sync`` is not safe to call twice
+    # (it asserts on the outstanding async handle and has no idempotency
+    # guarantee). We swap in a no-op so the schedule proceeds normally,
+    # then invoke the original finalize once after Phase 3 so the single
+    # DP reduction covers both the LLM grads from Phase 2 and the encoder
+    # grads from Phase 3.
+    original_finalize = mimo_model.config.finalize_model_grads_func
+    mimo_model.config.finalize_model_grads_func = _noop_finalize
+    try:
+        losses = schedules.forward_backward_pipelining_without_interleaving(
+            forward_step_func=_lm_forward_step,
+            data_iterator=cache_iter,
+            model=[mimo_model],
+            num_microbatches=num_microbatches,
+            forward_only=forward_only,
+            **schedule_kwargs,
+        )
+    finally:
+        mimo_model.config.finalize_model_grads_func = original_finalize
 
     # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────────
     # detached_full.grad was populated by Phase 2's per-microbatch LLM backward
@@ -97,6 +113,18 @@ def colocated_forward_backward_with_pp(
             grad = detached_full[key].grad
             if grad is not None:
                 torch.autograd.backward(enc_out[key], grad_tensors=grad)
+
+    # Single post-Phase-3 finalize: reduces LLM grads (from Phase 2) and
+    # encoder grads (from Phase 3) together. Without this call, encoder
+    # grads remain local to each rank and Adam steps on un-reduced grads,
+    # causing silent divergence from the equal-DP reference.
+    if not forward_only and original_finalize is not None:
+        original_finalize(
+            [mimo_model],
+            None,
+            pg_collection=schedule_kwargs.get('pg_collection'),
+            force_all_reduce=False,
+        )
 
     return losses
 
@@ -213,3 +241,12 @@ def _loss_func(loss_mask, output_tensor):
         return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
     loss = output_tensor.float().sum()
     return loss, {'loss_reduced': loss.detach().item()}
+
+
+def _noop_finalize(*args, **kwargs):
+    """Placeholder used to suppress the inner PP schedule's finalize call.
+
+    The three-phase schedule needs to defer grad finalization until after
+    Phase 3 runs the encoder backward. See ``colocated_forward_backward_with_pp``.
+    """
+    return None
