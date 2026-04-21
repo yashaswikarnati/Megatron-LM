@@ -592,27 +592,7 @@ class MimoModel(MegatronModule):
             # reuse the precomputed embeddings for every LLM microbatch.
             modality_embeddings = encoder_embeddings
         else:
-            # 1. Process each modality to get embeddings
-            modality_embeddings = {}
-
-            for modality_name, submodule in self.modality_submodules.items():
-                if (
-                    modality_inputs
-                    and modality_name in modality_inputs
-                    and modality_inputs[modality_name] is not None
-                ):
-                    logger.debug(f"Processing {modality_name} modality")
-                    embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
-                    if embeddings is not None:
-                        modality_embeddings[modality_name] = embeddings
-                        logger.debug(
-                            f"Generated embeddings for {modality_name} with shape "
-                            f"{embeddings.shape}"
-                        )
-
-            # Apply colocated communication if configured (no-op when colocated_comms is empty)
-            if self.colocated_comms:
-                modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+            modality_embeddings = self.encode_and_communicate(modality_inputs)
 
         # Get text embeddings
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
