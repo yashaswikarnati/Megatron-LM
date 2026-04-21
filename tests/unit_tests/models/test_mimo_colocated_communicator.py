@@ -238,11 +238,12 @@ class TestValidateGrids:
         with pytest.raises(ValueError, match="src PP must be 1"):
             make_comm(src_grid, dest_grid)
 
-    def test_dest_pp_gt_one_rejected(self):
+    def test_dest_pp_gt_one_accepted(self):
+        # Dest PP>1 is valid: the three-phase colocated schedule handles
+        # the LLM pipeline orchestration. The bridge only needs src PP=1.
         src_grid = create_hypercomm_grid(tp=4, dp=2)
         dest_grid = create_hypercomm_grid(tp=2, pp=2, dp=2)
-        with pytest.raises(ValueError, match="dest PP must be 1"):
-            make_comm(src_grid, dest_grid)
+        make_comm(src_grid, dest_grid)
 
     def test_cp_gt_one_rejected(self):
         src_grid = create_hypercomm_grid(tp=2, cp=2, dp=2)

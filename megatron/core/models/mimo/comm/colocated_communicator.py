@@ -136,13 +136,20 @@ class ColocatedBridgeCommunicator:
                 f"src={self.src_grid.rank_offset}, dest={self.dest_grid.rank_offset}"
             )
 
-        for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
-            if 'pp' in grid.dim_names:
-                pp_size = grid.shape[grid.dim_names.index('pp')]
-                if pp_size != 1:
-                    raise ValueError(
-                        f"{name} PP must be 1 for ColocatedBridgeCommunicator, got {pp_size}"
-                    )
+        # Src (encoder) must be PP=1: encode_and_communicate runs on every
+        # rank synchronously and its collectives assume no PP staggering.
+        # Dest (LLM) PP>1 is allowed: the three-phase colocated schedule
+        # handles PP orchestration, and ranks sharing (llm_dp, llm_tp)
+        # across PP stages consume the same encoder slice — fan-in gather
+        # groups keyed by src (PP=1) position place each rank into exactly
+        # one group regardless of its llm_pp index, and the EQUAL path
+        # performs no collective at all.
+        if 'pp' in self.src_grid.dim_names:
+            src_pp = self.src_grid.shape[self.src_grid.dim_names.index('pp')]
+            if src_pp != 1:
+                raise ValueError(
+                    f"src PP must be 1 for ColocatedBridgeCommunicator, got {src_pp}"
+                )
 
         # CP>1 corrupts dp_idx when we iterate get_rank_enum(['tp']) groups.
         for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
