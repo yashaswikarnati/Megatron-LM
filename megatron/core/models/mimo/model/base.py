@@ -68,25 +68,13 @@ class MimoModel(MegatronModule):
             # in TP/DP within those ranks.
             self._build_colocated_communicators()
 
-        # Detect LLM PP>1 for three-phase colocated execution
-        self.lm_has_pp = False
-        self.lm_is_first_pp_stage = True
-        if mimo_config.module_to_grid_map:
-            lang_grid = mimo_config.module_to_grid_map.get(MIMO_LANGUAGE_MODULE_KEY)
-            if lang_grid and 'pp' in lang_grid.dim_names:
-                pp_idx = lang_grid.dim_names.index('pp')
-                if lang_grid.shape[pp_idx] > 1:
-                    self.lm_has_pp = True
-                    pp_group = lang_grid.get_pg('pp')
-                    pp_rank = pp_group.rank()
-                    pp_size = pp_group.size()
-                    self.lm_is_first_pp_stage = pp_rank == 0
-                    # Update language module stage info for PP>1
-                    from megatron.core.models.mimo.config.role import ModuleStageInfo
-
-                    self.role.modules[MIMO_LANGUAGE_MODULE_KEY] = ModuleStageInfo(
-                        is_first_stage=(pp_rank == 0), is_last_stage=(pp_rank == pp_size - 1)
-                    )
+        # LLM PP>1 is already reflected in self.role; expose convenience flags
+        # for the three-phase colocated schedule.
+        lang_info = self.role.modules.get(MIMO_LANGUAGE_MODULE_KEY)
+        self.lm_has_pp = lang_info is not None and not (
+            lang_info.is_first_stage and lang_info.is_last_stage
+        )
+        self.lm_is_first_pp_stage = lang_info is None or lang_info.is_first_stage
 
         # Use special token IDs from the config
         self.special_token_ids = (
