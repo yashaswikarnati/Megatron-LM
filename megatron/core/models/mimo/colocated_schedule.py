@@ -78,17 +78,9 @@ def colocated_forward_backward_with_pp(
         )
         return output_tensor, partial(_loss_func, cached['loss_mask'])
 
-    # Defer finalize until AFTER Phase 3. The inner PP schedule would call
-    # ``config.finalize_model_grads_func`` at end-of-schedule, which runs
-    # DDP ``finish_grad_sync`` on both the LLM and the encoder. At that
-    # point the encoder has zero grads (Phase 3 has not run yet), so its
-    # DP all-reduce operates on zeros and the Phase 3 grads that follow
-    # are never synced — ``finish_grad_sync`` is not safe to call twice
-    # (it asserts on the outstanding async handle and has no idempotency
-    # guarantee). We swap in a no-op so the schedule proceeds normally,
-    # then invoke the original finalize once after Phase 3 so the single
-    # DP reduction covers both the LLM grads from Phase 2 and the encoder
-    # grads from Phase 3.
+    # Swap in a no-op finalize so the inner PP schedule does not run DDP
+    # grad sync before Phase 3 has produced encoder grads. We invoke the
+    # original finalize once after Phase 3 (see below).
     original_finalize = mimo_model.config.finalize_model_grads_func
     mimo_model.config.finalize_model_grads_func = _noop_finalize
     try:
