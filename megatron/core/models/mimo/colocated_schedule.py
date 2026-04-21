@@ -13,6 +13,7 @@ separates encoder (synchronized) from LLM (pipelined) by detaching the autograd
 graph at the encoder-LLM boundary.
 """
 
+from contextlib import contextmanager
 from functools import partial
 from typing import Optional
 
@@ -81,9 +82,7 @@ def colocated_forward_backward_with_pp(
     # Swap in a no-op finalize so the inner PP schedule does not run DDP
     # grad sync before Phase 3 has produced encoder grads. We invoke the
     # original finalize once after Phase 3 (see below).
-    original_finalize = mimo_model.config.finalize_model_grads_func
-    mimo_model.config.finalize_model_grads_func = _noop_finalize
-    try:
+    with _deferred_finalize(mimo_model.config) as original_finalize:
         losses = schedules.forward_backward_pipelining_without_interleaving(
             forward_step_func=_lm_forward_step,
             data_iterator=cache_iter,
@@ -92,8 +91,6 @@ def colocated_forward_backward_with_pp(
             forward_only=forward_only,
             **schedule_kwargs,
         )
-    finally:
-        mimo_model.config.finalize_model_grads_func = original_finalize
 
     # ── Phase 3: Encoder backward (one pass, all ranks sync) ────────────
     # detached_full.grad was populated by Phase 2's per-microbatch LLM backward
@@ -242,3 +239,16 @@ def _noop_finalize(*args, **kwargs):
     Phase 3 runs the encoder backward. See ``colocated_forward_backward_with_pp``.
     """
     return None
+
+
+@contextmanager
+def _deferred_finalize(config):
+    """Suppress the PP schedule's end-of-run DDP grad sync; yield the
+    original so callers can invoke it once after Phase 3.
+    """
+    original = config.finalize_model_grads_func
+    config.finalize_model_grads_func = _noop_finalize
+    try:
+        yield original
+    finally:
+        config.finalize_model_grads_func = original
