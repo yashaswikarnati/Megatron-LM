@@ -128,8 +128,9 @@ class ColocatedBridgeCommunicator:
                 f"src={self.src_grid.rank_offset}, dest={self.dest_grid.rank_offset}"
             )
 
-        # Per-grid dim checks: tp/dp required; pp and cp (if present) must be 1.
-        # CP>1 also corrupts dp_idx when iterating get_rank_enum(['tp']) groups.
+        # Per-grid dim checks: tp/dp required; cp (if present) must be 1.
+        # Src PP must be 1; dest PP>1 is allowed. CP>1 corrupts dp_idx when
+        # iterating get_rank_enum(['tp']) groups.
         for name, grid in [("src", self.src_grid), ("dest", self.dest_grid)]:
             for required in ('tp', 'dp'):
                 if required not in grid.dim_names:
@@ -137,14 +138,18 @@ class ColocatedBridgeCommunicator:
                         f"{name} grid must have '{required}' dimension, "
                         f"got dim_names={grid.dim_names}"
                     )
-            for singleton in ('pp', 'cp'):
-                if singleton in grid.dim_names:
-                    size = grid.shape[grid.dim_names.index(singleton)]
-                    if size != 1:
-                        raise ValueError(
-                            f"{name} {singleton.upper()} must be 1 for "
-                            f"ColocatedBridgeCommunicator, got {size}"
-                        )
+            if 'cp' in grid.dim_names:
+                cp_size = grid.shape[grid.dim_names.index('cp')]
+                if cp_size != 1:
+                    raise ValueError(
+                        f"{name} CP must be 1 for ColocatedBridgeCommunicator, got {cp_size}"
+                    )
+        if 'pp' in self.src_grid.dim_names:
+            src_pp = self.src_grid.shape[self.src_grid.dim_names.index('pp')]
+            if src_pp != 1:
+                raise ValueError(
+                    f"src PP must be 1 for ColocatedBridgeCommunicator, got {src_pp}"
+                )
 
         src_dp = self.src_grid.shape[self.src_grid.dim_names.index('dp')]
         dest_dp = self.dest_grid.shape[self.dest_grid.dim_names.index('dp')]
