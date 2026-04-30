@@ -178,6 +178,10 @@ class PartitionAdapter:
             )
 
         if self.cfg.seq_parallel and embeddings is not None:
+            if self.cfg.use_cp:
+                # After CP split, embeddings are [B, S/CP, H]. SP scatter splits dim 0,
+                # so transpose to seq-first [S/CP, B, H] before scatter.
+                embeddings = embeddings.transpose(0, 1).contiguous()
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
                 embeddings, group=self.cfg.tp_group
             )
@@ -237,7 +241,7 @@ class PartitionAdapter:
             batch["attention_mask"] = attention_mask
 
         if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd':
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(batch, cp_group=self.cfg.cp_group)
         else:
             assert _HAVE_TEX and is_te_min_version("1.10.0"), (
                 "Please update Transformer Engine to >= 1.10 "

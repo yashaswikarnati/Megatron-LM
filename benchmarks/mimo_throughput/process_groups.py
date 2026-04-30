@@ -27,10 +27,10 @@ class ProcessGroupManager:
         self._grids: List[HyperCommGrid] = []
         self._embedding_pg_cache: dict = {}
 
-    def create_grid(self, tp: int, dp: int, pp: int = 1, offset: int = 0) -> HyperCommGrid:
+    def create_grid(self, tp: int, dp: int, pp: int = 1, cp: int = 1, offset: int = 0) -> HyperCommGrid:
         """Create a HyperCommGrid with specified parallelism.
 
-        Grid shape: [tp, cp=1, pp, dp, ep=1, expt_dp=1]
+        Grid shape: [tp, cp, pp, dp, ep=1, expt_dp=1]
 
         Creates ALL PGs needed by DDP, optimizer, and schedule:
         - Core: tp, cp, pp, dp
@@ -41,13 +41,14 @@ class ProcessGroupManager:
             tp: Tensor parallel degree.
             dp: Data parallel degree.
             pp: Pipeline parallel degree (default 1).
+            cp: Context parallel degree (default 1).
             offset: Rank offset for the grid (default 0).
 
         Returns:
             Configured HyperCommGrid with all required PGs created.
         """
         grid = HyperCommGrid(
-            shape=[tp, 1, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
+            shape=[tp, cp, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
             dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
             rank_offset=offset,
             backend="nccl",

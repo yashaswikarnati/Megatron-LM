@@ -550,6 +550,16 @@ class MimoModel(MegatronModule):
             # Non-first stage: receive hidden states from previous LM stage
             hidden_states = input_tensors.get(lang_name) if input_tensors else None
 
+            # CP-split labels: first PP stage handles this in _forward_all_modules
+            # via partition_adapter.shard(), but non-first stages bypass that path.
+            if self.partition_adapter is not None and labels is not None:
+                _, labels, _, _, _ = self.partition_adapter.shard(
+                    embeddings=None,
+                    labels=labels,
+                    loss_mask=None,
+                    attention_mask=None,
+                )
+
             # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
             if hidden_states is not None:
                 underlying_lm = unwrap_model(self.language_model)
@@ -728,7 +738,12 @@ class MimoModel(MegatronModule):
                 )
             )
 
-            if not sp_only and combined_embeddings is not None:
+            cp_and_sp = (
+                self.partition_adapter is not None
+                and self.partition_adapter.cfg.use_cp
+                and self.partition_adapter.cfg.seq_parallel
+            )
+            if not sp_only and not cp_and_sp and combined_embeddings is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
         # 5. Forward pass through language model

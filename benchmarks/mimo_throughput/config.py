@@ -24,11 +24,11 @@ class ParallelSpec:
     tp: int = 1
     dp: int = 1
     pp: int = 1  # encoder always 1, LLM can be >1
-    # CP=1 always for now
+    cp: int = 1
 
     @property
     def world_size(self) -> int:
-        return self.tp * self.dp * self.pp
+        return self.tp * self.dp * self.pp * self.cp
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,13 @@ class BenchmarkConfig:
         # Encoder must be PP=1
         assert self.encoder_parallel.pp == 1, "Encoder must have PP=1"
 
+        # Colocated: encoder CP must be 1 (bridge communicator doesn't support enc_cp>1)
+        # Homo: encoder CP must match LLM CP (parallel_state forces same CP on both)
+        if self.pp_mode == "colocated":
+            assert self.encoder_parallel.cp == 1, (
+                "Colocated mode requires encoder CP=1 (bridge communicator limitation)"
+            )
+
         # Encoder offload requires colocated mode with LLM PP > 1
         if self.encoder_offload:
             assert self.pp_mode == "colocated" and self.llm_parallel.pp > 1, (
@@ -132,13 +139,17 @@ class BenchmarkConfig:
                 f"Homo mode requires encoder DP ({self.encoder_parallel.dp}) "
                 f"== LLM DP ({self.llm_parallel.dp})"
             )
+            assert self.encoder_parallel.cp == self.llm_parallel.cp, (
+                f"Homo mode requires encoder CP ({self.encoder_parallel.cp}) "
+                f"== LLM CP ({self.llm_parallel.cp})"
+            )
         else:
-            # Colocated: all GPUs accounted for: encoder TP*DP == LLM TP*DP*PP
+            # Colocated: all GPUs accounted for: encoder world_size == LLM world_size
             assert (
-                self.encoder_parallel.tp * self.encoder_parallel.dp
+                self.encoder_parallel.world_size
                 == self.llm_parallel.world_size
             ), (
-                f"Encoder world_size ({self.encoder_parallel.tp * self.encoder_parallel.dp}) "
+                f"Encoder world_size ({self.encoder_parallel.world_size}) "
                 f"!= LLM world_size ({self.llm_parallel.world_size})"
             )
 
@@ -172,6 +183,18 @@ class BenchmarkConfig:
             f"num_images({self.data.num_images_per_sample}) * enc_seq({self.encoder_arch.seq_length})"
             f" = {total_image_tokens} exceeds llm_seq({self.llm_arch.seq_length})"
         )
+
+        # CP: world_size must be divisible by CP
+        cp = self.llm_parallel.cp
+        if cp > 1:
+            ws = self.llm_parallel.world_size
+            assert ws % cp == 0, (
+                f"LLM world_size ({ws}) must be divisible by CP ({cp})"
+            )
+            # LLM seq_length must be divisible by CP
+            assert self.llm_arch.seq_length % cp == 0, (
+                f"LLM seq_length ({self.llm_arch.seq_length}) must be divisible by CP ({cp})"
+            )
 
         # Fan-in: encoder batch must be divisible by scale (enc_dp // llm_dp).
         # At PP=1, forward_step processes one microbatch at a time → check per-mb.

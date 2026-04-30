@@ -191,13 +191,17 @@ class PerformanceMonitor:
                 'encoder_parallel': {
                     'tp': self.config.encoder_parallel.tp,
                     'dp': self.config.encoder_parallel.dp,
+                    'cp': self.config.encoder_parallel.cp,
                     'pp': self.config.encoder_parallel.pp,
                 },
                 'llm_parallel': {
                     'tp': self.config.llm_parallel.tp,
                     'dp': self.config.llm_parallel.dp,
+                    'cp': self.config.llm_parallel.cp,
                     'pp': self.config.llm_parallel.pp,
                 },
+                'sequence_parallel': self.config.sequence_parallel,
+                'pp_mode': self.config.pp_mode,
                 'data': {
                     'micro_batch_size': self.config.data.micro_batch_size,
                     'num_microbatches': self.config.data.num_microbatches,

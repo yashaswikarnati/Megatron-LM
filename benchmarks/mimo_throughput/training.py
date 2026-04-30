@@ -69,7 +69,7 @@ ENCODER_NAME = "images"
 # ---------------------------------------------------------------------------
 
 
-def _get_language_model_spec(arch, pg_collection, sequence_parallel=False, timers=None):
+def _get_language_model_spec(arch, pg_collection, sequence_parallel=False, timers=None, cp_size=1):
     """Build ModuleSpec for the GPT language model."""
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
@@ -84,6 +84,7 @@ def _get_language_model_spec(arch, pg_collection, sequence_parallel=False, timer
         moe_token_dispatcher_type='alltoall',
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
+        context_parallel_size=cp_size,
         pipeline_dtype=torch.bfloat16,
         bf16=True,
         cross_entropy_loss_fusion=True,
@@ -211,11 +212,9 @@ def _init_sequence_parallel(llm_pg, config, lp, ep):
                 initialize_ub,
             )
 
-            effective_mbs = config.data.micro_batch_size
-            if lp.dp > ep.dp:
-                effective_mbs = config.data.micro_batch_size * (lp.dp // ep.dp)
+            cp_size = config.llm_parallel.cp
             initialize_ub(
-                shape=[config.llm_arch.seq_length * effective_mbs, config.llm_arch.hidden_size],
+                shape=[config.llm_arch.seq_length // cp_size * config.data.micro_batch_size, config.llm_arch.hidden_size],
                 tp_size=lp.tp,
                 quantization_modes=[UserBufferQuantizationMode.NONE],
                 ub_cfgs={},
@@ -247,8 +246,8 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
     ep = config.encoder_parallel
     lp = config.llm_parallel
 
-    encoder_grid = pg_manager.create_grid(tp=ep.tp, dp=ep.dp, pp=ep.pp, offset=0)
-    llm_grid = pg_manager.create_grid(tp=lp.tp, dp=lp.dp, pp=lp.pp, offset=0)
+    encoder_grid = pg_manager.create_grid(tp=ep.tp, dp=ep.dp, pp=ep.pp, cp=ep.cp, offset=0)
+    llm_grid = pg_manager.create_grid(tp=lp.tp, dp=lp.dp, pp=lp.pp, cp=lp.cp, offset=0)
     pg_manager.create_embedding_groups([encoder_grid, llm_grid])
 
     torch.manual_seed(12345)
@@ -261,7 +260,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
         _init_sequence_parallel(llm_pg, config, lp, ep)
 
     language_model_spec = _get_language_model_spec(
-        config.llm_arch, llm_pg, sequence_parallel=use_sp, timers=timers,
+        config.llm_arch, llm_pg, sequence_parallel=use_sp, timers=timers, cp_size=lp.cp,
     )
     vision_submodule_spec = _get_vision_submodules_spec(
         config.encoder_arch,
@@ -291,7 +290,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
         encoder_offload=config.encoder_offload,
     )
 
-    mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp)
+    mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp, cp_group=llm_pg.cp)
     mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
     mimo_model.model_type = ModelType.encoder_or_decoder
 
@@ -404,6 +403,7 @@ def create_mimo_model_homo(config: BenchmarkConfig, timers=None):
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=lp.tp,
         pipeline_model_parallel_size=lp.pp,
+        context_parallel_size=lp.cp,
     )
 
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -433,7 +433,7 @@ def create_mimo_model_homo(config: BenchmarkConfig, timers=None):
                     initialize_ub,
                 )
                 initialize_ub(
-                    shape=[config.llm_arch.seq_length * config.data.micro_batch_size,
+                    shape=[config.llm_arch.seq_length // lp.cp * config.data.micro_batch_size,
                            config.llm_arch.hidden_size],
                     tp_size=lp.tp,
                     quantization_modes=[UserBufferQuantizationMode.NONE],
@@ -454,6 +454,7 @@ def create_mimo_model_homo(config: BenchmarkConfig, timers=None):
         moe_token_dispatcher_type='alltoall',
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
+        context_parallel_size=lp.cp,
         pipeline_dtype=torch.bfloat16,
         bf16=True,
         cross_entropy_loss_fusion=True,
