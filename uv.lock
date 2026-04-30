@@ -2714,7 +2714,6 @@ no-pypi-wheels = [
 test = [
     { name = "coverage" },
     { name = "mock" },
-    { name = "nemo-run" },
     { name = "nltk" },
     { name = "pydantic" },
     { name = "pygithub" },
@@ -2825,7 +2824,6 @@ no-pypi-wheels = [
 test = [
     { name = "coverage" },
     { name = "mock" },
-    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=01a9a8ba360f7b2908728ad0516e0ad9d936966d" },
     { name = "nltk" },
     { name = "pydantic" },
     { name = "pygithub" },
@@ -3291,28 +3289,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/33/fa/7b45eef11b7971f0beb29d27b7bfe0d747d063aa29e170d9edd004733c8a/myst_parser-5.0.0.tar.gz", hash = "sha256:f6f231452c56e8baa662cc352c548158f6a16fcbd6e3800fc594978002b94f3a", size = 98535, upload-time = "2026-01-15T09:08:18.036Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d3/ac/686789b9145413f1a61878c407210e41bfdb097976864e0913078b24098c/myst_parser-5.0.0-py3-none-any.whl", hash = "sha256:ab31e516024918296e169139072b81592336f2fef55b8986aa31c9f04b5f7211", size = 84533, upload-time = "2026-01-15T09:08:16.788Z" },
-]
-
-[[package]]
-name = "nemo-run"
-version = "0.7.0rc0.dev0"
-source = { git = "https://github.com/NVIDIA-NeMo/Run.git?rev=01a9a8ba360f7b2908728ad0516e0ad9d936966d#01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
-dependencies = [
-    { name = "catalogue" },
-    { name = "cryptography" },
-    { name = "fabric" },
-    { name = "fiddle" },
-    { name = "inquirerpy" },
-    { name = "jinja2" },
-    { name = "leptonai" },
-    { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "omegaconf" },
-    { name = "packaging" },
-    { name = "rich" },
-    { name = "toml" },
-    { name = "torchx" },
-    { name = "typer" },
 ]
 
 [[package]]
