@@ -11,6 +11,7 @@ import statistics
 import time
 
 import torch
+import torch.distributed as dist
 
 from benchmarks.mimo_throughput.config import BenchmarkConfig
 
@@ -111,11 +112,23 @@ class PerformanceMonitor:
 
         cfg = self.config
         total_samples = cfg.global_batch_size  # mbs × llm_dp × nmb
+        mem_gb = torch.cuda.max_memory_allocated() / 1e9
+
+        if dist.is_available() and dist.is_initialized():
+            local = torch.tensor(
+                [elapsed, fwd_bwd_ms / 1000.0, opt_step_ms / 1000.0, mem_gb],
+                device='cuda',
+                dtype=torch.float64,
+            )
+            dist.all_reduce(local, op=dist.ReduceOp.MAX)
+            elapsed = local[0].item()
+            fwd_bwd_ms = local[1].item() * 1000.0
+            opt_step_ms = local[2].item() * 1000.0
+            mem_gb = local[3].item()
 
         tflops_per_gpu = self.total_flops / (elapsed * 1e12 * self.world_size)
         tokens_per_sec = (total_samples * cfg.llm_arch.seq_length) / elapsed
         samples_per_sec = total_samples / elapsed
-        mem_gb = torch.cuda.max_memory_allocated() / 1e9
 
         metrics = {
             'iteration': len(self.history) + 1,
@@ -193,12 +206,34 @@ class PerformanceMonitor:
                     'dp': self.config.encoder_parallel.dp,
                     'cp': self.config.encoder_parallel.cp,
                     'pp': self.config.encoder_parallel.pp,
+                    'offset': self.config.encoder_parallel.offset,
                 },
                 'llm_parallel': {
                     'tp': self.config.llm_parallel.tp,
                     'dp': self.config.llm_parallel.dp,
                     'cp': self.config.llm_parallel.cp,
                     'pp': self.config.llm_parallel.pp,
+                    'offset': self.config.llm_parallel.offset,
+                },
+                'placement': {
+                    'encoder': {
+                        'offset': self.config.encoder_parallel.offset,
+                        'world_size': self.config.encoder_parallel.world_size,
+                        'range': [
+                            self.config.encoder_parallel.offset,
+                            self.config.encoder_parallel.offset
+                            + self.config.encoder_parallel.world_size,
+                        ],
+                    },
+                    'llm': {
+                        'offset': self.config.llm_parallel.offset,
+                        'world_size': self.config.llm_parallel.world_size,
+                        'range': [
+                            self.config.llm_parallel.offset,
+                            self.config.llm_parallel.offset
+                            + self.config.llm_parallel.world_size,
+                        ],
+                    },
                 },
                 'sequence_parallel': self.config.sequence_parallel,
                 'pp_mode': self.config.pp_mode,

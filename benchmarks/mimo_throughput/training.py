@@ -38,14 +38,22 @@ from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.pipeline_parallel.multimodule_communicator import (
+    MultiModulePipelineCommunicator,
+)
 from megatron.core.timers import Timers
+from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from benchmarks.mimo_throughput.config import BenchmarkConfig
-from benchmarks.mimo_throughput.data import SyntheticVLMIterator
+from benchmarks.mimo_throughput.data import (
+    SyntheticVLMIterator,
+    compute_non_colocated_encoder_batch_size,
+    get_non_colocated_data_ownership,
+)
 from benchmarks.mimo_throughput.metrics import PerformanceMonitor
 from benchmarks.mimo_throughput.process_groups import ProcessGroupManager
 
@@ -69,11 +77,44 @@ ENCODER_NAME = "images"
 # ---------------------------------------------------------------------------
 
 
-def _get_language_model_spec(arch, pg_collection, sequence_parallel=False, timers=None, cp_size=1):
+def _safe_group_rank(group, default=0):
+    """Return this rank's group rank, or a default for non-member ranks."""
+    if group is None:
+        return default
+    try:
+        rank = dist.get_rank(group)
+    except (RuntimeError, ValueError):
+        return default
+    return default if rank < 0 else rank
+
+
+def _safe_group_size(group, default=1):
+    """Return process group size, or a default for non-member ranks."""
+    if group is None:
+        return default
+    try:
+        size = dist.get_world_size(group)
+    except (RuntimeError, ValueError):
+        return default
+    return default if size < 0 else size
+
+
+def _get_language_model_spec(
+    arch,
+    pg_collection,
+    sequence_parallel=False,
+    timers=None,
+    cp_size=1,
+    pp_rank=None,
+    pp_size=None,
+    tp_size=None,
+):
     """Build ModuleSpec for the GPT language model."""
-    pp_rank = dist.get_rank(pg_collection.pp)
-    pp_size = dist.get_world_size(pg_collection.pp)
-    tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
+    pp_rank = _safe_group_rank(pg_collection.pp) if pp_rank is None else pp_rank
+    pp_size = _safe_group_size(pg_collection.pp) if pp_size is None else pp_size
+    tp_size = pg_collection.tp.size() if tp_size is None and pg_collection.tp is not None else (
+        tp_size or 1
+    )
 
     lm_config = TransformerConfig(
         num_layers=arch.num_layers,
@@ -114,11 +155,13 @@ def _get_language_model_spec(arch, pg_collection, sequence_parallel=False, timer
     return ModuleSpec(module=GPTModel, params=gpt_params)
 
 
-def _get_vision_submodules_spec(arch, language_hidden_size, pg_collection):
+def _get_vision_submodules_spec(arch, language_hidden_size, pg_collection, tp_size=None):
     """Build ModuleSpec for the vision encoder + projection."""
     from megatron.core.transformer.transformer_block import TransformerBlock
 
-    tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
+    tp_size = pg_collection.tp.size() if tp_size is None and pg_collection.tp is not None else (
+        tp_size or 1
+    )
 
     vision_config = TransformerConfig(
         num_layers=arch.num_layers,
@@ -196,8 +239,35 @@ def _setup_encoder_dist_opt_groups(encoder_grid, encoder_pg, num_instances):
     encoder_pg.intra_dist_opt = intra_dist_opt_group
 
 
-def _init_sequence_parallel(llm_pg, config, lp, ep):
-    """Initialize RNG tracker, global memory buffer, and TE UB for sequence parallelism."""
+def _init_tp_comm_overlap_user_buffers(config, lp):
+    """Initialize TE user buffers for tensor-parallel communication overlap."""
+    if lp.tp <= 1:
+        return
+
+    try:
+        from transformer_engine.pytorch.module.base import (
+            UserBufferQuantizationMode,
+            initialize_ub,
+        )
+
+        cp_size = config.llm_parallel.cp
+        initialize_ub(
+            shape=[
+                config.llm_arch.seq_length // cp_size * config.data.micro_batch_size,
+                config.llm_arch.hidden_size,
+            ],
+            tp_size=lp.tp,
+            quantization_modes=[UserBufferQuantizationMode.NONE],
+            ub_cfgs={},
+            bootstrap_backend='nccl',
+        )
+    except Exception as e:
+        if dist.get_rank() == 0:
+            logger.warning(f"TE UB init failed (tp_comm_overlap disabled): {e}")
+
+
+def _init_sequence_parallel(llm_pg, config, lp, ep, initialize_tp_comm_overlap=True):
+    """Initialize RNG tracker, global memory buffer, and optionally TE UB for SP."""
     from megatron.core.parallel_state import _set_global_memory_buffer
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
@@ -205,24 +275,8 @@ def _init_sequence_parallel(llm_pg, config, lp, ep):
     model_parallel_cuda_manual_seed(seed=12345, tp_rank=llm_tp_rank, ep_rank=0, etp_rank=0)
     _set_global_memory_buffer()
 
-    if lp.tp > 1:
-        try:
-            from transformer_engine.pytorch.module.base import (
-                UserBufferQuantizationMode,
-                initialize_ub,
-            )
-
-            cp_size = config.llm_parallel.cp
-            initialize_ub(
-                shape=[config.llm_arch.seq_length // cp_size * config.data.micro_batch_size, config.llm_arch.hidden_size],
-                tp_size=lp.tp,
-                quantization_modes=[UserBufferQuantizationMode.NONE],
-                ub_cfgs={},
-                bootstrap_backend='nccl',
-            )
-        except Exception as e:
-            if dist.get_rank() == 0:
-                logger.warning(f"TE UB init failed (tp_comm_overlap disabled): {e}")
+    if initialize_tp_comm_overlap:
+        _init_tp_comm_overlap_user_buffers(config, lp)
 
 
 def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, timers=None):
@@ -256,16 +310,25 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
     llm_pg = pg_manager.get_pg_collection(llm_grid, is_language_model=True)
 
     use_sp = config.sequence_parallel
-    if use_sp:
+    use_sp_on_rank = use_sp and llm_grid.is_current_rank_in_grid()
+    if use_sp_on_rank:
         _init_sequence_parallel(llm_pg, config, lp, ep)
 
     language_model_spec = _get_language_model_spec(
-        config.llm_arch, llm_pg, sequence_parallel=use_sp, timers=timers, cp_size=lp.cp,
+        config.llm_arch,
+        llm_pg,
+        sequence_parallel=use_sp_on_rank,
+        timers=timers,
+        cp_size=lp.cp,
+        pp_rank=_safe_group_rank(llm_pg.pp),
+        pp_size=lp.pp,
+        tp_size=lp.tp,
     )
     vision_submodule_spec = _get_vision_submodules_spec(
         config.encoder_arch,
         language_hidden_size=config.llm_arch.hidden_size,
         pg_collection=encoder_pg,
+        tp_size=ep.tp,
     )
 
     # Build memory_config from benchmark MemorySpec
@@ -383,6 +446,193 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
         ctx['p2p_communicator'] = P2PCommunicator(
             pp_group=pp_group, config=mimo_model.config
         )
+
+    return mimo_model, ctx
+
+
+def create_mimo_model_non_colocated(
+    config: BenchmarkConfig, pg_manager: ProcessGroupManager, timers=None
+):
+    """Create a MIMO model for disjoint encoder and language rank ranges."""
+    # Clear NVTE env vars that may conflict with TE attention backend detection
+    os.environ.pop('NVTE_FLASH_ATTN', None)
+    os.environ.pop('NVTE_FUSED_ATTN', None)
+    os.environ.pop('NVTE_UNFUSED_ATTN', None)
+
+    ep = config.encoder_parallel
+    lp = config.llm_parallel
+
+    encoder_grid = pg_manager.create_grid(
+        tp=ep.tp, dp=ep.dp, pp=ep.pp, cp=ep.cp, offset=ep.offset
+    )
+    llm_grid = pg_manager.create_grid(
+        tp=lp.tp, dp=lp.dp, pp=lp.pp, cp=lp.cp, offset=lp.offset
+    )
+    pg_manager.create_embedding_groups([encoder_grid, llm_grid])
+
+    torch.manual_seed(12345)
+
+    encoder_pg = pg_manager.get_pg_collection(encoder_grid, is_language_model=False)
+    llm_pg = pg_manager.get_pg_collection(llm_grid, is_language_model=True)
+
+    use_sp = config.sequence_parallel
+    use_sp_on_rank = use_sp and llm_grid.is_current_rank_in_grid()
+    if use_sp:
+        _init_tp_comm_overlap_user_buffers(config, lp)
+    if use_sp_on_rank:
+        _init_sequence_parallel(
+            llm_pg,
+            config,
+            lp,
+            ep,
+            initialize_tp_comm_overlap=False,
+        )
+
+    language_model_spec = _get_language_model_spec(
+        config.llm_arch,
+        llm_pg,
+        sequence_parallel=use_sp_on_rank,
+        timers=timers,
+        cp_size=lp.cp,
+        pp_rank=_safe_group_rank(llm_pg.pp),
+        pp_size=lp.pp,
+        tp_size=lp.tp,
+    )
+    vision_submodule_spec = _get_vision_submodules_spec(
+        config.encoder_arch,
+        language_hidden_size=config.llm_arch.hidden_size,
+        pg_collection=encoder_pg,
+        tp_size=ep.tp,
+    )
+
+    memory_config = None
+    if config.memory is not None:
+        import dataclasses as _dc
+
+        memory_config = {}
+        if config.memory.encoder is not None:
+            memory_config[ENCODER_NAME] = ModuleMemoryConfig(**_dc.asdict(config.memory.encoder))
+        if config.memory.llm is not None:
+            memory_config[MIMO_LANGUAGE_MODULE_KEY] = ModuleMemoryConfig(
+                **_dc.asdict(config.memory.llm)
+            )
+
+    module_to_grid_map = {ENCODER_NAME: encoder_grid, MIMO_LANGUAGE_MODULE_KEY: llm_grid}
+    topology = {ENCODER_NAME: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []}
+
+    mimo_config = MimoModelConfig(
+        language_model_spec=language_model_spec,
+        modality_submodules_spec={ENCODER_NAME: vision_submodule_spec},
+        special_token_ids={ENCODER_NAME: config.data.image_token_id},
+        module_to_grid_map=module_to_grid_map,
+        memory_config=memory_config,
+    )
+
+    mimo_model = MimoModel(mimo_config, tp_group=llm_pg.tp, cp_group=llm_pg.cp)
+    mimo_model.to(torch.device("cuda")).to(torch.bfloat16)
+    mimo_model.model_type = ModelType.encoder_or_decoder
+
+    llm_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True, use_distributed_optimizer=True
+    )
+
+    encoder_num_instances = getattr(config, 'encoder_num_dist_opt_instances', 1)
+    encoder_use_dist_opt = getattr(config, 'encoder_use_distributed_optimizer', True)
+    encoder_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        bucket_size=200_000_000,
+        use_distributed_optimizer=encoder_use_dist_opt,
+        num_distributed_optimizer_instances=encoder_num_instances,
+    )
+
+    if encoder_num_instances > 1:
+        _setup_encoder_dist_opt_groups(encoder_grid, encoder_pg, encoder_num_instances)
+
+    if mimo_model.language_model is not None:
+        mimo_model.language_model = DistributedDataParallel(
+            config=mimo_model.language_model.config,
+            ddp_config=llm_ddp_config,
+            module=mimo_model.language_model,
+            pg_collection=llm_pg,
+        )
+
+    if ENCODER_NAME in mimo_model.modality_submodules:
+        submodule = mimo_model.modality_submodules[ENCODER_NAME]
+        if submodule is not None:
+            mimo_model.modality_submodules[ENCODER_NAME] = DistributedDataParallel(
+                config=submodule.encoders['clip_encoder'].config,
+                ddp_config=encoder_ddp_config,
+                module=submodule,
+                pg_collection=encoder_pg,
+            )
+
+    @contextmanager
+    def no_sync_func():
+        with ExitStack() as stack:
+            if mimo_model.language_model is not None:
+                stack.enter_context(mimo_model.language_model.no_sync())
+            for sub in mimo_model.modality_submodules.values():
+                if sub is not None:
+                    stack.enter_context(sub.no_sync())
+            yield
+
+    def finalize_grads_func(*args, force_all_reduce=False, **kwargs):
+        if mimo_model.language_model is not None:
+            finalize_model_grads(
+                [mimo_model.language_model],
+                num_tokens=None,
+                pg_collection=llm_pg,
+                force_all_reduce=force_all_reduce,
+            )
+        for sub in mimo_model.modality_submodules.values():
+            if sub is not None:
+                finalize_model_grads(
+                    [sub],
+                    num_tokens=None,
+                    pg_collection=encoder_pg,
+                    force_all_reduce=force_all_reduce,
+                )
+
+    mimo_model.config.no_sync_func = no_sync_func
+    mimo_model.config.finalize_model_grads_func = finalize_grads_func
+    mimo_model.config.grad_scale_func = lambda loss: (
+        torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
+        if isinstance(loss, (int, float))
+        else loss
+    )
+
+    communicator = MultiModulePipelineCommunicator(
+        module_to_grid_map,
+        topology,
+        mimo_model.config,
+        dim_mapping={'s': 0, 'h': 2, 'b': 1},
+        module_output_ndim={ENCODER_NAME: 2},
+    )
+
+    module_pgs = {}
+    language_model_module_name = None
+    if encoder_grid.is_current_rank_in_grid():
+        module_pgs[ENCODER_NAME] = encoder_pg
+    if llm_grid.is_current_rank_in_grid():
+        module_pgs[MIMO_LANGUAGE_MODULE_KEY] = llm_pg
+        language_model_module_name = MIMO_LANGUAGE_MODULE_KEY
+
+    pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs=module_pgs, language_model_module_name=language_model_module_name
+    )
+
+    ctx = {
+        'encoder_grid': encoder_grid,
+        'llm_grid': llm_grid,
+        'encoder_name': ENCODER_NAME,
+        'encoder_pg': encoder_pg,
+        'llm_pg': llm_pg,
+        'module_to_grid_map': module_to_grid_map,
+        'topology': topology,
+        'p2p_communicator': communicator,
+        'pg_collection': pg_collection,
+    }
 
     return mimo_model, ctx
 
@@ -628,6 +878,63 @@ def forward_step_homo(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask)
 
 
+def forward_step_non_colocated(data_iterator, model):
+    """Forward step for role-disjoint multi-module PP."""
+    batch = next(data_iterator) if data_iterator is not None else {'input_ids': None}
+    output_tensor, loss_mask = model(**batch)
+    return output_tensor, partial(loss_func, loss_mask)
+
+
+def create_non_colocated_data_iterator(config: BenchmarkConfig, encoder_grid, llm_grid):
+    """Create a synthetic iterator only for tensors needed by this rank's role."""
+    in_encoder_grid = encoder_grid.is_current_rank_in_grid()
+    encoder_pp_rank = None
+    if in_encoder_grid:
+        encoder_pp_rank = encoder_grid.get_pg("pp").rank()
+
+    in_llm_grid = llm_grid.is_current_rank_in_grid()
+    llm_pp_rank = None
+    llm_pp_size = None
+    if in_llm_grid:
+        llm_pp_group = llm_grid.get_pg("pp")
+        llm_pp_rank = llm_pp_group.rank()
+        llm_pp_size = llm_pp_group.size()
+
+    needs_text, needs_encoder = get_non_colocated_data_ownership(
+        in_encoder_grid=in_encoder_grid,
+        encoder_pp_rank=encoder_pp_rank,
+        in_llm_grid=in_llm_grid,
+        llm_pp_rank=llm_pp_rank,
+        llm_pp_size=llm_pp_size,
+    )
+
+    if not needs_encoder and not needs_text:
+        return None
+
+    encoder_batch_size = None
+    if needs_encoder:
+        encoder_batch_size = compute_non_colocated_encoder_batch_size(
+            micro_batch_size=config.data.micro_batch_size,
+            num_images_per_sample=config.data.num_images_per_sample,
+            encoder_dp=config.encoder_parallel.dp,
+            llm_dp=config.llm_parallel.dp,
+        )
+
+    return SyntheticVLMIterator(
+        encoder_hidden_size=config.encoder_arch.hidden_size,
+        image_seq_length=config.encoder_arch.seq_length,
+        total_seq_length=config.llm_arch.seq_length,
+        micro_batch_size=config.data.micro_batch_size,
+        vocab_size=config.llm_arch.vocab_size,
+        image_token_id=config.data.image_token_id,
+        encoder_name=ENCODER_NAME,
+        num_images_per_sample=config.data.num_images_per_sample,
+        include_text=needs_text,
+        include_encoder=needs_encoder,
+        encoder_batch_size=encoder_batch_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Forward step (PP=1 path only; PP>1 uses colocated_schedule internally)
 # ---------------------------------------------------------------------------
@@ -710,7 +1017,22 @@ def loss_func(loss_mask, output_tensor):
     """
     if output_tensor is None:
         return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
-    loss = output_tensor.float().sum()
+
+    if isinstance(output_tensor, dict):
+        output_tensor = output_tensor.get(
+            MIMO_LANGUAGE_MODULE_KEY, next(iter(output_tensor.values()), None)
+        )
+        if output_tensor is None:
+            return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
+
+    loss_tensor = output_tensor.float()
+    if loss_mask is not None:
+        mask = loss_mask.float()
+        if mask.shape != loss_tensor.shape:
+            mask = mask.reshape_as(loss_tensor)
+        loss_tensor = loss_tensor * mask
+
+    loss = loss_tensor.sum()
     return loss, {'loss_reduced': loss.detach().item()}
 
 
@@ -812,11 +1134,12 @@ def run_benchmark(
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     is_homo = (config.pp_mode == "homo")
+    is_non_colocated = (config.pp_mode == "non_colocated")
 
     if rank == 0:
         logger.info(f"Starting benchmark: {config.experiment.name} (pp_mode={config.pp_mode})")
 
-    # 1. Process groups + model + optimizer (homo vs colocated paths)
+    # 1. Process groups + model + optimizer (homo vs colocated/non-colocated paths)
     pipeline_timers = None
     if config.pipeline_timers:
         pipeline_timers = Timers(log_level=2, log_option='all')
@@ -830,6 +1153,22 @@ def run_benchmark(
         mimo_model, optimizer = create_mimo_model_homo(config, timers=pipeline_timers)
         encoder_grid = llm_grid = llm_pg = None
         effective_mbs = config.data.micro_batch_size
+    elif is_non_colocated:
+        # Non-colocated hetero: disjoint encoder/LLM grids with bridge communicator
+        pg_manager = ProcessGroupManager()
+        mimo_model, ctx = create_mimo_model_non_colocated(
+            config, pg_manager, timers=pipeline_timers
+        )
+        encoder_grid = ctx['encoder_grid']
+        llm_grid = ctx['llm_grid']
+        llm_pg = ctx['llm_pg']
+        effective_mbs = config.data.micro_batch_size
+
+        opt_config = OptimizerConfig(
+            optimizer='adam', lr=1e-4, weight_decay=0.01, clip_grad=1.0,
+            bf16=True, use_distributed_optimizer=True,
+        )
+        optimizer = get_mimo_optimizer(mimo_model, opt_config)
     else:
         # Colocated hetero: grid-based, encoder on all ranks
         pg_manager = ProcessGroupManager()
@@ -854,16 +1193,19 @@ def run_benchmark(
                 offloader.set_optimizer(enc_info.optimizer)
 
     # 3. Data iterator
-    data_iter = SyntheticVLMIterator(
-        encoder_hidden_size=config.encoder_arch.hidden_size,
-        image_seq_length=config.encoder_arch.seq_length,
-        total_seq_length=config.llm_arch.seq_length,
-        micro_batch_size=effective_mbs,
-        vocab_size=config.llm_arch.vocab_size,
-        image_token_id=config.data.image_token_id,
-        encoder_name=ENCODER_NAME,
-        num_images_per_sample=config.data.num_images_per_sample,
-    )
+    if is_non_colocated:
+        data_iter = create_non_colocated_data_iterator(config, encoder_grid, llm_grid)
+    else:
+        data_iter = SyntheticVLMIterator(
+            encoder_hidden_size=config.encoder_arch.hidden_size,
+            image_seq_length=config.encoder_arch.seq_length,
+            total_seq_length=config.llm_arch.seq_length,
+            micro_batch_size=effective_mbs,
+            vocab_size=config.llm_arch.vocab_size,
+            image_token_id=config.data.image_token_id,
+            encoder_name=ENCODER_NAME,
+            num_images_per_sample=config.data.num_images_per_sample,
+        )
 
     # 5. Performance monitor
     monitor = PerformanceMonitor(config, world_size)
@@ -872,7 +1214,7 @@ def run_benchmark(
         logger.info(
             f"  Total FLOPs/iter: {monitor.total_flops:.2e}, "
             f"effective MBS: {effective_mbs}, "
-            f"PP: {'yes' if config.llm_has_pp else 'no'}"
+            f"PP: {'yes' if (config.llm_has_pp or is_non_colocated) else 'no'}"
         )
 
     # 6. Training loop
@@ -903,6 +1245,8 @@ def run_benchmark(
     if pipeline_timers is not None:
         if is_homo and config.llm_has_pp:
             pp_stage = parallel_state.get_pipeline_model_parallel_rank()
+        elif is_non_colocated:
+            pp_stage = ctx['p2p_communicator'].current_stage
         elif config.llm_has_pp and llm_grid is not None:
             pp_group = llm_grid.get_pg("pp")
             pp_stage = pp_group.rank()
@@ -954,6 +1298,20 @@ def run_benchmark(
                     micro_batch_size=effective_mbs,
                     forward_only=False,
                 )
+        elif is_non_colocated:
+            from megatron.core.pipeline_parallel import schedules
+
+            losses = schedules.forward_backward_pipelining_without_interleaving(
+                forward_step_func=forward_step_non_colocated,
+                data_iterator=data_iter,
+                model=[mimo_model],
+                num_microbatches=config.data.num_microbatches,
+                seq_length=config.llm_arch.seq_length,
+                micro_batch_size=effective_mbs,
+                forward_only=False,
+                p2p_communicator=ctx['p2p_communicator'],
+                pg_collection=ctx['pg_collection'],
+            )
         elif config.llm_has_pp:
             from megatron.core.models.mimo.colocated_schedule import (
                 colocated_forward_backward_with_pp,

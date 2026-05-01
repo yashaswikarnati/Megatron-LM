@@ -77,9 +77,9 @@ class MimoModel(MegatronModule):
         # Detect LLM PP>1 for two-phase colocated execution
         self.lm_has_pp = False
         self.lm_is_first_pp_stage = True
-        if mimo_config.module_to_grid_map:
+        if mimo_config.module_to_grid_map and self.role.mode == ModuleLayout.COLOCATED:
             lang_grid = mimo_config.module_to_grid_map.get(MIMO_LANGUAGE_MODULE_KEY)
-            if lang_grid and 'pp' in lang_grid.dim_names:
+            if lang_grid and lang_grid.is_current_rank_in_grid() and 'pp' in lang_grid.dim_names:
                 pp_idx = lang_grid.dim_names.index('pp')
                 if lang_grid.shape[pp_idx] > 1:
                     self.lm_has_pp = True
@@ -428,6 +428,7 @@ class MimoModel(MegatronModule):
                     attention_mask,
                     labels,
                     {MIMO_LANGUAGE_MODULE_KEY: input_tensors},
+                    loss_mask=loss_mask,
                 )
                 # Unwrap dict for P2P (schedule uses plain tensors, not dicts)
                 if isinstance(lm_result, dict):
@@ -455,7 +456,12 @@ class MimoModel(MegatronModule):
             if self.role.has_language_module:
                 return (
                     self._forward_language_module(
-                        input_ids, position_ids, attention_mask, labels, input_tensors
+                        input_ids,
+                        position_ids,
+                        attention_mask,
+                        labels,
+                        input_tensors,
+                        loss_mask=loss_mask,
                     ),
                     loss_mask,
                 )
@@ -502,6 +508,7 @@ class MimoModel(MegatronModule):
         attention_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         input_tensors: Optional[Dict[str, torch.Tensor]],
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for language module on this rank.
 
@@ -539,6 +546,30 @@ class MimoModel(MegatronModule):
                 special_token_ids=self.special_token_ids,
             )
 
+            if self.partition_adapter is not None:
+                lm = unwrap_model(self.language_model)
+                sp_only = (
+                    getattr(lm.config, 'sequence_parallel', False)
+                    and lm.config.context_parallel_size <= 1
+                )
+                if not sp_only:
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
+                combined_embeddings, labels, loss_mask, attention_mask, _ = (
+                    self.partition_adapter.shard(
+                        embeddings=combined_embeddings,
+                        labels=labels,
+                        loss_mask=loss_mask,
+                        attention_mask=attention_mask,
+                    )
+                )
+
+                cp_and_sp = (
+                    self.partition_adapter.cfg.use_cp and self.partition_adapter.cfg.seq_parallel
+                )
+                if not sp_only and not cp_and_sp and combined_embeddings is not None:
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
             lm_output = self.language_model(
                 input_ids=None,
                 position_ids=None,
@@ -554,10 +585,7 @@ class MimoModel(MegatronModule):
             # via partition_adapter.shard(), but non-first stages bypass that path.
             if self.partition_adapter is not None and labels is not None:
                 _, labels, _, _, _ = self.partition_adapter.shard(
-                    embeddings=None,
-                    labels=labels,
-                    loss_mask=None,
-                    attention_mask=None,
+                    embeddings=None, labels=labels, loss_mask=None, attention_mask=None
                 )
 
             # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)

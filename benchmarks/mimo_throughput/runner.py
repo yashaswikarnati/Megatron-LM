@@ -96,6 +96,7 @@ def aggregate_results_csv(results_dir: str, output_path: str = None):
         rows.append({
             'experiment': cfg.get('experiment', filename.replace('.json', '')),
             'world_size': cfg.get('world_size', ''),
+            'pp_mode': cfg.get('pp_mode', ''),
             # Encoder arch
             'enc_layers': enc_a.get('num_layers', ''),
             'enc_hidden': enc_a.get('hidden_size', ''),
@@ -109,9 +110,11 @@ def aggregate_results_csv(results_dir: str, output_path: str = None):
             'enc_tp': enc_p.get('tp', ''),
             'enc_dp': enc_p.get('dp', ''),
             'enc_pp': enc_p.get('pp', ''),
+            'enc_offset': enc_p.get('offset', ''),
             'llm_tp': llm_p.get('tp', ''),
             'llm_dp': llm_p.get('dp', ''),
             'llm_pp': llm_p.get('pp', ''),
+            'llm_offset': llm_p.get('offset', ''),
             # Data
             'micro_batch_size': data_cfg.get('micro_batch_size', ''),
             'num_microbatches': data_cfg.get('num_microbatches', ''),
@@ -221,7 +224,7 @@ def main():
     if args.config:
         # Single experiment
         config = _apply_cli_overrides(load_config(args.config))
-        config.validate()
+        config.validate(world_size=dist.get_world_size())
         if rank == 0:
             logger.info(f"Running single experiment: {config.experiment.name}")
             if config.pipeline_timers:
@@ -243,7 +246,7 @@ def main():
 
         for cfg in configs:
             cfg = _apply_cli_overrides(cfg)
-            cfg.validate()
+            cfg.validate(world_size=dist.get_world_size())
             if rank == 0:
                 logger.info(f"--- Running experiment: {cfg.experiment.name} ---")
                 if cfg.pipeline_timers:

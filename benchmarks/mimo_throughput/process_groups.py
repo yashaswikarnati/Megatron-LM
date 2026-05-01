@@ -80,14 +80,11 @@ class ProcessGroupManager:
             grids: List of HyperCommGrids to create embedding groups for.
         """
         for grid in grids:
-            pp_group = grid.get_pg("pp")
-            if not pp_group:
-                continue
+            for pp_ranks in grid.get_rank_enum("pp"):
+                cache_key = tuple(pp_ranks)
+                if cache_key in self._embedding_pg_cache:
+                    continue
 
-            pp_ranks = sorted(dist.get_process_group_ranks(pp_group))
-            cache_key = tuple(pp_ranks)
-
-            if cache_key not in self._embedding_pg_cache:
                 pos_embd_ranks = [pp_ranks[0]]
                 embd_ranks = [pp_ranks[0]]
                 if pp_ranks[-1] != pp_ranks[0]:
@@ -121,12 +118,14 @@ class ProcessGroupManager:
         pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
         pg_collection.expt_dp = grid.get_pg("expt_dp")
 
-        # Add embedding groups from cache
-        pp_ranks = sorted(dist.get_process_group_ranks(pg_collection.pp))
-        cache_key = tuple(pp_ranks)
+        # Add embedding groups from cache. For non-colocated grids, ranks outside
+        # this grid may receive a non-member process group sentinel.
+        if not grid.is_current_rank_in_grid() or not pg_collection.pp:
+            return pg_collection
 
-        if cache_key in self._embedding_pg_cache:
-            pos_embd_pg, embd_pg = self._embedding_pg_cache[cache_key]
+        pp_ranks = tuple(dist.get_process_group_ranks(pg_collection.pp))
+        if pp_ranks in self._embedding_pg_cache:
+            pos_embd_pg, embd_pg = self._embedding_pg_cache[pp_ranks]
             pg_collection.pos_embd = (
                 pos_embd_pg if is_pp_first_stage(pg_collection.pp) else None
             )

@@ -1,0 +1,26 @@
+# 1B+3B non-colocated smoke, 8 GPUs / 1 node, 50% vision.
+# Encoder ranks: [0, 4) = TP2/DP2. LLM ranks: [4, 8) = TP2/PP2/DP1.
+# Runtime validation target for the benchmark harness with sequence_parallel disabled.
+pp_mode: non_colocated
+experiment:
+  name: cat1_1b3b_noncolocated_enc_tp2dp2_llm_tp2pp2dp1_8g_mbs1_gbs4_4img_1N_smoke
+  num_iterations: 5
+  warmup_iterations: 1
+  log_interval: 1
+model:
+  encoder: { num_layers: 40, hidden_size: 1408, num_attention_heads: 16, seq_length: 1024 }
+  llm:     { num_layers: 28, hidden_size: 3072, num_attention_heads: 24, vocab_size: 128000, seq_length: 8192 }
+parallelism:
+  encoder: { tp: 2, dp: 2, pp: 1, offset: 0 }
+  llm:     { tp: 2, dp: 1, pp: 2, offset: 4 }
+data:
+  micro_batch_size: 1
+  num_microbatches: 4
+  num_images_per_sample: 4
+  image_token_id: 128000
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 40
+sequence_parallel: false
