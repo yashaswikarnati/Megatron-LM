@@ -215,6 +215,17 @@ class PerformanceMonitor:
                     'pp': self.config.llm_parallel.pp,
                     'offset': self.config.llm_parallel.offset,
                 },
+                'llm_pipeline_split': {
+                    'num_layers_in_first_pipeline_stage': (
+                        self.config.llm_num_layers_in_first_pipeline_stage
+                    ),
+                    'num_layers_in_last_pipeline_stage': (
+                        self.config.llm_num_layers_in_last_pipeline_stage
+                    ),
+                    'pipeline_model_parallel_layout': (
+                        self.config.llm_pipeline_model_parallel_layout
+                    ),
+                },
                 'placement': {
                     'encoder': {
                         'offset': self.config.encoder_parallel.offset,

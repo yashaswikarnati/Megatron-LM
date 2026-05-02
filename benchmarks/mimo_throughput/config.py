@@ -4,7 +4,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,9 @@ class BenchmarkConfig:
     encoder_offload: bool = False  # Offload encoder DDP params + optimizer states to CPU
     sequence_parallel: bool = True  # SP + tp_comm_overlap on LLM (should always be on for TP>1)
     pipeline_timers: bool = False  # Enable per-microbatch fwd/bwd timers (profiling only)
+    llm_num_layers_in_first_pipeline_stage: Optional[int] = None
+    llm_num_layers_in_last_pipeline_stage: Optional[int] = None
+    llm_pipeline_model_parallel_layout: Optional[Any] = None
 
     @property
     def llm_has_pp(self) -> bool:
@@ -109,6 +112,15 @@ class BenchmarkConfig:
         """Total samples per optimizer step: mbs × llm_dp × num_microbatches."""
         return self.dp_batch_size * self.data.num_microbatches
 
+    @property
+    def llm_has_custom_pipeline_split(self) -> bool:
+        """Whether LLM PP uses Megatron's uneven/custom layer placement."""
+        return (
+            self.llm_num_layers_in_first_pipeline_stage is not None
+            or self.llm_num_layers_in_last_pipeline_stage is not None
+            or self.llm_pipeline_model_parallel_layout is not None
+        )
+
     def validate(self, world_size: Optional[int] = None):
         """Validate cross-field constraints across the benchmark configuration."""
         if world_size is None and "WORLD_SIZE" in os.environ:
@@ -120,10 +132,7 @@ class BenchmarkConfig:
 
         # Encoder must be PP=1
         assert self.encoder_parallel.pp == 1, "Encoder must have PP=1"
-        assert self.llm_arch.num_layers % self.llm_parallel.pp == 0, (
-            f"LLM num_layers ({self.llm_arch.num_layers}) must be divisible by "
-            f"LLM PP ({self.llm_parallel.pp})"
-        )
+        self._validate_llm_pipeline_split()
 
         assert self.encoder_parallel.offset >= 0, "Encoder rank offset must be non-negative"
         assert self.llm_parallel.offset >= 0, "LLM rank offset must be non-negative"
@@ -247,6 +256,66 @@ class BenchmarkConfig:
                 f"{'* nmb=' + str(self.data.num_microbatches) if self.llm_parallel.pp > 1 else ''})"
                 f" not divisible by fan-in scale {scale}"
                 f" (enc_dp={enc_dp} / llm_dp={llm_dp})"
+            )
+
+    def _validate_llm_pipeline_split(self):
+        """Validate LLM PP layer placement before constructing TransformerConfig."""
+        pp = self.llm_parallel.pp
+        num_layers = self.llm_arch.num_layers
+        first = self.llm_num_layers_in_first_pipeline_stage
+        last = self.llm_num_layers_in_last_pipeline_stage
+        layout = self.llm_pipeline_model_parallel_layout
+
+        has_uneven_edges = first is not None or last is not None
+        has_layout = layout is not None
+        assert not (has_uneven_edges and has_layout), (
+            "llm_pipeline_model_parallel_layout cannot be set with "
+            "llm_num_layers_in_first_pipeline_stage or "
+            "llm_num_layers_in_last_pipeline_stage"
+        )
+
+        if has_layout:
+            # Megatron validates decoder/embedding/loss placement when it builds
+            # TransformerConfig. The harness only needs to avoid the even split
+            # divisibility assertion.
+            return
+
+        if not has_uneven_edges:
+            assert num_layers % pp == 0, (
+                f"LLM num_layers ({num_layers}) must be divisible by LLM PP ({pp}) "
+                "unless an LLM uneven/custom pipeline split is configured"
+            )
+            return
+
+        remaining_layers = num_layers
+        remaining_stages = pp
+
+        if first is not None:
+            assert first > 0, "llm_num_layers_in_first_pipeline_stage must be positive"
+            remaining_layers -= first
+            remaining_stages -= 1
+
+        if last is not None:
+            assert last > 0, "llm_num_layers_in_last_pipeline_stage must be positive"
+            remaining_layers -= last
+            remaining_stages -= 1
+
+        assert remaining_layers >= 0, (
+            "LLM uneven pipeline split assigns more edge-stage layers than "
+            f"total layers ({num_layers})"
+        )
+        assert remaining_stages >= 0, (
+            "LLM uneven pipeline split configures more edge stages than "
+            f"pipeline stages ({pp})"
+        )
+        assert bool(remaining_layers) == bool(remaining_stages), (
+            f"Mismatch: {remaining_layers} middle LLM layers remain but "
+            f"{remaining_stages} middle PP stages are available"
+        )
+        if remaining_stages:
+            assert remaining_layers % remaining_stages == 0, (
+                f"Remaining LLM layers ({remaining_layers}) must be divisible by "
+                f"remaining PP stages ({remaining_stages})"
             )
 
     def _validate_non_colocated_placement(self, world_size: Optional[int]):

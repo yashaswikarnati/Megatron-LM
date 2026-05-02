@@ -89,6 +89,7 @@ def aggregate_results_csv(results_dir: str, output_path: str = None):
         summary = data.get('summary', {})
         enc_p = cfg.get('encoder_parallel', {})
         llm_p = cfg.get('llm_parallel', {})
+        llm_pp_split = cfg.get('llm_pipeline_split', {})
         enc_a = cfg.get('encoder_arch', {})
         llm_a = cfg.get('llm_arch', {})
         data_cfg = cfg.get('data', {})
@@ -115,6 +116,13 @@ def aggregate_results_csv(results_dir: str, output_path: str = None):
             'llm_dp': llm_p.get('dp', ''),
             'llm_pp': llm_p.get('pp', ''),
             'llm_offset': llm_p.get('offset', ''),
+            'llm_first_pp_layers': llm_pp_split.get(
+                'num_layers_in_first_pipeline_stage', ''
+            ),
+            'llm_last_pp_layers': llm_pp_split.get(
+                'num_layers_in_last_pipeline_stage', ''
+            ),
+            'llm_pp_layout': llm_pp_split.get('pipeline_model_parallel_layout', ''),
             # Data
             'micro_batch_size': data_cfg.get('micro_batch_size', ''),
             'num_microbatches': data_cfg.get('num_microbatches', ''),

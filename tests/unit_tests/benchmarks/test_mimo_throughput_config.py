@@ -130,6 +130,87 @@ def test_loader_accepts_parallelism_offsets(tmp_path):
     cfg.validate(world_size=6)
 
 
+def test_homo_config_accepts_uneven_llm_pipeline_split():
+    cfg = _benchmark_config(
+        pp_mode="homo",
+        sequence_parallel=True,
+        encoder_arch=ModuleArch(num_layers=48, hidden_size=32, num_attention_heads=4, seq_length=4),
+        llm_arch=ModuleArch(
+            num_layers=80, hidden_size=32, num_attention_heads=4, seq_length=64, vocab_size=128
+        ),
+        encoder_parallel=ParallelSpec(tp=4, dp=6, pp=1, cp=1, offset=0),
+        llm_parallel=ParallelSpec(tp=4, dp=6, pp=3, cp=1, offset=0),
+        data=DataSpec(micro_batch_size=1, num_microbatches=48, num_images_per_sample=4),
+        llm_num_layers_in_first_pipeline_stage=24,
+    )
+
+    cfg.validate(world_size=72)
+    assert cfg.global_batch_size == 288
+    assert cfg.llm_has_custom_pipeline_split
+
+
+def test_homo_config_rejects_uneven_llm_layers_without_split():
+    cfg = _benchmark_config(
+        pp_mode="homo",
+        encoder_arch=ModuleArch(num_layers=48, hidden_size=32, num_attention_heads=4, seq_length=4),
+        llm_arch=ModuleArch(
+            num_layers=80, hidden_size=32, num_attention_heads=4, seq_length=64, vocab_size=128
+        ),
+        encoder_parallel=ParallelSpec(tp=4, dp=6, pp=1, cp=1, offset=0),
+        llm_parallel=ParallelSpec(tp=4, dp=6, pp=3, cp=1, offset=0),
+        data=DataSpec(micro_batch_size=1, num_microbatches=48, num_images_per_sample=4),
+    )
+
+    with pytest.raises(AssertionError, match="unless an LLM uneven/custom pipeline split"):
+        cfg.validate(world_size=72)
+
+
+def test_loader_accepts_uneven_llm_pipeline_split(tmp_path):
+    config_path = tmp_path / "homo_uneven_pp.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            """
+            experiment:
+              name: yaml_homo_uneven_pp
+            model:
+              encoder:
+                num_layers: 48
+                hidden_size: 32
+                num_attention_heads: 4
+                seq_length: 4
+              llm:
+                num_layers: 80
+                hidden_size: 32
+                num_attention_heads: 4
+                seq_length: 64
+                vocab_size: 128
+            parallelism:
+              encoder:
+                tp: 4
+                dp: 6
+                pp: 1
+              llm:
+                tp: 4
+                dp: 6
+                pp: 3
+            data:
+              micro_batch_size: 1
+              num_microbatches: 48
+              num_images_per_sample: 4
+            pp_mode: homo
+            sequence_parallel: true
+            llm_num_layers_in_first_pipeline_stage: 24
+            """
+        )
+    )
+
+    cfg = load_config(str(config_path))
+
+    assert cfg.llm_num_layers_in_first_pipeline_stage == 24
+    assert cfg.llm_num_layers_in_last_pipeline_stage is None
+    cfg.validate(world_size=72)
+
+
 def test_non_colocated_encoder_batch_size_helper():
     assert (
         compute_non_colocated_encoder_batch_size(

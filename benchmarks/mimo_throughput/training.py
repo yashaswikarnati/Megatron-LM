@@ -99,6 +99,22 @@ def _safe_group_size(group, default=1):
     return default if size < 0 else size
 
 
+def _get_llm_pipeline_split_kwargs(config: BenchmarkConfig) -> dict:
+    """Return Megatron TransformerConfig kwargs for custom LLM PP splits."""
+    kwargs = {}
+    if config.llm_num_layers_in_first_pipeline_stage is not None:
+        kwargs["num_layers_in_first_pipeline_stage"] = (
+            config.llm_num_layers_in_first_pipeline_stage
+        )
+    if config.llm_num_layers_in_last_pipeline_stage is not None:
+        kwargs["num_layers_in_last_pipeline_stage"] = (
+            config.llm_num_layers_in_last_pipeline_stage
+        )
+    if config.llm_pipeline_model_parallel_layout is not None:
+        kwargs["pipeline_model_parallel_layout"] = config.llm_pipeline_model_parallel_layout
+    return kwargs
+
+
 def _get_language_model_spec(
     arch,
     pg_collection,
@@ -108,6 +124,7 @@ def _get_language_model_spec(
     pp_rank=None,
     pp_size=None,
     tp_size=None,
+    pipeline_split_kwargs=None,
 ):
     """Build ModuleSpec for the GPT language model."""
     pp_rank = _safe_group_rank(pg_collection.pp) if pp_rank is None else pp_rank
@@ -136,6 +153,7 @@ def _get_language_model_spec(
         sequence_parallel=sequence_parallel,
         tp_comm_overlap=sequence_parallel,
         timers=timers,
+        **(pipeline_split_kwargs or {}),
     )
 
     gpt_params = {
@@ -323,6 +341,7 @@ def create_mimo_model(config: BenchmarkConfig, pg_manager: ProcessGroupManager, 
         pp_rank=_safe_group_rank(llm_pg.pp),
         pp_size=lp.pp,
         tp_size=lp.tp,
+        pipeline_split_kwargs=_get_llm_pipeline_split_kwargs(config),
     )
     vision_submodule_spec = _get_vision_submodules_spec(
         config.encoder_arch,
@@ -497,6 +516,7 @@ def create_mimo_model_non_colocated(
         pp_rank=_safe_group_rank(llm_pg.pp),
         pp_size=lp.pp,
         tp_size=lp.tp,
+        pipeline_split_kwargs=_get_llm_pipeline_split_kwargs(config),
     )
     vision_submodule_spec = _get_vision_submodules_spec(
         config.encoder_arch,
@@ -715,6 +735,7 @@ def create_mimo_model_homo(config: BenchmarkConfig, timers=None):
         sequence_parallel=use_sp,
         tp_comm_overlap=use_sp,
         timers=timers,
+        **_get_llm_pipeline_split_kwargs(config),
     )
     gpt_params = {
         "config": lm_config,

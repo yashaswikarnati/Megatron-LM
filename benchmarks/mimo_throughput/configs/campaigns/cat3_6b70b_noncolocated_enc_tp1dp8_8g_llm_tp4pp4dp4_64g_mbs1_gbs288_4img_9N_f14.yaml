@@ -1,0 +1,48 @@
+# Cat3: ViT-6B + LLM-70B, non-colocated TP4/PP4 with PP0 rebalanced.
+# Prior even [20,20,20,20] split OOMed on LLM PP0 ranks. This keeps the
+# same 64-GPU LLM island but shifts decoder layers away from PP0: [14,22,22,22].
+experiment:
+  name: cat3_6b70b_noncolocated_enc_tp1dp8_8g_llm_tp4pp4dp4_64g_mbs1_gbs288_4img_9N_f14
+  num_iterations: 4
+  warmup_iterations: 1
+  log_interval: 1
+
+model:
+  encoder:
+    num_layers: 48
+    hidden_size: 3072
+    num_attention_heads: 24
+    seq_length: 1024
+  llm:
+    num_layers: 80
+    hidden_size: 8192
+    num_attention_heads: 64
+    vocab_size: 128000
+    seq_length: 8192
+
+parallelism:
+  encoder:
+    tp: 1
+    dp: 8
+    pp: 1
+    offset: 0
+  llm:
+    tp: 4
+    dp: 4
+    pp: 4
+    offset: 8
+
+data:
+  micro_batch_size: 1
+  num_microbatches: 72
+  num_images_per_sample: 4
+
+memory:
+  encoder:
+    recompute_granularity: full
+    recompute_method: uniform
+    recompute_num_layers: 48
+
+pp_mode: non_colocated
+sequence_parallel: true
+llm_num_layers_in_first_pipeline_stage: 14
