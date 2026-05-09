@@ -11,6 +11,13 @@ import torch.distributed as dist
 from megatron.core.hyper_comm_grid import HyperCommGrid
 
 
+def _is_process_group_member(pg: Optional[dist.ProcessGroup]) -> bool:
+    """Return whether pg is a real process group for this rank."""
+    group_member = getattr(dist, "GroupMember", None)
+    non_member = getattr(group_member, "NON_GROUP_MEMBER", None)
+    return pg is not None and pg != non_member
+
+
 class CommRole(Enum):
     """Communication role for ranks in bridge communication.
 
@@ -53,7 +60,7 @@ class BridgeCommunicator:
     def destroy_broadcast_pgs(cls):
         """Destroy all cached broadcast process groups."""
         for pg in cls._broadcast_pg_cache.values():
-            if pg is not None:
+            if _is_process_group_member(pg):
                 dist.destroy_process_group(pg)
         cls._broadcast_pg_cache.clear()
 

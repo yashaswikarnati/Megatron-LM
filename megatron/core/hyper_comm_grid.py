@@ -31,6 +31,13 @@ except ImportError:
     HAVE_ABSL = False
 
 
+def _is_process_group_member(pg: Optional[dist.ProcessGroup]) -> bool:
+    """Return whether pg is a real process group for this rank."""
+    group_member = getattr(dist, "GroupMember", None)
+    non_member = getattr(group_member, "NON_GROUP_MEMBER", None)
+    return pg is not None and pg != non_member
+
+
 @dataclass
 class _GridLayout:
     """Rank layout owned by a HyperCommGrid.
@@ -270,7 +277,7 @@ class HyperCommGrid:
     def destroy(self) -> None:
         """Destroy all process groups created by this grid."""
         for pg in self._pgs.values():
-            if pg is not None:
+            if _is_process_group_member(pg):
                 dist.destroy_process_group(pg)
         self._pgs.clear()
 
