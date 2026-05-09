@@ -259,6 +259,69 @@ class ProcessGroupCollection:
 
         return cls(**init_dict)
 
+    @classmethod
+    def from_hyper_comm_grid(
+        cls,
+        grid,
+        create: bool = False,
+        required_pgs: Optional[List[str]] = None,
+        num_distributed_optimizer_instances: int = 1,
+    ):
+        """Build a ProcessGroupCollection from an extended HyperCommGrid.
+
+        The grid must expose expert groups via registered layout dimensions
+        such as ``expt_tp``/``expt_dp`` and aliases such as ``tp_ep_pp``.
+        When ``create`` is True, the helper owns group creation in a
+        deterministic order. Otherwise it only reads groups that must already
+        exist on the grid.
+        """
+        if num_distributed_optimizer_instances != 1:
+            raise ValueError(
+                "ProcessGroupCollection.from_hyper_comm_grid only supports "
+                "num_distributed_optimizer_instances == 1"
+            )
+
+        pg_specs = {
+            'tp': 'tp',
+            'cp': 'cp',
+            'pp': 'pp',
+            'dp': 'dp',
+            'dp_cp': ['dp', 'cp'],
+            'tp_cp': ['tp', 'cp'],
+            'mp': ['tp', 'pp'],
+            'tp_dp_cp': ['tp', 'dp', 'cp'],
+            'ep': 'ep',
+            'expt_tp': 'expt_tp',
+            'expt_dp': 'expt_dp',
+            'tp_ep': 'tp_ep',
+            'tp_ep_pp': 'tp_ep_pp',
+            'intra_dist_opt': grid.dim_names,
+        }
+        if required_pgs is None:
+            required_pgs = list(pg_specs)
+
+        invalid_pgs = [pg for pg in required_pgs if pg not in pg_specs]
+        if invalid_pgs:
+            raise ValueError(f"Invalid process groups requested: {invalid_pgs}")
+
+        if 'tp_ep_pp' in required_pgs and hasattr(grid, 'get_alias_dims'):
+            alias_dims = grid.get_alias_dims('tp_ep_pp')
+            if 'pp' not in alias_dims:
+                raise ValueError("tp_ep_pp alias must include the shared pipeline dimension 'pp'")
+
+        def get_or_create(dims):
+            return grid.create_pg(dims) if create else grid.get_pg(dims)
+
+        init_dict = {pg_name: get_or_create(pg_specs[pg_name]) for pg_name in required_pgs}
+
+        if 'dp_cp' in init_dict:
+            init_dict.setdefault('intra_dp_cp', init_dict['dp_cp'])
+        if 'expt_dp' in init_dict:
+            init_dict.setdefault('intra_expt_dp', init_dict['expt_dp'])
+        init_dict.setdefault('inter_dist_opt', None)
+
+        return cls(**init_dict)
+
     @staticmethod
     def setup_process_groups_for_optimizer(
         pg_collection: Optional['ProcessGroupCollection'],

@@ -3,6 +3,7 @@
 import pytest
 import torch.distributed as dist
 
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
@@ -103,6 +104,112 @@ class TestProcessGroupsConfig:
         repr_str = repr(model_pgs)
         assert "ProcessGroupCollection(" in repr_str
         assert "hcp([2, 4])" in repr_str
+
+    def test_from_hyper_comm_grid_reads_required_groups(self, mocker):
+        """Test mapping from an extended HyperCommGrid to ProcessGroupCollection."""
+        grid = mocker.Mock()
+        grid.dim_names = ["tp", "cp", "dp", "pp"]
+
+        pgs = {}
+
+        def pg_for(dims):
+            key = tuple(dims) if isinstance(dims, list) else dims
+            pgs.setdefault(key, mocker.Mock(spec=dist.ProcessGroup))
+            return pgs[key]
+
+        grid.get_pg.side_effect = pg_for
+        grid.get_alias_dims.return_value = ["expt_tp", "ep", "pp"]
+
+        collection = ProcessGroupCollection.from_hyper_comm_grid(
+            grid,
+            required_pgs=['tp', 'pp', 'dp', 'dp_cp', 'mp', 'expt_dp', 'tp_ep_pp', 'intra_dist_opt'],
+        )
+
+        assert collection.tp is pgs['tp']
+        assert collection.pp is pgs['pp']
+        assert collection.dp is pgs['dp']
+        assert collection.dp_cp is pgs[('dp', 'cp')]
+        assert collection.mp is pgs[('tp', 'pp')]
+        assert collection.expt_dp is pgs['expt_dp']
+        assert collection.tp_ep_pp is pgs['tp_ep_pp']
+        assert collection.intra_dist_opt is pgs[('tp', 'cp', 'dp', 'pp')]
+        assert collection.intra_dp_cp is collection.dp_cp
+        assert collection.intra_expt_dp is collection.expt_dp
+        assert collection.inter_dist_opt is None
+
+    def test_from_hyper_comm_grid_rejects_multi_instance_distopt(self, mocker):
+        """Phase 1 helper does not support multiple distributed optimizer instances."""
+        grid = mocker.Mock()
+        with pytest.raises(ValueError, match="num_distributed_optimizer_instances == 1"):
+            ProcessGroupCollection.from_hyper_comm_grid(grid, num_distributed_optimizer_instances=2)
+
+    def test_from_hyper_comm_grid_creates_from_real_extended_grid(self, mocker, monkeypatch):
+        """Test helper against real HyperCommGrid alias resolution without distributed init."""
+        monkeypatch.setenv("WORLD_SIZE", "16")
+        mocker.patch('torch.distributed.get_rank', return_value=0)
+        mock_new_subgroups = mocker.patch('torch.distributed.new_subgroups_by_enumeration')
+
+        created = []
+
+        def make_pg(rank_enum, **_kwargs):
+            pg = mocker.Mock(spec=dist.ProcessGroup)
+            pg.size.return_value = len(rank_enum[0])
+            created.append((rank_enum, pg))
+            return pg, None
+
+        mock_new_subgroups.side_effect = make_pg
+
+        grid = HyperCommGrid([2, 1, 4, 2], ["tp", "cp", "dp", "pp"])
+        grid.register_layout(
+            "expert",
+            [1, 4, 2, 2],
+            ["expt_tp", "ep", "expt_dp", "pp"],
+            aliases={"tp_ep": ["expt_tp", "ep"], "tp_ep_pp": ["expt_tp", "ep", "pp"]},
+        )
+
+        collection = ProcessGroupCollection.from_hyper_comm_grid(
+            grid,
+            create=True,
+            required_pgs=[
+                'tp',
+                'dp',
+                'dp_cp',
+                'mp',
+                'ep',
+                'expt_tp',
+                'expt_dp',
+                'tp_ep',
+                'tp_ep_pp',
+                'intra_dist_opt',
+            ],
+        )
+
+        assert collection.tp is grid.get_pg("tp")
+        assert collection.dp is grid.get_pg("dp")
+        assert collection.dp_cp is grid.get_pg(["dp", "cp"])
+        assert collection.mp is grid.get_pg(["tp", "pp"])
+        assert collection.ep is grid.get_pg("ep")
+        assert collection.expt_tp is grid.get_pg("expt_tp")
+        assert collection.expt_dp is grid.get_pg("expt_dp")
+        assert collection.tp_ep is grid.get_pg("tp_ep")
+        assert collection.tp_ep_pp is grid.get_pg("tp_ep_pp")
+        assert collection.intra_dist_opt is grid.get_pg(["tp", "cp", "dp", "pp"])
+        assert collection.intra_dp_cp is collection.dp_cp
+        assert collection.intra_expt_dp is collection.expt_dp
+        assert collection.inter_dist_opt is None
+
+    def test_from_hyper_comm_grid_rejects_tp_ep_pp_without_shared_pp(self, monkeypatch):
+        """tp_ep_pp must include the same pp dimension used by the base layout."""
+        monkeypatch.setenv("WORLD_SIZE", "4")
+        grid = HyperCommGrid([2, 2], ["tp", "pp"])
+        grid.register_layout(
+            "expert", [2, 2], ["ep", "expert_pp"], aliases={"tp_ep_pp": ["ep", "expert_pp"]}
+        )
+
+        with pytest.raises(ValueError, match="shared pipeline dimension 'pp'"):
+            ProcessGroupCollection.from_hyper_comm_grid(
+                grid, create=True, required_pgs=['tp_ep_pp']
+            )
 
 
 class TestPGConfigDefaultInitialization:

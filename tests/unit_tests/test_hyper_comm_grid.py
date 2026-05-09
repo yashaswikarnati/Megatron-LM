@@ -309,6 +309,134 @@ class TestHyperCommGrid:
         expected_ab = [[0, 2, 1, 3], [4, 6, 5, 7]]
         assert rank_enum_ab == expected_ab
 
+    def test_register_layout_for_expert_groups(self, monkeypatch):
+        """Test alternate expert layout over the same rank span."""
+        monkeypatch.setenv("WORLD_SIZE", "16")
+        grid = HyperCommGrid([2, 1, 4, 2], ["tp", "cp", "dp", "pp"])
+
+        grid.register_layout(
+            "expert",
+            [1, 4, 2, 2],
+            ["expt_tp", "ep", "expt_dp", "pp"],
+            aliases={"tp_ep": ["expt_tp", "ep"], "tp_ep_pp": ["expt_tp", "ep", "pp"]},
+        )
+
+        assert grid.has_layout("base")
+        assert grid.has_layout("expert")
+        assert grid.get_rank_enum("pp") == grid.get_rank_enum("pp", layout_name="expert")
+        assert grid.get_rank_enum("ep") == [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+            [8, 9, 10, 11],
+            [12, 13, 14, 15],
+        ]
+        assert grid.get_rank_enum("expt_dp") == [
+            [0, 4],
+            [1, 5],
+            [2, 6],
+            [3, 7],
+            [8, 12],
+            [9, 13],
+            [10, 14],
+            [11, 15],
+        ]
+        assert grid.get_rank_enum("tp_ep") == [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+            [8, 9, 10, 11],
+            [12, 13, 14, 15],
+        ]
+        assert grid.get_rank_enum("tp_ep_pp") == [
+            [0, 1, 2, 3, 8, 9, 10, 11],
+            [4, 5, 6, 7, 12, 13, 14, 15],
+        ]
+
+    @patch('torch.distributed.get_rank', return_value=0)
+    @patch('torch.distributed.new_subgroups_by_enumeration')
+    def test_create_pg_from_registered_layout_and_alias(
+        self, mock_new_subgroups, _mock_get_rank, monkeypatch
+    ):
+        """Test create/get with registered expert dims and aliases."""
+        monkeypatch.setenv("WORLD_SIZE", "16")
+        mock_ep_pg = MagicMock(spec=dist.ProcessGroup)
+        mock_tp_ep_pg = MagicMock(spec=dist.ProcessGroup)
+        mock_new_subgroups.side_effect = [(mock_ep_pg, None), (mock_tp_ep_pg, None)]
+
+        grid = HyperCommGrid([2, 1, 4, 2], ["tp", "cp", "dp", "pp"])
+        grid.register_layout(
+            "expert",
+            [1, 4, 2, 2],
+            ["expt_tp", "ep", "expt_dp", "pp"],
+            aliases={"tp_ep": ["expt_tp", "ep"]},
+        )
+
+        assert grid.create_pg("ep") == mock_ep_pg
+        assert grid.create_pg("tp_ep") == mock_tp_ep_pg
+        assert grid.get_pg("ep") == mock_ep_pg
+        assert grid.get_pg("tp_ep") == mock_tp_ep_pg
+
+        assert "ep" in grid._pgs
+        assert "tp_ep" in grid._pgs
+        first_call_enum = mock_new_subgroups.call_args_list[0].args[0]
+        second_call_enum = mock_new_subgroups.call_args_list[1].args[0]
+        assert first_call_enum == grid.get_rank_enum("ep")
+        assert second_call_enum == grid.get_rank_enum("tp_ep")
+
+    def test_registered_layout_rejects_invalid_shapes_and_collisions(self, monkeypatch):
+        """Test validation for registered layouts."""
+        monkeypatch.setenv("WORLD_SIZE", "16")
+        grid = HyperCommGrid([2, 1, 4, 2], ["tp", "cp", "dp", "pp"])
+
+        with pytest.raises(ValueError, match="base.*reserved"):
+            grid.register_layout("base", [1, 4, 2, 2], ["expt_tp", "ep", "expt_dp", "pp"])
+
+        with pytest.raises(ValueError, match="base grid size"):
+            grid.register_layout("bad_size", [1, 2, 2, 2], ["expt_tp", "ep", "expt_dp", "pp"])
+
+        with pytest.raises(ValueError, match="collides.*different rank enumeration"):
+            grid.register_layout("bad_tp", [1, 4, 2, 2], ["expt_tp", "tp", "expt_dp", "pp"])
+
+        with pytest.raises(ValueError, match="conflicts with an existing dimension"):
+            grid.register_layout(
+                "bad_alias",
+                [1, 4, 2, 2],
+                ["expt_tp", "ep", "expt_dp", "pp"],
+                aliases={"tp": ["expt_tp", "ep"]},
+            )
+
+        with pytest.raises(ValueError, match="cannot contain '-'"):
+            grid.register_layout(
+                "bad_alias_key",
+                [1, 4, 2, 2],
+                ["expt_tp", "ep", "expt_dp", "pp"],
+                aliases={"dp-cp": ["expt_tp", "ep"]},
+            )
+
+        with pytest.raises(ValueError, match="duplicate dimensions"):
+            grid.register_layout(
+                "bad_alias_dims",
+                [1, 4, 2, 2],
+                ["expt_tp", "ep", "expt_dp", "pp"],
+                aliases={"bad_dims": ["ep", "ep"]},
+            )
+
+    def test_registered_layout_rejects_implicit_cross_layout_composites(self, monkeypatch):
+        """Composite expert groups must use registered aliases."""
+        monkeypatch.setenv("WORLD_SIZE", "16")
+        grid = HyperCommGrid([2, 1, 4, 2], ["tp", "cp", "dp", "pp"])
+        grid.register_layout(
+            "expert",
+            [1, 4, 2, 2],
+            ["expt_tp", "ep", "expt_dp", "pp"],
+            aliases={"tp_ep": ["expt_tp", "ep"]},
+        )
+
+        with pytest.raises(ValueError, match="must use an explicit alias"):
+            grid.get_rank_enum(["expt_tp", "ep"])
+
+        with pytest.raises(ValueError, match="single registered layout"):
+            grid.get_rank_enum(["tp", "ep"])
+
 
 class TestHyperCommGridIntegration:
     """Integration tests for HyperCommGrid with real distributed initialization."""

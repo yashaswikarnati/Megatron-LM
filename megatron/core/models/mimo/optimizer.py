@@ -51,6 +51,7 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
+        """Prepare gradients for all active module optimizers."""
         found_inf = False
         for opt in self._active_optimizers:
             found_inf |= opt.prepare_grads()
@@ -72,6 +73,7 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self) -> Tuple[bool, Optional[float], Optional[int]]:
+        """Run a synchronized optimizer step across active module optimizers."""
         found_inf = self.prepare_grads()
         # Synchronize found_inf across all ranks to prevent deadlock:
         # if encoder ranks detect inf but LLM ranks don't, the early return
@@ -104,21 +106,25 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
+        """Step active module optimizers after gradients have been prepared."""
         success = True
         for opt in self._active_optimizers:
             success &= opt.step_with_ready_grads()
         return success
 
     def zero_grad(self, set_to_none: bool = True):
+        """Clear gradients on all active module optimizers."""
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
 
     def get_loss_scale(self) -> torch.Tensor:
+        """Return the loss scale from the first active optimizer, or one for stubs."""
         if self._active_optimizers:
             return self._active_optimizers[0].get_loss_scale()
         return torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def count_zeros(self) -> int:
+        """Count zero gradients across all active module optimizers."""
         return sum(opt.count_zeros() for opt in self._active_optimizers)
 
     @property
@@ -132,6 +138,7 @@ class MimoOptimizer(MegatronOptimizer):
     # Checkpointing
 
     def state_dict(self):
+        """Return per-module optimizer state dicts."""
         return {
             name: info.optimizer.state_dict() if info.is_active and info.optimizer else None
             for name, info in self.module_infos.items()
@@ -183,6 +190,7 @@ class MimoOptimizer(MegatronOptimizer):
         return sharded_state
 
     def reload_model_params(self, state_dict=None):
+        """Reload model parameters for all active module optimizers."""
         for opt in self._active_optimizers:
             opt.reload_model_params(state_dict)
 
@@ -286,15 +294,16 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     Only fetches process groups required by the optimizer. Assumes all groups
     are pre-created in the grid via grid.create_pg() - does not create any new groups.
 
-    The following groups must be pre-created in the grid before calling this function:
+    For extended HyperCommGrid instances with registered expert layouts, the following
+    groups must be pre-created in the grid before calling this function:
         grid.create_pg(["dp"])
         grid.create_pg(["dp", "cp"])
         grid.create_pg(["tp"])
         grid.create_pg(["pp"])
         grid.create_pg(["tp", "pp"])
-        grid.create_pg(["tp", "ep", "pp"])
-        grid.create_pg(["dp", "ep"])
-        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+        grid.create_pg("tp_ep_pp")
+        grid.create_pg("expt_dp")
+        grid.create_pg(["tp", "cp", "dp", "pp"])
 
     Args:
         grid: HyperCommGrid with pre-created process groups.
@@ -308,6 +317,22 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
         - tp_ep_pp: Expert tensor-model-pipeline group
         - expt_dp: Expert data parallel group
     """
+    try:
+        return ProcessGroupCollection.from_hyper_comm_grid(
+            grid,
+            create=False,
+            required_pgs=['dp', 'dp_cp', 'tp', 'pp', 'mp', 'tp_ep_pp', 'expt_dp', 'intra_dist_opt'],
+        )
+    except (KeyError, ValueError) as exc:
+        has_registered_expert_aliases = hasattr(grid, 'has_alias') and (
+            grid.has_alias('tp_ep') or grid.has_alias('tp_ep_pp')
+        )
+        if has_registered_expert_aliases:
+            raise exc
+        # Backward-compatible fallback for older tests/grids that encoded EP
+        # directly in the base Cartesian layout.
+        pass
+
     pg = ProcessGroupCollection()
 
     # Core groups needed by optimizer and checkpointing
