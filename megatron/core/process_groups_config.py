@@ -166,6 +166,95 @@ class ProcessGroupCollection:
         )
 
     @classmethod
+    def from_hyper_comm_grid(cls, grid) -> "ProcessGroupCollection":
+        """Build a ``ProcessGroupCollection`` directly from a ``HyperCommGrid``.
+
+        Uses the grid's primary axes ``tp``, ``cp``, ``dp``, ``pp`` (each optional) to
+        populate the standard non-expert fields, and the grid's alt-factorization axes
+        ``etp``/``ep``/``edp`` to populate the expert fields when an alt factorization
+        named ``"expert"`` (or any alt that names those axes) is present. No global
+        ``parallel_state`` initialization is required.
+
+        Args:
+            grid: A ``HyperCommGrid`` instance. May carry an alt factorization that names
+                expert axes (``etp``/``ep``/``edp``) over the same per-PP-stage rank slab as
+                the primary ``tp``/``cp``/``dp`` axes (see NMFW-464 expert overlap).
+
+        Returns:
+            A populated ``ProcessGroupCollection``. Primary fields (``tp``/``cp``/``dp``/``pp``
+            and the standard combined groups ``dp_cp``/``tp_cp``/``tp_dp_cp``/``mp``) are only
+            set when the corresponding axes exist in the grid; on ranks that aren't members of
+            the grid, the value is ``None`` rather than the field being absent. Expert fields
+            (``ep``/``expt_tp``/``expt_dp``/``tp_ep``/``tp_ep_pp``) are *always* populated —
+            either with the alt-factorization group, or with ``None`` when no alt is present —
+            so DDP / optimizer / MoE call sites can use a uniform ``hasattr`` + ``is not None``
+            probe regardless of whether the grid has an expert alt.
+        """
+        from megatron.core.hyper_comm_grid import HyperCommGrid  # local import to avoid cycle
+
+        if not isinstance(grid, HyperCommGrid):
+            raise TypeError(f"grid must be a HyperCommGrid, got {type(grid)}")
+
+        primary = set(grid.dim_names)
+        alts = set(grid._dim_to_alt) if hasattr(grid, "_dim_to_alt") else set()
+
+        def _make(dims):
+            """Create the requested group if all named axes are present in the grid.
+
+            Returns the PG (which may be ``None`` on ranks that aren't members of this
+            grid — ``dist.new_subgroups_by_enumeration`` returns ``None`` for non-members).
+            Returns the sentinel ``"absent"`` if the axis isn't present in the grid at
+            all (so the field is skipped entirely rather than set to ``None``).
+            """
+            names = [dims] if isinstance(dims, str) else list(dims)
+            if not all((d in primary) or (d in alts) for d in names):
+                return "absent"
+            return grid.create_pg(dims)
+
+        kwargs = {}
+        for field_name, axis_spec in (
+            ("tp", "tp"),
+            ("cp", "cp"),
+            ("dp", "dp"),
+            ("pp", "pp"),
+            ("dp_cp", ["dp", "cp"]),
+            ("tp_cp", ["tp", "cp"]),
+            ("tp_dp_cp", ["tp", "dp", "cp"]),
+            ("mp", ["tp", "pp"]),
+        ):
+            pg = _make(axis_spec)
+            if pg != "absent":
+                # Set the field even when ``pg is None`` so non-member ranks see
+                # ``collection.tp is None`` rather than ``AttributeError``.
+                kwargs[field_name] = pg
+
+        # Expert axes via alt factorization. As above, ``pg`` may legitimately be
+        # ``None`` on ranks outside this grid — set the field so callers can probe.
+        # When the grid carries no alt factorization at all (typical for non-MoE
+        # encoder grids), populate the standard expert fields with ``None`` so that
+        # callers like ``setup_process_groups_for_ddp`` (which uses ``hasattr``) can
+        # uniformly probe for them without distinguishing MoE-grid from non-MoE-grid.
+        kwargs["ep"] = grid.create_pg("ep") if "ep" in alts else None
+        kwargs["expt_tp"] = grid.create_pg("etp") if "etp" in alts else None
+        kwargs["expt_dp"] = grid.create_pg("edp") if "edp" in alts else None
+        kwargs["tp_ep"] = grid.create_pg(["etp", "ep"]) if {"etp", "ep"}.issubset(alts) else None
+        kwargs["tp_ep_pp"] = (
+            grid.create_pg(["etp", "ep", "pp"])
+            if {"etp", "ep"}.issubset(alts) and "pp" in primary
+            else None
+        )
+
+        # Aliases used by DDP / optimizer when there's a single distributed-optimizer instance.
+        # Falling back to the non-partial groups keeps ``hasattr`` / fallback paths happy without
+        # needing to allocate separate NCCL groups.
+        if "dp_cp" in kwargs and "intra_dp_cp" not in kwargs:
+            kwargs["intra_dp_cp"] = kwargs["dp_cp"]
+        if "expt_dp" in kwargs and "intra_expt_dp" not in kwargs:
+            kwargs["intra_expt_dp"] = kwargs["expt_dp"]
+
+        return cls(**kwargs)
+
+    @classmethod
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
         """
         Use the default process groups from parallel_state.

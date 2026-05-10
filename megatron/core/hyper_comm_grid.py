@@ -77,6 +77,37 @@ class HyperCommGrid:
         rank_offset: Starting rank when the grid doesn't span the entire communication world.
             Default 0.
         backend: Backend for creating process group. Default None and will use default backend.
+        alt_factorizations: Optional alternate factorizations of a contiguous block of the primary
+            dim_names. Each entry re-expresses the same rank slab under different axis names with
+            a different shape. Used to overlap expert parallelism (EP / ETP / EDP) onto the same
+            ranks that carry TP / CP / DP without inflating the world size. The mapping has the
+            shape ``{name: {"shape": [...], "dim_names": [...], "replaces": [...]}}``.
+
+            Constraints (enforced at construction):
+
+            * ``replaces`` must be a contiguous slice of the primary ``dim_names``.
+            * The product of the alt ``shape`` must equal the product of the primary shape values
+              at the covered positions.
+            * Alt ``dim_names`` must not collide with primary ``dim_names`` or with names from
+              any other alt factorization.
+
+            Example for NMFW-464 expert overlap (8 ranks, ``tp=cp=dp=2``, ``ep=etp=edp=2``)::
+
+                HyperCommGrid(
+                    [2, 2, 2, 1], ["tp", "cp", "dp", "pp"],
+                    alt_factorizations={
+                        "expert": {
+                            "shape": [2, 2, 2],
+                            "dim_names": ["etp", "ep", "edp"],
+                            "replaces": ["tp", "cp", "dp"],
+                        },
+                    },
+                )
+
+            ``create_pg("ep")`` then enumerates the same rank slab as ``create_pg("cp")`` would
+            for the primary, but under the expert factorization. Mixing covered primary dims
+            (e.g. ``tp``) with alt dims (e.g. ``ep``) in a single ``create_pg`` call is rejected
+            because the two views share ranks and the combined group is ambiguous.
     """
 
     def __init__(
@@ -85,6 +116,7 @@ class HyperCommGrid:
         dim_names: list[str],
         rank_offset: int = 0,
         backend: Optional[str] = None,
+        alt_factorizations: Optional[dict[str, dict[str, Any]]] = None,
     ) -> None:
         if len(shape) != len(dim_names):
             raise ValueError(f"len(shape) {shape} != len(dim_names) {dim_names}")
@@ -117,6 +149,134 @@ class HyperCommGrid:
         self.backend = backend
         self._pgs: dict[str, dist.ProcessGroup] = {}
 
+        # Alt factorizations: each builds a "shadow" (dim_names, shape) that expresses the same
+        # flat rank range under a different naming, by replacing the contiguous slice of primary
+        # dim_names listed in ``replaces`` with the alt's dim_names and shape. The shadow drives
+        # einops enumeration when the caller asks for groups along alt axes.
+        self._alt_shadows: dict[str, Tuple[list[str], list[int]]] = {}
+        # Map from primary dim name → alt name that replaces it. Used to detect ambiguous
+        # mixed-factorization requests in ``_resolve_dims``.
+        self._replaced_to_alt: dict[str, str] = {}
+        # Map from alt-axis dim name → alt name that owns it.
+        self._dim_to_alt: dict[str, str] = {}
+        if alt_factorizations:
+            for alt_name, alt_spec in alt_factorizations.items():
+                shadow = self._validate_and_build_alt(alt_name, alt_spec)
+                self._alt_shadows[alt_name] = shadow
+                for d in alt_spec["dim_names"]:
+                    self._dim_to_alt[d] = alt_name
+                for d in alt_spec["replaces"]:
+                    if d in self._replaced_to_alt:
+                        other = self._replaced_to_alt[d]
+                        raise ValueError(
+                            f"alt_factorization {alt_name!r}: primary dim {d!r} is already "
+                            f"replaced by alt factorization {other!r}; alt factorizations must "
+                            f"replace disjoint slices of the primary"
+                        )
+                    self._replaced_to_alt[d] = alt_name
+
+    def _validate_and_build_alt(
+        self, alt_name: str, alt_spec: dict[str, Any]
+    ) -> Tuple[list[str], list[int]]:
+        r"""Validate one alt factorization and return its ``(shadow_dim_names, shadow_shape)``."""
+        for required in ("shape", "dim_names", "replaces"):
+            if required not in alt_spec:
+                raise ValueError(
+                    f"alt_factorization {alt_name!r} is missing required key {required!r}"
+                )
+        alt_shape = list(alt_spec["shape"])
+        alt_dim_names = list(alt_spec["dim_names"])
+        replaces = list(alt_spec["replaces"])
+        if len(alt_shape) != len(alt_dim_names):
+            raise ValueError(
+                f"alt_factorization {alt_name!r}: len(shape) {alt_shape} != "
+                f"len(dim_names) {alt_dim_names}"
+            )
+        if not replaces:
+            raise ValueError(f"alt_factorization {alt_name!r}: replaces must be non-empty")
+
+        # replaces must be a contiguous slice of primary dim_names
+        for c in replaces:
+            if c not in self.dim_names:
+                raise ValueError(
+                    f"alt_factorization {alt_name!r}: replaces entry {c!r} is not a primary dim"
+                )
+        first_idx = self.dim_names.index(replaces[0])
+        expected = self.dim_names[first_idx : first_idx + len(replaces)]
+        if expected != replaces:
+            raise ValueError(
+                f"alt_factorization {alt_name!r}: replaces {replaces} must be a contiguous slice "
+                f"of primary dim_names {self.dim_names}"
+            )
+
+        # product(alt.shape) == product(primary.shape over replaced positions)
+        primary_replaced_prod = int(np.prod(self.shape[first_idx : first_idx + len(replaces)]))
+        alt_prod = int(np.prod(alt_shape))
+        if alt_prod != primary_replaced_prod:
+            raise ValueError(
+                f"alt_factorization {alt_name!r}: product(shape) {alt_prod} != product of "
+                f"primary replaced dims {primary_replaced_prod}"
+            )
+
+        # alt dim_names must not collide with primary or other alt names
+        for d in alt_dim_names:
+            if d in self.dim_names:
+                raise ValueError(
+                    f"alt_factorization {alt_name!r}: dim {d!r} collides with primary dim_names"
+                )
+            if d in self._dim_to_alt:
+                other = self._dim_to_alt[d]
+                raise ValueError(
+                    f"alt_factorization {alt_name!r}: dim {d!r} collides with alt "
+                    f"factorization {other!r}"
+                )
+
+        # Build shadow by replacing the contiguous slice with alt
+        shadow_dim_names = (
+            self.dim_names[:first_idx] + alt_dim_names + self.dim_names[first_idx + len(replaces) :]
+        )
+        shadow_shape = self.shape[:first_idx] + alt_shape + self.shape[first_idx + len(replaces) :]
+        return shadow_dim_names, shadow_shape
+
+    def _resolve_dims(self, dims_list: list[str]) -> Tuple[list[str], list[int]]:
+        r"""Pick the layout (primary or alt-shadow) that should handle ``dims_list``.
+
+        Returns:
+            ``(dim_names, shape)`` — the layout to use for rank-enumeration.
+
+        Raises:
+            KeyError: if a requested dim is unknown.
+            ValueError: if the request mixes replaced primary dims with alt dims, or alt dims
+                from different factorizations.
+        """
+        alts_used: set[str] = set()
+        has_replaced_primary = False
+        for d in dims_list:
+            if d in self._dim_to_alt:
+                alts_used.add(self._dim_to_alt[d])
+            elif d in self.dim_names:
+                if d in self._replaced_to_alt:
+                    has_replaced_primary = True
+            else:
+                raise KeyError(f"Dimension {d!r} is not a primary or alt dim of this grid")
+
+        if len(alts_used) > 1:
+            raise ValueError(
+                f"create_pg/get_pg cannot mix dims from multiple alt factorizations: "
+                f"{sorted(alts_used)}"
+            )
+
+        if alts_used:
+            alt_name = next(iter(alts_used))
+            if has_replaced_primary:
+                raise ValueError(
+                    f"Cannot combine replaced primary dims with dims from alt factorization "
+                    f"{alt_name!r}; the views share ranks and the combined group is ambiguous"
+                )
+            return self._alt_shadows[alt_name]
+
+        return self.dim_names, self.shape
+
     def create_pg(self, dims: Union[str, list[str]], **kwargs: Any) -> dist.ProcessGroup | None:
         r"""Create a process group based on a list of dimension names
 
@@ -145,8 +305,10 @@ class HyperCommGrid:
         Raises:
             KeyError: If attempting to recreate a process group with an existing key.
         """
-        # ordered_dims and unique_group_key will follow the reversed order of self.dim_names
-        ordered_dims, unique_group_key = self._order_dims(dims)
+        dims_list = [dims] if isinstance(dims, str) else list(dims)
+        layout_names, layout_shape = self._resolve_dims(dims_list)
+        # ordered_dims and unique_group_key follow the reversed order of layout_names
+        ordered_dims, unique_group_key = self._order_dims(dims, dim_names=layout_names)
 
         if unique_group_key in self._pgs:
             raise KeyError(
@@ -155,10 +317,10 @@ class HyperCommGrid:
                 f"of returning the process group that has already been created before."
             )
 
-        rank_enum = self._gen_rank_enum(ordered_dims)
+        rank_enum = self._gen_rank_enum(ordered_dims, dim_names=layout_names, shape=layout_shape)
         pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs)
 
-        if dist.get_rank() == 0:
+        if dist.is_initialized() and dist.get_rank() == 0:
             logging.info(
                 f"Generated process group for {unique_group_key} with enumeration {rank_enum}"
             )
@@ -178,7 +340,9 @@ class HyperCommGrid:
         Args:
             dims: Name of leading dimensions to create process group
         """
-        _, unique_group_key = self._order_dims(dims)
+        dims_list = [dims] if isinstance(dims, str) else list(dims)
+        layout_names, _ = self._resolve_dims(dims_list)
+        _, unique_group_key = self._order_dims(dims, dim_names=layout_names)
 
         if unique_group_key not in self._pgs:
             raise KeyError(
@@ -200,10 +364,17 @@ class HyperCommGrid:
         Returns:
             List of rank lists (one per subgroup).
         """
-        ordered_dims, _ = self._order_dims(dims)
-        return self._gen_rank_enum(ordered_dims)
+        dims_list = [dims] if isinstance(dims, str) else list(dims)
+        layout_names, layout_shape = self._resolve_dims(dims_list)
+        ordered_dims, _ = self._order_dims(dims, dim_names=layout_names)
+        return self._gen_rank_enum(ordered_dims, dim_names=layout_names, shape=layout_shape)
 
-    def _gen_rank_enum(self, dims: list[str]) -> list[list[int]]:
+    def _gen_rank_enum(
+        self,
+        dims: list[str],
+        dim_names: Optional[list[str]] = None,
+        shape: Optional[list[int]] = None,
+    ) -> list[list[int]]:
         r"""Generate rank enumeration before calling new_subgroups_by_enumeration
 
         This function returns ranks grouped by the specified dimensions, but in REVERSE order
@@ -220,6 +391,11 @@ class HyperCommGrid:
 
         Args:
             dims: Name of leading dimensions to create process group
+            dim_names: Layout dim_names to use; defaults to ``self.dim_names``. When the caller
+                requests groups along an alt factorization, this is overridden by the alt's
+                shadow dim_names.
+            shape: Layout shape to use; defaults to ``self.shape``. Like ``dim_names``, this is
+                overridden when generating groups along an alt factorization.
 
         Although the function is lightweight enough to be inlined, a standalone one makes it
         easier to test against MCore's RankGenerator
@@ -230,8 +406,11 @@ class HyperCommGrid:
                 "einops is not installed. Please install it with `pip install einops`."
             )
 
+        layout_names = self.dim_names if dim_names is None else dim_names
+        layout_shape = self.shape if shape is None else shape
+
         # Need to reverse order of dim_names to match MCore convention
-        dim_names_reverse = self.dim_names[::-1]
+        dim_names_reverse = layout_names[::-1]
 
         remaining_dims = []
         for v in dim_names_reverse:
@@ -243,17 +422,20 @@ class HyperCommGrid:
         )
         logging.debug(rearrange_str)
 
-        shape_dict = {d: s for d, s in zip(self.dim_names, self.shape)}
+        shape_dict = {d: s for d, s in zip(layout_names, layout_shape)}
         return einops.rearrange(
             np.arange(self.rank_offset, self.rank_offset + self.size), rearrange_str, **shape_dict
         ).tolist()
 
-    def _order_dims(self, dims: Union[str, list[str]]) -> Tuple[list[str], str]:
-        r"""Reorder dims based on the order of self.dim_names"""
+    def _order_dims(
+        self, dims: Union[str, list[str]], dim_names: Optional[list[str]] = None
+    ) -> Tuple[list[str], str]:
+        r"""Reorder dims based on the order of ``dim_names`` (defaults to ``self.dim_names``)."""
+        layout_names = self.dim_names if dim_names is None else dim_names
         if not isinstance(dims, list):
             ordered_dims = [dims]
         else:
-            dim_names_reverse = self.dim_names[::-1]
+            dim_names_reverse = layout_names[::-1]
             indices = sorted([dim_names_reverse.index(d) for d in dims])
             if len(indices) == 1:
                 ordered_dims = [dim_names_reverse[indices[0]]]
