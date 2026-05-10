@@ -126,6 +126,7 @@ class RADIOViTModel(VisionModule):
         self.has_cpe = has_cpe
 
         # Using non-TE version so we can force gather_output
+        tp_group = getattr(pg_collection, "tp", None) if pg_collection is not None else None
         self.embedder = ColumnParallelLinear(
             input_size=3 * self.patch_dim * self.patch_dim,
             output_size=self.visual_hidden_size,
@@ -133,6 +134,7 @@ class RADIOViTModel(VisionModule):
             config=transformer_config,
             gather_output=True,
             init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
+            tp_group=tp_group,
         )
 
         self.model_type = ModelType.encoder_or_decoder

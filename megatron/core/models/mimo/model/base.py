@@ -78,7 +78,9 @@ class MimoModel(MegatronModule):
 
         self.partition_adapter: Optional[PartitionAdapter] = None
         # Create partition adapter only if parallelism is enabled
-        if language_config.context_parallel_size > 1 or language_config.sequence_parallel:
+        if self.role.has_language_module and (
+            language_config.context_parallel_size > 1 or language_config.sequence_parallel
+        ):
             partition_config = PartitionConfig.from_mp_config(
                 mp=language_config,
                 max_seq_len=max_seq_len,
@@ -377,11 +379,14 @@ class MimoModel(MegatronModule):
                 return self._forward_encoders(modality_inputs, input_tensors), loss_mask
 
             if self.role.has_language_module:
-                return (
-                    self._forward_language_module(
-                        input_ids, position_ids, attention_mask, labels, input_tensors
-                    ),
+                return self._forward_language_module(
+                    input_ids,
+                    position_ids,
+                    attention_mask,
                     loss_mask,
+                    labels,
+                    input_tensors,
+                    packing_kwargs,
                 )
 
             raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
@@ -424,9 +429,11 @@ class MimoModel(MegatronModule):
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         input_tensors: Optional[Dict[str, torch.Tensor]],
-    ) -> torch.Tensor:
+        packing_kwargs: Optional[dict] = None,
+    ):
         """Forward pass for language module on this rank.
 
         Args:
@@ -439,6 +446,15 @@ class MimoModel(MegatronModule):
         Returns:
             Language model output (hidden states, logits, or loss depending on stage)
         """
+        packed_seq_params = None
+        if packing_kwargs is not None:
+            for key in packing_kwargs:
+                if 'cu_seqlens' in key and packing_kwargs[key] is not None:
+                    packing_kwargs[key] = packing_kwargs[key].to(dtype=torch.int32)
+            packed_seq_params = PackedSeqParams(**packing_kwargs)
+            packed_seq_params.qkv_format = 'thd'
+            logger.debug(f"Packed sequence parameters: {packed_seq_params}")
+
         lang_name = MIMO_LANGUAGE_MODULE_KEY
 
         if self.role.is_first_stage(lang_name):
@@ -463,12 +479,27 @@ class MimoModel(MegatronModule):
                 special_token_ids=self.special_token_ids,
             )
 
+            if self.partition_adapter is not None:
+                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+                combined_embeddings, labels, loss_mask, attention_mask, packed_seq_params = (
+                    self.partition_adapter.shard(
+                        embeddings=combined_embeddings,
+                        labels=labels,
+                        loss_mask=loss_mask,
+                        attention_mask=attention_mask,
+                        packed_seq_params=packed_seq_params,
+                    )
+                )
+                if combined_embeddings is not None:
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
             lm_output = self.language_model(
                 input_ids=None,
                 position_ids=None,
                 decoder_input=combined_embeddings,
                 labels=labels,
-                attention_mask=attention_mask,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
             )
         else:
             # Non-first stage: receive hidden states from previous LM stage
@@ -480,19 +511,31 @@ class MimoModel(MegatronModule):
                 if hasattr(underlying_lm, 'set_input_tensor'):
                     underlying_lm.set_input_tensor(hidden_states)
 
+            if self.partition_adapter is not None:
+                _, labels, loss_mask, attention_mask, packed_seq_params = (
+                    self.partition_adapter.shard(
+                        embeddings=None,
+                        labels=labels,
+                        loss_mask=loss_mask,
+                        attention_mask=attention_mask,
+                        packed_seq_params=packed_seq_params,
+                    )
+                )
+
             lm_output = self.language_model(
                 input_ids=None,
                 position_ids=None,
                 decoder_input=None,
                 labels=labels,
                 attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
             )
 
         # Key output for non-last stages so schedule can route to next LM stage
         if not self.role.is_last_stage(lang_name):
-            return {lang_name: lm_output}
+            return {lang_name: lm_output}, loss_mask
 
-        return lm_output
+        return lm_output, loss_mask
 
     def _build_colocated_communicators(self):
         grid_map = self.mimo_config.module_to_grid_map

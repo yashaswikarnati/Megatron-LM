@@ -290,7 +290,11 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.reset_global_aux_loss_tracker()
 
 
-def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
+def _update_router_expert_bias(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
     """
     Update the expert bias of the router for a global batch.
     This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
@@ -312,7 +316,10 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
     stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
+        stacked_tokens_per_expert,
+        stacked_expert_bias,
+        config.moe_router_bias_update_rate,
+        tp_dp_cp_group=tp_dp_cp_group,
     )
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
@@ -433,12 +440,16 @@ def finalize_model_grads(
         embd_group = pg_collection.embd
         pos_emb_group = pg_collection.pos_embd
         dp_cp_group = pg_collection.dp_cp
+        tp_dp_cp_group = getattr(pg_collection, 'tp_dp_cp', None)
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        )
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
@@ -478,7 +489,11 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
-        _update_router_expert_bias(model, config)
+        if tp_dp_cp_group is None:
+            raise RuntimeError(
+                "pg_collection.tp_dp_cp is required when moe_router_enable_expert_bias is enabled"
+            )
+        _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 

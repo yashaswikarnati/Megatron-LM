@@ -145,6 +145,8 @@ class PartitionAdapter:
             shard_factor = None
             seq_dim = None  # which dimension holds the token sequence
 
+            # MimoModel.forward() passes embeddings in batch-first layout
+            # [B, S, H], so the token sequence dimension is always 1 here.
             if self.cfg.use_cp and self.cfg.seq_parallel:
                 shard_factor = get_pg_size(self.cfg.tp_group) * get_pg_size(self.cfg.cp_group) * 2
                 seq_dim = 1  # embeddings shape: [B, S, H]
@@ -153,7 +155,7 @@ class PartitionAdapter:
                 seq_dim = 1
             elif self.cfg.seq_parallel:
                 shard_factor = get_pg_size(self.cfg.tp_group)
-                seq_dim = 0  # embeddings shape: [S, B, H]
+                seq_dim = 1
 
             if shard_factor is not None and (
                 packed_seq_params is None
@@ -178,7 +180,13 @@ class PartitionAdapter:
             )
 
         if self.cfg.seq_parallel and embeddings is not None:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            # GPT/Hybrid output layers gather sequence-parallel hidden states
+            # before per-token loss, so labels/loss_mask remain full sequence.
+            embeddings = embeddings.transpose(0, 1).contiguous()
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                embeddings, group=self.cfg.tp_group
+            )
+            embeddings = embeddings.transpose(0, 1).contiguous()
 
         return embeddings, labels, loss_mask, attention_mask, packed_seq_params
 

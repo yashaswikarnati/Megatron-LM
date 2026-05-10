@@ -195,8 +195,7 @@ class TestPartitionAdapterShard:
         mock_tp_group = MagicMock()
         cfg = self._make_cfg(seq_parallel=True, max_seq_len=8, tp_group=mock_tp_group)
         adapter = PartitionAdapter(cfg)
-        # SP uses seq_dim=0: embeddings shape [S, B, H]
-        embeddings = torch.rand(8, 2, 16)
+        embeddings = torch.rand(2, 8, 16)
         labels = torch.randint(0, 100, (2, 8))
         loss_mask = torch.ones(2, 8)
         attention_mask = torch.ones(2, 8)
@@ -209,7 +208,23 @@ class TestPartitionAdapterShard:
             ),
         ):
             out = adapter.shard(embeddings, labels, loss_mask, attention_mask)
-        assert out[0].shape == (4, 2, 16)
+        assert out[0].shape == (2, 4, 16)
+        assert out[1] is labels
+        assert out[2] is loss_mask
+
+    def test_sp_only_leaves_labels_and_loss_mask_without_embeddings(self):
+        mock_tp_group = MagicMock()
+        cfg = self._make_cfg(seq_parallel=True, max_seq_len=8, tp_group=mock_tp_group)
+        adapter = PartitionAdapter(cfg)
+        labels = torch.arange(16).view(2, 8)
+        loss_mask = torch.arange(16, dtype=torch.float32).view(2, 8)
+        attention_mask = torch.ones(2, 8)
+        with patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2):
+            out = adapter.shard(None, labels, loss_mask, attention_mask)
+        assert out[0] is None
+        assert out[1] is labels
+        assert out[2] is loss_mask
+        assert out[3] is attention_mask
 
     def test_cp_and_sp_combined(self):
         mock_cp_group = MagicMock()
@@ -233,7 +248,7 @@ class TestPartitionAdapterShard:
             'loss_mask': loss_mask[:, :8],
             'attention_mask': attention_mask[:, :8],
         }
-        scattered = torch.rand(2, 4, 16)
+        scattered = torch.rand(4, 2, 16)
 
         with (
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
@@ -248,6 +263,8 @@ class TestPartitionAdapterShard:
         ):
             out = adapter.shard(embeddings, labels, loss_mask, attention_mask)
         assert out[0].shape == (2, 4, 16)
+        torch.testing.assert_close(out[1], labels[:, :8])
+        torch.testing.assert_close(out[2], loss_mask[:, :8])
 
     def test_seq_not_divisible_raises(self):
         mock_cp_group = MagicMock()
@@ -270,7 +287,7 @@ class TestPartitionAdapterShard:
         )
         adapter = PartitionAdapter(cfg)
         # S=8 but max_seq_len=16 → assertion fires
-        embeddings = torch.rand(8, 2, 16)  # [S, B, H] for SP
+        embeddings = torch.rand(2, 8, 16)
         labels = torch.randint(0, 100, (2, 8))
         loss_mask = torch.ones(2, 8)
         attention_mask = torch.ones(2, 8)

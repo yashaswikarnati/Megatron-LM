@@ -38,9 +38,15 @@ class MimoOptimizer(MegatronOptimizer):
     across all modules via all_reduce MAX.
     """
 
-    def __init__(self, module_infos: Dict[str, ModuleOptimizerInfo], config: OptimizerConfig):
+    def __init__(
+        self,
+        module_infos: Dict[str, ModuleOptimizerInfo],
+        config: OptimizerConfig,
+        stats_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
         self.module_infos = module_infos
         self.config = config
+        self.stats_group = stats_group
         self._active_optimizers: List[MegatronOptimizer] = [
             info.optimizer
             for info in module_infos.values()
@@ -53,8 +59,10 @@ class MimoOptimizer(MegatronOptimizer):
     def prepare_grads(self) -> bool:
         """Prepare gradients for all active module optimizers."""
         found_inf = False
-        for opt in self._active_optimizers:
-            found_inf |= opt.prepare_grads()
+        for name, info in sorted(self.module_infos.items()):
+            if not (info.is_active and info.optimizer is not None):
+                continue
+            found_inf |= info.optimizer.prepare_grads()
         return found_inf
 
     @torch.no_grad()
@@ -68,7 +76,9 @@ class MimoOptimizer(MegatronOptimizer):
                 module_norm = info.optimizer.get_grad_norm() or 0.0
                 norm_sq[i] = module_norm**2
 
-        torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(
+            norm_sq, op=torch.distributed.ReduceOp.MAX, group=self.stats_group
+        )
         return torch.sqrt(norm_sq.sum()).item()
 
     @torch.no_grad()
@@ -79,7 +89,9 @@ class MimoOptimizer(MegatronOptimizer):
         # if encoder ranks detect inf but LLM ranks don't, the early return
         # would skip the all_reduce in get_grad_norm(), causing a hang.
         found_inf_tensor = torch.tensor([found_inf], dtype=torch.float32, device="cuda")
-        torch.distributed.all_reduce(found_inf_tensor, op=torch.distributed.ReduceOp.MAX)
+        torch.distributed.all_reduce(
+            found_inf_tensor, op=torch.distributed.ReduceOp.MAX, group=self.stats_group
+        )
         found_inf = found_inf_tensor.item() > 0
         if found_inf:
             return False, None, None
@@ -356,7 +368,11 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     return pg
 
 
-def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
+def get_mimo_optimizer(
+    mimo_model: "MimoModel",
+    config: OptimizerConfig,
+    stats_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> MimoOptimizer:
     """Create optimizer for MimoModel with heterogeneous parallelism."""
     from megatron.core.optimizer import get_megatron_optimizer
 
@@ -401,4 +417,4 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
             optimizer=optimizer, grid=grid, pg_collection=pg_collection, is_active=is_active
         )
 
-    return MimoOptimizer(module_infos, config)
+    return MimoOptimizer(module_infos, config, stats_group=stats_group)
