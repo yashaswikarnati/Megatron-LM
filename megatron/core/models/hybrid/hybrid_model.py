@@ -192,6 +192,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            tp_group=getattr(self.pg_collection, "tp", None),
+            dp_cp_group=getattr(self.pg_collection, "dp_cp", None),
         )
 
         # Determine if MTP is needed (based on pattern parsing)

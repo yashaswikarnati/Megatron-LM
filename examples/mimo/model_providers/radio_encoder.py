@@ -6,11 +6,14 @@ Wraps RADIOViTModel to conform to the MIMO encoder forward(**kwargs) interface,
 with optional class-token dropping and pixel-shuffle post-processing.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
 from megatron.core.models.multimodal.llava_model import pixel_shuffle
 from megatron.core.models.vision.radio import RADIOViTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -41,6 +44,7 @@ class RADIOEncoderWrapper(nn.Module):
         max_img_w: int = 2048,
         has_cpe: bool = True,
         embedder_bias: bool = False,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__()
         self.drop_class_token = drop_class_token
@@ -59,6 +63,7 @@ class RADIOEncoderWrapper(nn.Module):
             max_img_w=max_img_w,
             has_cpe=has_cpe,
             embedder_bias=embedder_bias,
+            pg_collection=pg_collection,
         )
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):

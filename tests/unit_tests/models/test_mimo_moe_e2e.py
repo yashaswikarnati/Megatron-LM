@@ -268,6 +268,9 @@ def _build_radio_submodules_spec(
             "max_img_w": img_w,
             "has_cpe": True,
             "embedder_bias": False,
+            # Threading the encoder pg_collection into RADIOViTModel so it doesn't
+            # fall back to ``parallel_state`` for dp / dp_cp / intra_dp_cp groups.
+            "pg_collection": pg,
         },
     )
     proj_config = TransformerConfig(
@@ -440,33 +443,24 @@ class TestMimoMoEColocated:
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
     @staticmethod
-    def _reset_parallel_state(tp=1, pp=1, ep=1, etp=1):
-        """Destroy any existing parallel_state and re-initialize with the given topology.
+    def _reset_global_singletons():
+        """Drop any leftover ``parallel_state`` groups so this test's HCG-built groups
+        are the only model-parallel topology the process knows about.
 
-        Required because ``HybridModel`` still calls into ``parallel_state``
-        (e.g. ``log_on_each_pipeline_stage``); without an unconditional
-        destroy-then-init, tests that need different topologies become order-dependent.
-        Also resets the global memory buffer and the CUDA RNG tracker so prior tests'
-        state doesn't bleed into RNG-sensitive paths in this one.
+        The MIMO/hetero path threads process groups through ``HyperCommGrid`` and
+        ``ProcessGroupCollection``; we deliberately do *not* call
+        ``parallel_state.initialize_model_parallel`` so any code that silently reaches
+        for it via the global singletons surfaces immediately rather than picking up
+        a wrong-topology group.
+
+        ``_GLOBAL_MEMORY_BUFFER`` and ``_CUDA_RNG_STATE_TRACKER`` are intentionally
+        left alone — touching them at test-method scope can race with live CUDA state
+        and crash pytest fixture teardown. The batch runner already gives each test
+        its own ``torch.distributed.run`` invocation, so a fresh process is the real
+        isolation boundary.
         """
-        from megatron.core.tensor_parallel import random as tp_random
-
         if parallel_state.model_parallel_is_initialized():
             parallel_state.destroy_model_parallel()
-        parallel_state._GLOBAL_MEMORY_BUFFER = None
-        # ``_CUDA_RNG_STATE_TRACKER`` is a private singleton; ``.reset()`` is its public
-        # surface for clearing seed names. ``initialize_rng_tracker`` recreates the
-        # tracker on next ``model_parallel_cuda_manual_seed`` call.
-        try:
-            tp_random.get_cuda_rng_tracker().reset()
-        except Exception:
-            pass
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=tp,
-            pipeline_model_parallel_size=pp,
-            expert_model_parallel_size=ep,
-            expert_tensor_parallel_size=etp,
-        )
 
     def _run_mimo_step(
         self,
@@ -563,7 +557,7 @@ class TestMimoMoEColocated:
         # GPT path doesn't strictly need ``parallel_state``, but resetting it
         # explicitly makes the test order-independent — matches the other tests
         # in the class.
-        self._reset_parallel_state(tp=1, pp=1, ep=4, etp=1)
+        self._reset_global_singletons()
         encoder_grid, llm_grid, encoder_pg, llm_pg = self._setup_pgs_and_rng()
         hidden = 64
         language_spec = _build_language_spec(
@@ -599,7 +593,7 @@ class TestMimoMoEColocated:
         """
         if not dist.is_initialized() or dist.get_world_size() != 8:
             pytest.skip("Requires exactly 8 GPUs")
-        self._reset_parallel_state(tp=1, pp=1, ep=4, etp=1)
+        self._reset_global_singletons()
         encoder_grid, llm_grid, encoder_pg, llm_pg = self._setup_pgs_and_rng()
 
         hidden = 128
@@ -693,7 +687,7 @@ class TestMimoMoEColocated:
         LLM (ranks 4-7) bridged by ``MultiModulePipelineCommunicator``."""
         if not dist.is_initialized() or dist.get_world_size() != 8:
             pytest.skip("Requires exactly 8 GPUs")
-        self._reset_parallel_state(tp=1, pp=1, ep=2, etp=1)
+        self._reset_global_singletons()
         torch.manual_seed(12345)
         torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
 
@@ -902,7 +896,7 @@ class TestMimoMoEColocated:
         # parallel_state needs to match the LLM topology because HybridModel still
         # reaches into log_on_each_pipeline_stage / get_tensor_model_parallel_*. We
         # initialize it once with TP=1 EP=2 PP=1 (matching the LLM slab on ranks 4-7).
-        self._reset_parallel_state(tp=1, pp=1, ep=2, etp=1)
+        self._reset_global_singletons()
 
         torch.manual_seed(12345)
         torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
@@ -1138,7 +1132,7 @@ class TestMimoMoEColocated:
         if not dist.is_initialized() or dist.get_world_size() != 8:
             pytest.skip("Requires exactly 8 GPUs")
         # Match LLM grid topology: tp=1 cp=1 dp=8 pp=1 with ep=4 etp=1 edp=2.
-        self._reset_parallel_state(tp=1, pp=1, ep=4, etp=1)
+        self._reset_global_singletons()
         encoder_grid, llm_grid, encoder_pg, llm_pg = self._setup_pgs_and_rng()
         hidden = 128
         language_spec = _build_mamba_moe_language_spec(
