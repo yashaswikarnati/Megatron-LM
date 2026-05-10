@@ -38,15 +38,9 @@ class MimoOptimizer(MegatronOptimizer):
     across all modules via all_reduce MAX.
     """
 
-    def __init__(
-        self,
-        module_infos: Dict[str, ModuleOptimizerInfo],
-        config: OptimizerConfig,
-        stats_group: Optional[torch.distributed.ProcessGroup] = None,
-    ):
+    def __init__(self, module_infos: Dict[str, ModuleOptimizerInfo], config: OptimizerConfig):
         self.module_infos = module_infos
         self.config = config
-        self.stats_group = stats_group
         self._active_optimizers: List[MegatronOptimizer] = [
             info.optimizer
             for info in module_infos.values()
@@ -76,9 +70,7 @@ class MimoOptimizer(MegatronOptimizer):
                 module_norm = info.optimizer.get_grad_norm() or 0.0
                 norm_sq[i] = module_norm**2
 
-        torch.distributed.all_reduce(
-            norm_sq, op=torch.distributed.ReduceOp.MAX, group=self.stats_group
-        )
+        torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
         return torch.sqrt(norm_sq.sum()).item()
 
     @torch.no_grad()
@@ -89,9 +81,7 @@ class MimoOptimizer(MegatronOptimizer):
         # if encoder ranks detect inf but LLM ranks don't, the early return
         # would skip the all_reduce in get_grad_norm(), causing a hang.
         found_inf_tensor = torch.tensor([found_inf], dtype=torch.float32, device="cuda")
-        torch.distributed.all_reduce(
-            found_inf_tensor, op=torch.distributed.ReduceOp.MAX, group=self.stats_group
-        )
+        torch.distributed.all_reduce(found_inf_tensor, op=torch.distributed.ReduceOp.MAX)
         found_inf = found_inf_tensor.item() > 0
         if found_inf:
             return False, None, None
@@ -118,25 +108,25 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
-        """Step active module optimizers after gradients have been prepared."""
+        """Step each active optimizer using already-ready gradients."""
         success = True
         for opt in self._active_optimizers:
             success &= opt.step_with_ready_grads()
         return success
 
     def zero_grad(self, set_to_none: bool = True):
-        """Clear gradients on all active module optimizers."""
+        """Clear gradients on each active optimizer."""
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
 
     def get_loss_scale(self) -> torch.Tensor:
-        """Return the loss scale from the first active optimizer, or one for stubs."""
+        """Return the active optimizer loss scale."""
         if self._active_optimizers:
             return self._active_optimizers[0].get_loss_scale()
         return torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def count_zeros(self) -> int:
-        """Count zero gradients across all active module optimizers."""
+        """Count zero gradients across active optimizers."""
         return sum(opt.count_zeros() for opt in self._active_optimizers)
 
     @property
@@ -306,14 +296,14 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     Only fetches process groups required by the optimizer. Assumes all groups
     are pre-created in the grid via grid.create_pg() - does not create any new groups.
 
-    For extended HyperCommGrid instances with registered expert layouts, the following
-    groups must be pre-created in the grid before calling this function:
+    For HyperCommGrid instances with registered expert dimensions, the following
+    groups must be pre-created before calling this function:
         grid.create_pg(["dp"])
         grid.create_pg(["dp", "cp"])
         grid.create_pg(["tp"])
         grid.create_pg(["pp"])
         grid.create_pg(["tp", "pp"])
-        grid.create_pg("tp_ep_pp")
+        grid.create_pg(["expt_tp", "ep", "pp"])
         grid.create_pg("expt_dp")
         grid.create_pg(["tp", "cp", "dp", "pp"])
 
@@ -336,10 +326,7 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
             required_pgs=['dp', 'dp_cp', 'tp', 'pp', 'mp', 'tp_ep_pp', 'expt_dp', 'intra_dist_opt'],
         )
     except (KeyError, ValueError) as exc:
-        has_registered_expert_aliases = hasattr(grid, 'has_alias') and (
-            grid.has_alias('tp_ep') or grid.has_alias('tp_ep_pp')
-        )
-        if has_registered_expert_aliases:
+        if hasattr(grid, 'has_layout') and grid.has_layout('expert'):
             raise exc
         # Backward-compatible fallback for older tests/grids that encoded EP
         # directly in the base Cartesian layout.
@@ -368,11 +355,7 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     return pg
 
 
-def get_mimo_optimizer(
-    mimo_model: "MimoModel",
-    config: OptimizerConfig,
-    stats_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> MimoOptimizer:
+def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
     """Create optimizer for MimoModel with heterogeneous parallelism."""
     from megatron.core.optimizer import get_megatron_optimizer
 
@@ -417,4 +400,4 @@ def get_mimo_optimizer(
             optimizer=optimizer, grid=grid, pg_collection=pg_collection, is_active=is_active
         )
 
-    return MimoOptimizer(module_infos, config, stats_group=stats_group)
+    return MimoOptimizer(module_infos, config)

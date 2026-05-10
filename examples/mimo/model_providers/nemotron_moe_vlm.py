@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Model provider helpers for heterogeneous MIMO VLM examples."""
+"""Model providers and configs for MIMO VLM examples."""
 
 from __future__ import annotations
 
@@ -29,14 +29,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
 
 from examples.mimo.utils.hetero import (
-    MOCK_VISION_ENCODER_KEY,
-    NEMOTRON_20L_HYBRID_PATTERN,
-    NEMOTRON_VISION_ENCODER_KEY,
     debug_rank,
     get_grid_dim_size,
     get_group_rank_or,
     get_group_size_or,
-    is_nemotron_20l,
     is_process_group_member,
 )
 
@@ -50,6 +46,127 @@ except ImportError:
     TEColumnParallelLinear = None
     TELayerNormColumnParallelLinear = None
     TERowParallelLinear = None
+
+MOCK_MODEL_PROVIDER = "mock"
+NEMOTRON_20L_MODEL_PROVIDER = "nemotron-moe-vlm-20l"
+NEMOTRON_20L_HYBRID_PATTERN = "MEMEM*EMEMEM*EMEMEM*"
+NEMOTRON_20L_IMAGE_SEQ_PER_TILE = 256
+NEMOTRON_20L_MAX_NUM_TILES = 12
+NEMOTRON_20L_DEFAULT_STAGE = "stage2"
+MOCK_VISION_ENCODER_KEY = "clip_encoder"
+NEMOTRON_VISION_ENCODER_KEY = "radio_encoder"
+
+
+def is_nemotron_20l(args: argparse.Namespace) -> bool:
+    return args.model_provider == NEMOTRON_20L_MODEL_PROVIDER
+
+
+def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
+    provider = parser.add_argument_group("model provider")
+    provider.add_argument(
+        "--model-provider",
+        choices=[MOCK_MODEL_PROVIDER, NEMOTRON_20L_MODEL_PROVIDER],
+        default=MOCK_MODEL_PROVIDER,
+    )
+    provider.add_argument("--hidden-size", type=int, default=128)
+    provider.add_argument("--num-layers", type=int, default=2)
+    provider.add_argument("--num-attention-heads", type=int, default=8)
+    provider.add_argument("--vocab-size", type=int, default=512)
+    provider.add_argument("--seq-length", type=int, default=32)
+    provider.add_argument("--image-seq-length", type=int, default=None)
+    provider.add_argument("--image-token-id", type=int, default=511)
+    provider.add_argument("--pad-token-id", type=int, default=0)
+    provider.add_argument("--image-token", type=str, default="<image>")
+    provider.add_argument("--tokenizer-model", type=str, default=None)
+    provider.add_argument("--tokenizer-prompt-format", type=str, default="nemotron6-moe")
+    provider.add_argument("--image-tag-type", type=str, default="")
+    provider.add_argument("--force-system-message", action="store_true")
+    provider.add_argument("--num-moe-experts", type=int, default=4)
+    provider.add_argument("--moe-router-topk", type=int, default=1)
+    provider.add_argument("--moe-grouped-gemm", action="store_true")
+    provider.add_argument("--img-h", type=int, default=512)
+    provider.add_argument("--img-w", type=int, default=512)
+    provider.add_argument("--patch-dim", type=int, default=16)
+    provider.add_argument("--class-token-len", type=int, default=8)
+    provider.add_argument("--num-image-tiles", type=int, default=NEMOTRON_20L_MAX_NUM_TILES)
+    provider.add_argument("--freeze-lm", action="store_true")
+    provider.add_argument("--freeze-vit", action="store_true")
+    provider.add_argument("--freeze-projection", action="store_true")
+    provider.add_argument("--training-stage", choices=["stage1", "stage2", "stage3"], default=None)
+    provider.add_argument("--fp32", action="store_true")
+
+
+def prepare_model_provider_args(args: argparse.Namespace) -> None:
+    apply_model_provider_defaults(args)
+    apply_training_stage(args)
+    resolve_image_token_id(args)
+    args.vision_encoder_key = get_encoder_module_name(args)
+    args.vision_input_mode = "pixels" if is_nemotron_20l(args) else "hidden_states"
+
+
+def apply_model_provider_defaults(args: argparse.Namespace) -> None:
+    if not is_nemotron_20l(args):
+        return
+
+    args.num_layers = 20
+    args.hidden_size = 2688
+    args.num_attention_heads = 32
+    args.num_moe_experts = 128
+    args.moe_router_topk = 6
+    args.moe_grouped_gemm = True
+    args.seq_length = 8192
+    args.image_seq_length = NEMOTRON_20L_IMAGE_SEQ_PER_TILE * args.num_image_tiles
+
+
+def apply_training_stage(args: argparse.Namespace) -> None:
+    if not is_nemotron_20l(args):
+        return
+
+    stage = args.training_stage or NEMOTRON_20L_DEFAULT_STAGE
+    if stage == "stage1":
+        args.freeze_vit = True
+        args.freeze_lm = True
+    elif stage == "stage2":
+        args.freeze_vit = True
+    elif stage != "stage3":
+        raise ValueError(f"unsupported Nemotron VLM training stage: {stage}")
+    args.training_stage = stage
+
+
+def resolve_image_token_id(args: argparse.Namespace) -> None:
+    if not is_nemotron_20l(args) or not args.tokenizer_model:
+        return
+
+    from megatron.core.tokenizers.vision.libraries.multimodal_tokenizer import (
+        MegatronMultimodalTokenizer,
+    )
+
+    tokenizer = MegatronMultimodalTokenizer(
+        path=args.tokenizer_model,
+        prompt_format=args.tokenizer_prompt_format,
+        special_tokens=[args.image_token],
+        image_tag_type=args.image_tag_type,
+        force_system_message=args.force_system_message,
+    )
+    image_token_id = tokenizer.convert_tokens_to_ids(args.image_token)
+    if image_token_id is None:
+        raise RuntimeError(
+            f"tokenizer at {args.tokenizer_model} did not produce an id for {args.image_token}"
+        )
+    args.image_token_id = int(image_token_id)
+    if tokenizer.pad is not None:
+        args.pad_token_id = int(tokenizer.pad)
+    if tokenizer.vocab_size is not None:
+        args.vocab_size = int(tokenizer.vocab_size)
+
+
+def validate_model_provider_args(args: argparse.Namespace) -> None:
+    if args.hidden_size % args.num_attention_heads != 0:
+        raise ValueError("--hidden-size must be divisible by --num-attention-heads")
+    if not 0 <= args.image_token_id < args.vocab_size:
+        raise ValueError("--image-token-id must be within --vocab-size")
+    if not 0 <= args.pad_token_id < args.vocab_size:
+        raise ValueError("--pad-token-id must be within --vocab-size")
 
 
 class RADIOEncoderWrapper(torch.nn.Module):
@@ -197,6 +314,8 @@ def nemotron_language_config(
         pipeline_dtype=dtype,
         bf16=bf16,
         calculate_per_token_loss=True,
+        cross_entropy_loss_fusion=True,
+        cross_entropy_fusion_impl="te",
         bias_activation_fusion=False,
         masked_softmax_fusion=True,
         persist_layer_norm=True,

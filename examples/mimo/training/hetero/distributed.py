@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 
 import torch
@@ -13,17 +12,9 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 
 
-def clear_transformer_engine_env() -> None:
-    """Clear attention backend overrides that can conflict with model construction."""
-    os.environ.pop("NVTE_FLASH_ATTN", None)
-    os.environ.pop("NVTE_FUSED_ATTN", None)
-    os.environ.pop("NVTE_UNFUSED_ATTN", None)
-
-
 def initialize_distributed() -> None:
     """Initialize torch.distributed for torchrun."""
-    clear_transformer_engine_env()
-    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    import os
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)

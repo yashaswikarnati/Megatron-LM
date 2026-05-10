@@ -44,7 +44,6 @@ def wire_training_hooks(runtime: HeteroRuntime, topology: HeteroTopology) -> Non
     mimo_model = runtime.model
     language_pg = topology.language_pg
     vision_pg = topology.vision_pg
-    token_count_group = topology.optimizer_stats_group
 
     def is_token_source_rank() -> bool:
         return (
@@ -61,7 +60,7 @@ def wire_training_hooks(runtime: HeteroRuntime, topology: HeteroTopology) -> Non
         token_count = torch.zeros(1, dtype=torch.float32, device="cuda")
         if is_token_source_rank():
             token_count[0] = num_tokens.to(device="cuda", dtype=torch.float32).sum()
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM, group=token_count_group)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
         global_num_tokens = token_count.item()
 
         if mimo_model.language_model is not None:
@@ -180,7 +179,7 @@ def train_step(
 
     debug_rank("optimizer step starting")
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-    update_successful = reduce_update_success(update_successful, topology.optimizer_stats_group)
+    update_successful = reduce_update_success(update_successful)
     debug_rank("optimizer step complete")
 
     if update_successful:
@@ -200,8 +199,8 @@ def train_step(
     )
 
 
-def reduce_update_success(update_successful: bool, group: dist.ProcessGroup) -> bool:
+def reduce_update_success(update_successful: bool) -> bool:
     """Match Megatron's cross-rank success agreement for hetero process groups."""
     value = torch.tensor([1 if update_successful else 0], dtype=torch.int, device="cuda")
-    dist.all_reduce(value, op=dist.ReduceOp.MIN, group=group)
+    dist.all_reduce(value, op=dist.ReduceOp.MIN)
     return bool(value.item())

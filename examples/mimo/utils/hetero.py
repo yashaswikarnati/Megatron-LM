@@ -12,20 +12,6 @@ import torch.distributed as dist
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
 
-MOCK_MODEL_PRESET = "mock"
-NEMOTRON_20L_MODEL_PRESET = "nemotron-moe-vlm-20l"
-NEMOTRON_20L_HYBRID_PATTERN = "MEMEM*EMEMEM*EMEMEM*"
-NEMOTRON_20L_IMAGE_SEQ_PER_TILE = 256
-NEMOTRON_20L_MAX_NUM_TILES = 12
-NEMOTRON_20L_DEFAULT_STAGE = "stage2"
-MOCK_VISION_ENCODER_KEY = "clip_encoder"
-NEMOTRON_VISION_ENCODER_KEY = "radio_encoder"
-
-
-def is_nemotron_20l(args) -> bool:
-    """Return whether the run should use the Nemotron6-MoE VLM 20L architecture."""
-    return args.model_preset == NEMOTRON_20L_MODEL_PRESET
-
 
 def debug_rank(message: str) -> None:
     """Emit per-rank startup checkpoints when MIMO_HETERO_DEBUG is set."""

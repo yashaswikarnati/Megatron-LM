@@ -35,7 +35,6 @@ class HeteroTopology:
     language_pg: ProcessGroupCollection
     vision_pg: ProcessGroupCollection
     schedule_pg_collection: MultiModuleProcessGroupCollection
-    optimizer_stats_group: dist.ProcessGroup
     encoder_size: int
     llm_size: int
     encoder_name: str = ENCODER_MODULE_NAME
@@ -52,7 +51,6 @@ class HeteroTopology:
 
     def destroy(self) -> None:
         """Destroy all process groups owned by this topology."""
-        destroy_process_group_if_member(self.optimizer_stats_group)
         destroy_embedding_groups()
         self.encoder_grid.destroy()
         self.llm_grid.destroy()
@@ -61,10 +59,8 @@ class HeteroTopology:
 
 def create_topology(args: argparse.Namespace, encoder_size: int, llm_size: int) -> HeteroTopology:
     """Create all rank-global process groups in one deterministic order."""
-    world_size = dist.get_world_size()
     encoder_grid = None
     llm_grid = None
-    optimizer_stats_group = None
     try:
         debug_rank("creating encoder grid")
         encoder_grid = create_hypercomm_grid(
@@ -98,22 +94,16 @@ def create_topology(args: argparse.Namespace, encoder_size: int, llm_size: int) 
             ENCODER_MODULE_NAME, encoder_grid, llm_grid, vision_pg, language_pg
         )
 
-        debug_rank("creating MIMO optimizer stats group")
-        optimizer_stats_group = dist.new_group(ranks=list(range(world_size)), backend="nccl")
-        debug_rank("MIMO optimizer stats group ready")
-
         return HeteroTopology(
             encoder_grid=encoder_grid,
             llm_grid=llm_grid,
             language_pg=language_pg,
             vision_pg=vision_pg,
             schedule_pg_collection=schedule_pg_collection,
-            optimizer_stats_group=optimizer_stats_group,
             encoder_size=encoder_size,
             llm_size=llm_size,
         )
     except Exception:
-        destroy_process_group_if_member(optimizer_stats_group)
         destroy_embedding_groups()
         if encoder_grid is not None:
             encoder_grid.destroy()
@@ -156,12 +146,7 @@ def create_hypercomm_grid(
         rank_offset=offset,
         backend="nccl",
     )
-    grid.register_layout(
-        "expert",
-        [expt_tp, ep, expt_dp, pp],
-        ["expt_tp", "ep", "expt_dp", "pp"],
-        aliases={"tp_ep": ["expt_tp", "ep"], "tp_ep_pp": ["expt_tp", "ep", "pp"]},
-    )
+    grid.register_layout("expert", [expt_tp, ep, expt_dp, pp], ["expt_tp", "ep", "expt_dp", "pp"])
 
     try:
         for dims in (
@@ -177,8 +162,8 @@ def create_hypercomm_grid(
             ["tp", "pp"],
             ["tp", "cp", "dp"],
             ["tp", "cp", "pp", "dp"],
-            "tp_ep",
-            "tp_ep_pp",
+            ["expt_tp", "ep"],
+            ["expt_tp", "ep", "pp"],
         ):
             grid.create_pg(dims)
     except Exception:

@@ -99,12 +99,7 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, ep=1, expt_tp=None, 
         rank_offset=offset,
         backend="nccl",
     )
-    grid.register_layout(
-        "expert",
-        [expt_tp, ep, expt_dp, pp],
-        ["expt_tp", "ep", "expt_dp", "pp"],
-        aliases={"tp_ep": ["expt_tp", "ep"], "tp_ep_pp": ["expt_tp", "ep", "pp"]},
-    )
+    grid.register_layout("expert", [expt_tp, ep, expt_dp, pp], ["expt_tp", "ep", "expt_dp", "pp"])
     grid.create_pg(["tp"])
     grid.create_pg(["cp"])
     grid.create_pg(["pp"])
@@ -117,8 +112,8 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, ep=1, expt_tp=None, 
     grid.create_pg(["tp", "pp"])
     grid.create_pg(["tp", "cp", "dp"])
     grid.create_pg(["tp", "cp", "pp", "dp"])
-    grid.create_pg("tp_ep")
-    grid.create_pg("tp_ep_pp")
+    grid.create_pg(["expt_tp", "ep"])
+    grid.create_pg(["expt_tp", "ep", "pp"])
     _active_grids.append(grid)
     return grid
 

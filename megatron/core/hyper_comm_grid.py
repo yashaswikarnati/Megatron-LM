@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from operator import itemgetter
 from typing import Any, Optional, Tuple, Union
 
@@ -40,15 +40,8 @@ def _is_process_group_member(pg: Optional[dist.ProcessGroup]) -> bool:
 
 @dataclass
 class _GridLayout:
-    """Rank layout owned by a HyperCommGrid.
-
-    The base layout is the original Cartesian grid. Registered layouts are
-    alternate factorizations over the same rank span.
-    """
-
     shape: list[int]
     dim_names: list[str]
-    aliases: dict[str, list[str]] = field(default_factory=dict)
 
 
 class HyperCommGrid:
@@ -138,15 +131,8 @@ class HyperCommGrid:
         self.backend = backend
         self._pgs: dict[str, dist.ProcessGroup] = {}
         self._layouts: dict[str, _GridLayout] = {"base": _GridLayout(self.shape, self.dim_names)}
-        self._aliases: dict[str, tuple[str, list[str]]] = {}
 
-    def register_layout(
-        self,
-        name: str,
-        shape: list[int],
-        dim_names: list[str],
-        aliases: Optional[dict[str, list[str]]] = None,
-    ) -> None:
+    def register_layout(self, name: str, shape: list[int], dim_names: list[str]) -> None:
         """Register an alternate rank layout over this grid's rank span.
 
         Registered layouts are useful when the same module rank universe has
@@ -159,8 +145,6 @@ class HyperCommGrid:
             shape: Shape of the alternate layout. Its product must equal the
                 base grid size.
             dim_names: Dimension names for the alternate layout.
-            aliases: Optional names for composite groups in this layout.
-                For example, ``{"tp_ep": ["expt_tp", "ep"]}``.
         """
         if name == "base":
             raise ValueError("'base' is reserved for the default HyperCommGrid layout")
@@ -187,44 +171,11 @@ class HyperCommGrid:
                     "but has different rank enumeration"
                 )
 
-        aliases = aliases or {}
-        for alias_name, alias_dims in aliases.items():
-            if alias_name in self._aliases:
-                raise ValueError(f"Alias {alias_name!r} is already registered")
-            if alias_name in self.dim_names or alias_name in dim_names:
-                raise ValueError(f"Alias {alias_name!r} conflicts with an existing dimension name")
-            if "-" in alias_name:
-                raise ValueError(
-                    f"Alias {alias_name!r} cannot contain '-' because process group keys use '-'"
-                )
-            if len(set(alias_dims)) != len(alias_dims):
-                raise ValueError(f"Alias {alias_name!r} has duplicate dimensions: {alias_dims}")
-            missing_dims = [dim for dim in alias_dims if dim not in dim_names]
-            if missing_dims:
-                raise ValueError(
-                    f"Alias {alias_name!r} references dimensions not in layout {name!r}: "
-                    f"{missing_dims}"
-                )
-            layout.aliases[alias_name] = alias_dims[:]
-
         self._layouts[name] = layout
-        for alias_name, alias_dims in layout.aliases.items():
-            self._aliases[alias_name] = (name, alias_dims[:])
 
     def has_layout(self, name: str) -> bool:
         """Return whether a named layout is registered."""
         return name in self._layouts
-
-    def has_alias(self, name: str) -> bool:
-        """Return whether an alias is registered."""
-        return name in self._aliases
-
-    def get_alias_dims(self, name: str) -> list[str]:
-        """Return a copy of the dimensions referenced by an alias."""
-        if name not in self._aliases:
-            raise KeyError(f"Alias {name!r} is not registered")
-        _, alias_dims = self._aliases[name]
-        return alias_dims[:]
 
     def create_pg(self, dims: Union[str, list[str]], **kwargs: Any) -> dist.ProcessGroup | None:
         r"""Create a process group based on a list of dimension names
@@ -308,7 +259,7 @@ class HyperCommGrid:
         Args:
             dims: Dimension name or list of dimension names.
             layout_name: Optional registered layout name. When unset, the
-                owning layout is inferred from dims or aliases.
+                owning layout is inferred from dims.
 
         Returns:
             List of rank lists (one per subgroup).
@@ -316,7 +267,6 @@ class HyperCommGrid:
         if layout_name is None:
             layout_name, ordered_dims, _ = self._resolve_dims(dims)
         else:
-            dims = self._expand_alias(dims, layout_name)
             ordered_dims, _ = self._order_dims_for_layout(dims, layout_name)
         return self._gen_rank_enum_for_layout(ordered_dims, layout_name)
 
@@ -405,11 +355,6 @@ class HyperCommGrid:
         return ordered_dims, unique_group_key
 
     def _resolve_dims(self, dims: Union[str, list[str]]) -> Tuple[str, list[str], str]:
-        if isinstance(dims, str) and dims in self._aliases:
-            layout_name, alias_dims = self._aliases[dims]
-            ordered_dims, _ = self._order_dims_for_layout(alias_dims, layout_name)
-            return layout_name, ordered_dims, dims
-
         raw_dims = [dims] if isinstance(dims, str) else dims
 
         if all(dim in self.dim_names for dim in raw_dims):
@@ -431,26 +376,8 @@ class HyperCommGrid:
             )
 
         layout_name = candidate_layouts[0]
-        if len(raw_dims) > 1:
-            aliases = sorted(self._layouts[layout_name].aliases)
-            raise ValueError(
-                f"Composite dimensions {raw_dims} from registered layout {layout_name!r} "
-                f"must use an explicit alias. Available aliases: {aliases}"
-            )
-
         ordered_dims, unique_group_key = self._order_dims_for_layout(raw_dims, layout_name)
         return layout_name, ordered_dims, unique_group_key
-
-    def _expand_alias(self, dims: Union[str, list[str]], layout_name: str) -> Union[str, list[str]]:
-        if not isinstance(dims, str) or dims not in self._aliases:
-            return dims
-
-        alias_layout_name, alias_dims = self._aliases[dims]
-        if alias_layout_name != layout_name:
-            raise ValueError(
-                f"Alias {dims!r} belongs to layout {alias_layout_name!r}, not {layout_name!r}"
-            )
-        return alias_dims[:]
 
     def is_current_rank_in_grid(self) -> bool:
         """Check if the current rank belongs to this grid.

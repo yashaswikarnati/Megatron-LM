@@ -68,13 +68,9 @@ class HeteroTrainingLogger:
         elapsed_ms = (elapsed / interval_iters) * 1000.0
         loss_value = self.loss_total / self.loss_count if self.loss_count else None
         learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
-        learning_rate = reduce_max_optional_float(
-            learning_rate, self.topology.optimizer_stats_group
-        )
-        grad_norm = reduce_max_optional_float(result.grad_norm, self.topology.optimizer_stats_group)
-        num_zeros_in_grad = reduce_max_optional_float(
-            result.num_zeros_in_grad, self.topology.optimizer_stats_group
-        )
+        learning_rate = reduce_max_optional_float(learning_rate)
+        grad_norm = reduce_max_optional_float(result.grad_norm)
+        num_zeros_in_grad = reduce_max_optional_float(result.num_zeros_in_grad)
         loss_scale = optimizer.get_loss_scale().item()
 
         if is_language_log_rank(self.topology):
@@ -109,16 +105,18 @@ class HeteroTrainingLogger:
 
 
 def reduce_language_loss(losses: list[dict], topology: HeteroTopology) -> Optional[float]:
-    """Reduce raw loss/token vectors over the language DP/TP/CP logging group."""
+    """Reduce raw loss/token vectors over the language DP/CP logging group."""
     language_pg = topology.language_pg
     loss_acc = torch.zeros(2, dtype=torch.float32, device="cuda")
-    is_log_stage = is_process_group_member(getattr(language_pg, "tp_dp_cp", None)) and (
-        is_pp_last_stage(language_pg.pp)
+    is_log_stage = (
+        is_process_group_member(getattr(language_pg, "dp_cp", None))
+        and (is_pp_last_stage(language_pg.pp))
+        and language_pg.tp.rank() == 0
     )
     if not is_log_stage:
         return None
 
-    if losses and language_pg.tp.rank() == 0:
+    if losses:
         for loss_dict in losses:
             loss_sum = loss_dict.get("lm loss sum")
             num_tokens = loss_dict.get("lm tokens")
@@ -131,7 +129,7 @@ def reduce_language_loss(losses: list[dict], topology: HeteroTopology) -> Option
             elif num_tokens is not None:
                 loss_acc[1] += float(num_tokens)
 
-    dist.all_reduce(loss_acc, op=dist.ReduceOp.SUM, group=language_pg.tp_dp_cp)
+    dist.all_reduce(loss_acc, op=dist.ReduceOp.SUM, group=language_pg.dp_cp)
     return loss_acc[0].item() / loss_acc[1].item() if loss_acc[1].item() else None
 
 
@@ -139,19 +137,20 @@ def is_language_log_rank(topology: HeteroTopology) -> bool:
     """Return whether this rank should print language-side training metrics."""
     language_pg = topology.language_pg
     if not (
-        is_process_group_member(getattr(language_pg, "tp_dp_cp", None))
+        is_process_group_member(getattr(language_pg, "dp_cp", None))
         and is_pp_last_stage(language_pg.pp)
+        and language_pg.tp.rank() == 0
     ):
         return False
-    language_group_ranks = dist.get_process_group_ranks(language_pg.tp_dp_cp)
+    language_group_ranks = dist.get_process_group_ranks(language_pg.dp_cp)
     return dist.get_rank() == min(language_group_ranks)
 
 
-def reduce_max_optional_float(value, group: dist.ProcessGroup) -> Optional[float]:
+def reduce_max_optional_float(value) -> Optional[float]:
     """Reduce optional scalar stats so the language log rank can see non-local optimizers."""
     if isinstance(value, torch.Tensor):
         value = value.item()
     local_value = -1.0 if value is None else float(value)
     stat = torch.tensor([local_value], dtype=torch.float32, device="cuda")
-    dist.all_reduce(stat, op=dist.ReduceOp.MAX, group=group)
+    dist.all_reduce(stat, op=dist.ReduceOp.MAX)
     return None if stat.item() == -1.0 else stat.item()

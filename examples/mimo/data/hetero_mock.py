@@ -8,12 +8,16 @@ import argparse
 
 import torch
 
-from examples.mimo.utils.hetero import (
-    MOCK_VISION_ENCODER_KEY,
-    NEMOTRON_VISION_ENCODER_KEY,
-    debug_rank,
-    is_nemotron_20l,
-)
+from examples.mimo.utils.hetero import debug_rank
+
+
+def validate_mock_data_args(args: argparse.Namespace) -> None:
+    """Validate synthetic next-token VLM data constraints."""
+    image_seq_length = args.image_seq_length or args.seq_length // 2
+    if image_seq_length >= args.seq_length:
+        raise ValueError("--image-seq-length must be smaller than --seq-length")
+    if args.seq_length - image_seq_length < 2:
+        raise ValueError("mock next-token training needs at least two text tokens")
 
 
 class MockVLMIterator:
@@ -26,6 +30,8 @@ class MockVLMIterator:
         self.micro_batch_size = micro_batch_size
         self.encoder_name = encoder_name
         self.image_seq_length = args.image_seq_length or args.seq_length // 2
+        self.vision_encoder_key = getattr(args, "vision_encoder_key", "clip_encoder")
+        self.vision_input_mode = getattr(args, "vision_input_mode", "hidden_states")
         self.dtype = torch.float32 if args.fp32 else torch.bfloat16
         self.generator = torch.Generator(device="cuda")
         self.generator.manual_seed(seed)
@@ -76,9 +82,9 @@ class MockVLMIterator:
         labels[(labels == args.image_token_id) | (labels == args.pad_token_id)] = -100
         loss_mask = (labels != -100).to(dtype=torch.float32)
 
-        if is_nemotron_20l(args):
+        if self.vision_input_mode == "pixels":
             encoder_inputs = {
-                NEMOTRON_VISION_ENCODER_KEY: {
+                self.vision_encoder_key: {
                     "x": torch.randn(
                         self.micro_batch_size * args.num_image_tiles,
                         3,
@@ -100,7 +106,7 @@ class MockVLMIterator:
                 generator=self.generator,
             )
             encoder_inputs = {
-                MOCK_VISION_ENCODER_KEY: {
+                self.vision_encoder_key: {
                     "hidden_states": encoder_hidden_states,
                     "attention_mask": None,
                 }

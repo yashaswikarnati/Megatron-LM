@@ -17,7 +17,7 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-from examples.mimo.model_providers.hetero_vlm import (
+from examples.mimo.model_providers.nemotron_moe_vlm import (
     get_vision_encoder_module,
     iter_vision_projection_modules,
     language_model_spec,

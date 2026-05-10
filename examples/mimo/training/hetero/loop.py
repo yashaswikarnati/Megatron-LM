@@ -47,7 +47,7 @@ def run_train_loop(args: argparse.Namespace) -> None:
         wire_training_hooks(runtime, topology)
 
         debug_rank("building MIMO optimizer")
-        optimizer = build_optimizer(args, runtime, topology)
+        optimizer = build_optimizer(args, runtime)
         opt_param_scheduler = build_optimizer_param_scheduler(args, optimizer)
         debug_rank("MIMO optimizer ready")
 
@@ -85,7 +85,7 @@ def run_train_loop(args: argparse.Namespace) -> None:
             topology.destroy()
 
 
-def build_optimizer(args: argparse.Namespace, runtime: HeteroRuntime, topology: HeteroTopology):
+def build_optimizer(args: argparse.Namespace, runtime: HeteroRuntime):
     """Build the MIMO optimizer for active hetero module optimizers."""
     return get_mimo_optimizer(
         runtime.model,
@@ -101,7 +101,6 @@ def build_optimizer(args: argparse.Namespace, runtime: HeteroRuntime, topology: 
             use_distributed_optimizer=True,
             log_num_zeros_in_grad=args.log_num_zeros_in_grad,
         ),
-        stats_group=topology.optimizer_stats_group,
     )
 
 

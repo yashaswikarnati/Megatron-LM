@@ -40,7 +40,7 @@ esac
   --standalone \
   --nproc-per-node "${GPUS_PER_NODE}" \
   examples/mimo/train_hetero.py \
-  --model-preset nemotron-moe-vlm-20l \
+  --model-provider nemotron-moe-vlm-20l \
   --training-stage "${TRAINING_STAGE}" \
   --encoder-tp 2 \
   --encoder-pp 1 \

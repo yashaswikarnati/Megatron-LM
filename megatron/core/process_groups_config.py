@@ -267,14 +267,7 @@ class ProcessGroupCollection:
         required_pgs: Optional[List[str]] = None,
         num_distributed_optimizer_instances: int = 1,
     ):
-        """Build a ProcessGroupCollection from an extended HyperCommGrid.
-
-        The grid must expose expert groups via registered layout dimensions
-        such as ``expt_tp``/``expt_dp`` and aliases such as ``tp_ep_pp``.
-        When ``create`` is True, the helper owns group creation in a
-        deterministic order. Otherwise it only reads groups that must already
-        exist on the grid.
-        """
+        """Build a ProcessGroupCollection from a HyperCommGrid with expert dimensions."""
         if num_distributed_optimizer_instances != 1:
             raise ValueError(
                 "ProcessGroupCollection.from_hyper_comm_grid only supports "
@@ -293,8 +286,8 @@ class ProcessGroupCollection:
             'ep': 'ep',
             'expt_tp': 'expt_tp',
             'expt_dp': 'expt_dp',
-            'tp_ep': 'tp_ep',
-            'tp_ep_pp': 'tp_ep_pp',
+            'tp_ep': ['expt_tp', 'ep'],
+            'tp_ep_pp': ['expt_tp', 'ep', 'pp'],
             'intra_dist_opt': grid.dim_names,
         }
         if required_pgs is None:
@@ -303,11 +296,6 @@ class ProcessGroupCollection:
         invalid_pgs = [pg for pg in required_pgs if pg not in pg_specs]
         if invalid_pgs:
             raise ValueError(f"Invalid process groups requested: {invalid_pgs}")
-
-        if 'tp_ep_pp' in required_pgs and hasattr(grid, 'get_alias_dims'):
-            alias_dims = grid.get_alias_dims('tp_ep_pp')
-            if 'pp' not in alias_dims:
-                raise ValueError("tp_ep_pp alias must include the shared pipeline dimension 'pp'")
 
         def get_or_create(dims):
             return grid.create_pg(dims) if create else grid.get_pg(dims)

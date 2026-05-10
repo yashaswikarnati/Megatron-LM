@@ -118,7 +118,6 @@ class TestProcessGroupsConfig:
             return pgs[key]
 
         grid.get_pg.side_effect = pg_for
-        grid.get_alias_dims.return_value = ["expt_tp", "ep", "pp"]
 
         collection = ProcessGroupCollection.from_hyper_comm_grid(
             grid,
@@ -131,7 +130,7 @@ class TestProcessGroupsConfig:
         assert collection.dp_cp is pgs[('dp', 'cp')]
         assert collection.mp is pgs[('tp', 'pp')]
         assert collection.expt_dp is pgs['expt_dp']
-        assert collection.tp_ep_pp is pgs['tp_ep_pp']
+        assert collection.tp_ep_pp is pgs[('expt_tp', 'ep', 'pp')]
         assert collection.intra_dist_opt is pgs[('tp', 'cp', 'dp', 'pp')]
         assert collection.intra_dp_cp is collection.dp_cp
         assert collection.intra_expt_dp is collection.expt_dp
@@ -144,7 +143,7 @@ class TestProcessGroupsConfig:
             ProcessGroupCollection.from_hyper_comm_grid(grid, num_distributed_optimizer_instances=2)
 
     def test_from_hyper_comm_grid_creates_from_real_extended_grid(self, mocker, monkeypatch):
-        """Test helper against real HyperCommGrid alias resolution without distributed init."""
+        """Test helper against a real HyperCommGrid expert layout without distributed init."""
         monkeypatch.setenv("WORLD_SIZE", "16")
         mocker.patch('torch.distributed.get_rank', return_value=0)
         mock_new_subgroups = mocker.patch('torch.distributed.new_subgroups_by_enumeration')
@@ -160,12 +159,7 @@ class TestProcessGroupsConfig:
         mock_new_subgroups.side_effect = make_pg
 
         grid = HyperCommGrid([2, 1, 4, 2], ["tp", "cp", "dp", "pp"])
-        grid.register_layout(
-            "expert",
-            [1, 4, 2, 2],
-            ["expt_tp", "ep", "expt_dp", "pp"],
-            aliases={"tp_ep": ["expt_tp", "ep"], "tp_ep_pp": ["expt_tp", "ep", "pp"]},
-        )
+        grid.register_layout("expert", [1, 4, 2, 2], ["expt_tp", "ep", "expt_dp", "pp"])
 
         collection = ProcessGroupCollection.from_hyper_comm_grid(
             grid,
@@ -191,22 +185,20 @@ class TestProcessGroupsConfig:
         assert collection.ep is grid.get_pg("ep")
         assert collection.expt_tp is grid.get_pg("expt_tp")
         assert collection.expt_dp is grid.get_pg("expt_dp")
-        assert collection.tp_ep is grid.get_pg("tp_ep")
-        assert collection.tp_ep_pp is grid.get_pg("tp_ep_pp")
+        assert collection.tp_ep is grid.get_pg(["expt_tp", "ep"])
+        assert collection.tp_ep_pp is grid.get_pg(["expt_tp", "ep", "pp"])
         assert collection.intra_dist_opt is grid.get_pg(["tp", "cp", "dp", "pp"])
         assert collection.intra_dp_cp is collection.dp_cp
         assert collection.intra_expt_dp is collection.expt_dp
         assert collection.inter_dist_opt is None
 
-    def test_from_hyper_comm_grid_rejects_tp_ep_pp_without_shared_pp(self, monkeypatch):
-        """tp_ep_pp must include the same pp dimension used by the base layout."""
+    def test_from_hyper_comm_grid_rejects_missing_expert_pp(self, monkeypatch):
+        """tp_ep_pp requires the registered expert layout to include pp."""
         monkeypatch.setenv("WORLD_SIZE", "4")
         grid = HyperCommGrid([2, 2], ["tp", "pp"])
-        grid.register_layout(
-            "expert", [2, 2], ["ep", "expert_pp"], aliases={"tp_ep_pp": ["ep", "expert_pp"]}
-        )
+        grid.register_layout("expert", [2, 2], ["ep", "expert_pp"])
 
-        with pytest.raises(ValueError, match="shared pipeline dimension 'pp'"):
+        with pytest.raises(ValueError, match="Dimensions .*pp"):
             ProcessGroupCollection.from_hyper_comm_grid(
                 grid, create=True, required_pgs=['tp_ep_pp']
             )

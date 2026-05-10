@@ -300,7 +300,6 @@ def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
-    param_group_sync_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -361,12 +360,8 @@ def _get_param_groups(
     # so we need to align the param groups across ranks, otherwise we may have
     # runtime error when loading the checkpoint or numerical error when resuming training.
     params_key = list(params_map.keys())
-    gathered_params_key = [
-        None for _ in range(torch.distributed.get_world_size(group=param_group_sync_group))
-    ]
-    torch.distributed.all_gather_object(
-        gathered_params_key, params_key, group=param_group_sync_group
-    )
+    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_params_key, params_key)
     for keys in gathered_params_key:
         for key in keys:
             if key not in params_key:
@@ -424,7 +419,6 @@ def _get_param_groups_and_buffers(
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
     filter_fn: Callable,
     buffer_name: str,
-    param_group_sync_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
 
@@ -443,9 +437,7 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(
-        model_chunks, config, config_overrides, param_group_sync_group=param_group_sync_group
-    )
+    param_groups = _get_param_groups(model_chunks, config, config_overrides)
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
@@ -791,10 +783,7 @@ def _get_megatron_emerging_optimizer(
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
-    param_group_sync_group = getattr(pg_collection, 'intra_dist_opt', None)
-    all_param_groups = _get_param_groups(
-        model_chunks, config, config_overrides, param_group_sync_group=param_group_sync_group
-    )
+    all_param_groups = _get_param_groups(model_chunks, config, config_overrides)
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
@@ -937,7 +926,6 @@ def get_megatron_optimizer(
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
-    param_group_sync_group = intra_dist_opt_group
 
     model_parallel_rank = get_pg_rank(mp_group)
 
@@ -961,7 +949,6 @@ def get_megatron_optimizer(
                 config_overrides=config_overrides,
                 filter_fn=lambda g: True,
                 buffer_name='buffers',
-                param_group_sync_group=param_group_sync_group,
             )
 
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
@@ -1012,7 +999,6 @@ def get_megatron_optimizer(
             config_overrides=config_overrides,
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
-            param_group_sync_group=param_group_sync_group,
         )
         for model_chunk in dense_model_chunks:
             model_chunk.overlap_param_gather_with_optimizer_step = (
@@ -1050,7 +1036,6 @@ def get_megatron_optimizer(
         config_overrides=config_overrides,
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
-        param_group_sync_group=param_group_sync_group,
     )
     if dump_param_to_param_group_map is not None:
         for param_group in moe_param_groups:

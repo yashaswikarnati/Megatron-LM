@@ -354,8 +354,8 @@ def select_pipeline_segment(
             uneven PP. Only valid when the pattern has no pipe separators.
         last_stage_layers: Number of layers on the last pipeline stage for
             uneven PP. Only valid when the pattern has no pipe separators.
-        tp_group: Tensor parallel process group used for rank-local logging.
-        dp_cp_group: Data/context parallel process group used for rank-local logging.
+        tp_group: Optional tensor-parallel process group used for per-stage logging.
+        dp_cp_group: Optional data/context-parallel process group used for per-stage logging.
 
     Returns:
         Tuple of (layer_type_list, layer_offset) where layer_type_list is
