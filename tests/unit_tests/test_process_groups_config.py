@@ -134,3 +134,75 @@ class TestPGConfigDefaultInitialization:
         # Test that an error is raised if an invalid process group is requested
         with pytest.raises(ValueError, match=r"Invalid process groups requested"):
             model_pgs = ProcessGroupCollection.use_mpu_process_groups(['tp', 'pp', 'foo'])
+
+
+class TestPGConfigFromHyperCommGrid:
+    """Build ProcessGroupCollection from a HyperCommGrid (no parallel_state init).
+
+    Uses real distributed groups via NCCL on whatever world the runner provides.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        if not dist.is_initialized():
+            try:
+                dist.init_process_group(backend="nccl")
+            except Exception as e:
+                pytest.skip(f"Cannot initialize distributed: {e}")
+
+    def test_from_hyper_comm_grid_dense_8gpu(self):
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+        if dist.get_world_size() != 8:
+            pytest.skip("Requires exactly 8 GPUs")
+
+        from megatron.core.hyper_comm_grid import HyperCommGrid
+
+        grid = HyperCommGrid(shape=[2, 1, 4, 1], dim_names=["tp", "cp", "dp", "pp"], backend="nccl")
+        pg = ProcessGroupCollection.from_hyper_comm_grid(grid)
+        assert hasattr(pg, "tp") and pg.tp.size() == 2
+        assert hasattr(pg, "cp") and pg.cp.size() == 1
+        assert hasattr(pg, "dp") and pg.dp.size() == 4
+        assert hasattr(pg, "pp") and pg.pp.size() == 1
+        assert hasattr(pg, "dp_cp") and pg.dp_cp.size() == 4
+        # No alt factorization -> expert fields are set to ``None`` (so callers like
+        # DDP's ``hasattr`` check pass uniformly without distinguishing MoE-grid
+        # from non-MoE-grid).
+        assert pg.ep is None
+        assert pg.expt_tp is None
+        assert pg.expt_dp is None
+
+    def test_from_hyper_comm_grid_with_expert_alt_8gpu(self):
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+        if dist.get_world_size() != 8:
+            pytest.skip("Requires exactly 8 GPUs")
+
+        from megatron.core.hyper_comm_grid import HyperCommGrid
+
+        grid = HyperCommGrid(
+            shape=[2, 1, 4, 1],
+            dim_names=["tp", "cp", "dp", "pp"],
+            backend="nccl",
+            alt_factorizations={
+                "expert": {
+                    "shape": [1, 4, 2],
+                    "dim_names": ["etp", "ep", "edp"],
+                    "replaces": ["tp", "cp", "dp"],
+                }
+            },
+        )
+        pg = ProcessGroupCollection.from_hyper_comm_grid(grid)
+        # Standard fields populated.
+        assert pg.tp.size() == 2
+        assert pg.dp.size() == 4
+        # Expert fields populated from alt factorization.
+        assert pg.ep.size() == 4
+        assert pg.expt_tp.size() == 1
+        assert pg.expt_dp.size() == 2
+        # Combined expert groups.
+        assert pg.tp_ep.size() == 4  # etp(1) * ep(4)
+        # Structural invariant: ep ranks must live entirely within this rank's
+        # primary tp*cp*dp slab (i.e. within the same PP stage). With pp=1, that's
+        # the full world; the meaningful check is that the size matches.
+        assert len(dist.get_process_group_ranks(pg.ep)) == 4

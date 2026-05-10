@@ -310,6 +310,356 @@ class TestHyperCommGrid:
         assert rank_enum_ab == expected_ab
 
 
+class TestHyperCommGridAltFactorization:
+    """Tests for the alt-factorization feature (NMFW-464 expert overlap)."""
+
+    def _expert_grid(self):
+        """Standard 8-rank LLM grid with expert overlap: tp=cp=dp=2 / ep=etp=edp=2."""
+        return HyperCommGrid(
+            shape=[2, 2, 2, 1],
+            dim_names=["tp", "cp", "dp", "pp"],
+            alt_factorizations={
+                "expert": {
+                    "shape": [2, 2, 2],
+                    "dim_names": ["etp", "ep", "edp"],
+                    "replaces": ["tp", "cp", "dp"],
+                }
+            },
+        )
+
+    def test_world_size_unchanged_with_alt(self):
+        """The alt factorization must not inflate world_size."""
+        grid = self._expert_grid()
+        # 8 ranks, not 8 * 8 = 64.
+        assert grid.size == 8
+
+    def test_alt_dim_names_registered(self):
+        """Alt dim names should be discoverable for dispatch."""
+        grid = self._expert_grid()
+        assert grid._dim_to_alt == {"etp": "expert", "ep": "expert", "edp": "expert"}
+
+    def test_alt_only_rank_enum_matches_primary(self):
+        """When alt shape == covered primary shape, alt axes enumerate the same rank groups
+        as the corresponding primary axes (just under different names).
+        """
+        grid = self._expert_grid()
+        # In primary, tp / cp / dp produce these enumerations:
+        primary_tp = grid._gen_rank_enum(["tp"])
+        primary_cp = grid._gen_rank_enum(["cp"])
+        primary_dp = grid._gen_rank_enum(["dp"])
+
+        # In alt, etp / ep / edp sit at the same positions in the shadow layout.
+        etp_enum = grid.get_rank_enum("etp")
+        ep_enum = grid.get_rank_enum("ep")
+        edp_enum = grid.get_rank_enum("edp")
+
+        assert etp_enum == primary_tp
+        assert ep_enum == primary_cp
+        assert edp_enum == primary_dp
+
+    def test_alt_multi_dim_rank_enum(self):
+        """Multi-dim alt groups (e.g. tp_ep semantically: ['ep', 'etp']) match primary."""
+        grid = self._expert_grid()
+        # Combined alt group [ep, etp] matches combined primary [cp, tp].
+        assert grid.get_rank_enum(["ep", "etp"]) == grid._gen_rank_enum(["cp", "tp"])
+
+    def test_alt_with_shared_dim(self):
+        """Combining alt dims with a primary shared (uncovered) dim should work."""
+        grid = HyperCommGrid(
+            shape=[2, 2, 2, 1],
+            dim_names=["tp", "cp", "dp", "pp"],
+            alt_factorizations={
+                "expert": {
+                    "shape": [2, 2, 2],
+                    "dim_names": ["etp", "ep", "edp"],
+                    "replaces": ["tp", "cp", "dp"],
+                }
+            },
+        )
+        # ep + pp should resolve via alt shadow layout.
+        # With pp=1, this collapses to the same as ep alone.
+        assert grid.get_rank_enum(["ep", "pp"]) == grid.get_rank_enum("ep")
+
+    def test_alt_with_nontrivial_pp(self):
+        """Multi-stage PP keeps the alt factorization confined to per-stage rank slabs."""
+        os.environ["WORLD_SIZE"] = "16"
+        try:
+            grid = HyperCommGrid(
+                shape=[2, 2, 2, 2],  # tp=2 cp=2 dp=2 pp=2 -> 16 ranks
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2, 2],
+                        "dim_names": ["etp", "ep", "edp"],
+                        "replaces": ["tp", "cp", "dp"],
+                    }
+                },
+            )
+            ep_enum = grid.get_rank_enum("ep")
+            # ep groups must only contain ranks within the same PP stage.
+            for group in ep_enum:
+                stages = {r // 8 for r in group}
+                assert len(stages) == 1, (
+                    f"ep group {group} crosses PP stages {stages}; expert axes must be confined "
+                    f"to a single PP stage's rank slab"
+                )
+        finally:
+            os.environ["WORLD_SIZE"] = "8"
+
+    def test_alt_unequal_shape(self):
+        """Alt factorization may differ in shape from primary covers as long as products match."""
+        # Primary tp*cp*dp = 2*2*2 = 8. Alt re-factor as ep=4, etp=2, edp=1 (product 8).
+        grid = HyperCommGrid(
+            shape=[2, 2, 2, 1],
+            dim_names=["tp", "cp", "dp", "pp"],
+            alt_factorizations={
+                "expert": {
+                    "shape": [2, 4, 1],
+                    "dim_names": ["etp", "ep", "edp"],
+                    "replaces": ["tp", "cp", "dp"],
+                }
+            },
+        )
+        # ep has size 4, so 2 groups of 4 ranks each (one per edp value, with edp=1 it's one
+        # outer group; but let's check structure).
+        ep_enum = grid.get_rank_enum("ep")
+        # 8 / 4 = 2 groups, each of size 4.
+        assert len(ep_enum) == 2
+        for group in ep_enum:
+            assert len(group) == 4
+        # Together they must cover all 8 ranks exactly once.
+        flat = [r for grp in ep_enum for r in grp]
+        assert sorted(flat) == list(range(8))
+
+    def test_alt_constraint_violated_product_mismatch(self):
+        """Mismatched product must raise."""
+        with pytest.raises(ValueError, match="product"):
+            HyperCommGrid(
+                shape=[2, 2, 2, 1],
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2, 4],  # product 16 != 8
+                        "dim_names": ["etp", "ep", "edp"],
+                        "replaces": ["tp", "cp", "dp"],
+                    }
+                },
+            )
+
+    def test_alt_constraint_violated_non_contiguous_replaces(self):
+        """``replaces`` that isn't a contiguous slice of primary dim_names must raise."""
+        with pytest.raises(ValueError, match="contiguous"):
+            HyperCommGrid(
+                shape=[2, 2, 2, 1],
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2],
+                        "dim_names": ["etp", "ep"],
+                        "replaces": ["tp", "dp"],  # tp and dp skip over cp -> non-contiguous
+                    }
+                },
+            )
+
+    def test_alt_constraint_violated_unknown_cover(self):
+        """Cover entries must be primary dim names."""
+        with pytest.raises(ValueError, match="not a primary dim"):
+            HyperCommGrid(
+                shape=[2, 2, 2, 1],
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {"shape": [2], "dim_names": ["ep"], "replaces": ["xx"]}
+                },
+            )
+
+    def test_alt_dim_name_collision_with_primary(self):
+        """Alt dim_names must not collide with primary dim_names."""
+        with pytest.raises(ValueError, match="collides with primary"):
+            HyperCommGrid(
+                shape=[2, 2, 2, 1],
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2, 2],
+                        "dim_names": ["tp", "ep", "edp"],  # tp collides
+                        "replaces": ["tp", "cp", "dp"],
+                    }
+                },
+            )
+
+    def test_alt_dim_name_collision_across_alts(self):
+        """Two alt factorizations must not share dim names."""
+        with pytest.raises(ValueError, match="collides with alt"):
+            HyperCommGrid(
+                shape=[2, 2, 2, 1],
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2, 2],
+                        "dim_names": ["etp", "ep", "edp"],
+                        "replaces": ["tp", "cp", "dp"],
+                    },
+                    "second": {
+                        "shape": [2, 2, 2],
+                        "dim_names": ["etp", "x", "y"],  # etp re-used
+                        "replaces": ["tp", "cp", "dp"],
+                    },
+                },
+            )
+
+    def test_create_pg_rejects_mixing_replaced_primary_and_alt(self):
+        """tp + ep together is ambiguous; reject at create_pg time."""
+        grid = self._expert_grid()
+        with pytest.raises(ValueError, match="combine replaced primary"):
+            grid.create_pg(["tp", "ep"])
+
+    def test_get_rank_enum_rejects_unknown_dim(self):
+        grid = self._expert_grid()
+        with pytest.raises(KeyError, match="not a primary or alt dim"):
+            grid.get_rank_enum("zz")
+
+    @patch('torch.distributed.new_subgroups_by_enumeration')
+    def test_create_pg_alt_then_get_pg_alt(self, mock_new_subgroups):
+        """create_pg for an alt dim, get_pg returns the same group."""
+        mock_pg = MagicMock(spec=dist.ProcessGroup)
+        mock_new_subgroups.return_value = (mock_pg, None)
+
+        grid = self._expert_grid()
+        ep_pg = grid.create_pg("ep")
+        assert ep_pg == mock_pg
+        assert grid.get_pg("ep") == mock_pg
+
+        # Verify the rank enumeration that was passed to new_subgroups_by_enumeration matches
+        # what the primary "cp" would produce, since etp/ep/edp share shapes with tp/cp/dp.
+        args, _ = mock_new_subgroups.call_args
+        assert args[0] == grid._gen_rank_enum(["cp"])
+
+    def test_alt_full_primary_no_shared_dims(self):
+        """Alt covering the full primary (no shared dims) is allowed."""
+        grid = HyperCommGrid(
+            shape=[2, 2, 2],  # tp cp dp; no pp
+            dim_names=["tp", "cp", "dp"],
+            alt_factorizations={
+                "expert": {
+                    "shape": [2, 2, 2],
+                    "dim_names": ["etp", "ep", "edp"],
+                    "replaces": ["tp", "cp", "dp"],
+                }
+            },
+        )
+        assert grid.get_rank_enum("ep") == grid._gen_rank_enum(["cp"])
+        assert grid.get_rank_enum(["ep", "etp"]) == grid._gen_rank_enum(["cp", "tp"])
+
+    def test_disjoint_alts_positive(self):
+        """Two alt factorizations may replace disjoint slices of the primary."""
+        os.environ["WORLD_SIZE"] = "16"
+        try:
+            grid = HyperCommGrid(
+                shape=[2, 2, 2, 2],
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2],
+                        "dim_names": ["etp", "ep"],
+                        "replaces": ["tp", "cp"],
+                    },
+                    "video": {"shape": [2], "dim_names": ["vdp"], "replaces": ["dp"]},
+                },
+            )
+            # vdp aliases dp; ep aliases cp.
+            assert grid.get_rank_enum("vdp") == grid._gen_rank_enum(["dp"])
+            assert grid.get_rank_enum("ep") == grid._gen_rank_enum(["cp"])
+        finally:
+            os.environ["WORLD_SIZE"] = "8"
+
+    def test_disjoint_alts_overlapping_replaces_rejected(self):
+        """Two alt factorizations replacing overlapping primary dims must raise."""
+        with pytest.raises(ValueError, match="already replaced"):
+            HyperCommGrid(
+                shape=[2, 2, 2, 1],
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2],
+                        "dim_names": ["etp", "ep"],
+                        "replaces": ["tp", "cp"],
+                    },
+                    "second": {"shape": [2], "dim_names": ["x"], "replaces": ["cp"]},
+                },
+            )
+
+    def test_resolve_rejects_mixing_two_alt_factorizations(self):
+        """Mixing dims from two different alt factorizations at request time must raise."""
+        os.environ["WORLD_SIZE"] = "16"
+        try:
+            grid = HyperCommGrid(
+                shape=[2, 2, 2, 2],
+                dim_names=["tp", "cp", "dp", "pp"],
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2],
+                        "dim_names": ["etp", "ep"],
+                        "replaces": ["tp", "cp"],
+                    },
+                    "video": {"shape": [2], "dim_names": ["vdp"], "replaces": ["dp"]},
+                },
+            )
+            with pytest.raises(ValueError, match="multiple alt factorizations"):
+                grid.get_rank_enum(["ep", "vdp"])
+        finally:
+            os.environ["WORLD_SIZE"] = "8"
+
+    def test_alt_with_rank_offset(self):
+        """rank_offset shifts the alt enumeration by the same amount as the primary."""
+        os.environ["WORLD_SIZE"] = "16"
+        try:
+            grid = HyperCommGrid(
+                shape=[2, 2, 2, 1],
+                dim_names=["tp", "cp", "dp", "pp"],
+                rank_offset=8,  # grid lives on ranks 8..15
+                alt_factorizations={
+                    "expert": {
+                        "shape": [2, 2, 2],
+                        "dim_names": ["etp", "ep", "edp"],
+                        "replaces": ["tp", "cp", "dp"],
+                    }
+                },
+            )
+            ep_enum = grid.get_rank_enum("ep")
+            cp_enum = grid._gen_rank_enum(["cp"])
+            assert ep_enum == cp_enum
+            # Every rank in the enumeration must be in [8, 16).
+            for group in ep_enum:
+                for r in group:
+                    assert 8 <= r < 16
+        finally:
+            os.environ["WORLD_SIZE"] = "8"
+
+    def test_get_rank_enum_multi_axis_alt_via_public_api(self):
+        """Multi-axis alt groups must be reachable through the public API."""
+        grid = self._expert_grid()
+        assert grid.get_rank_enum(["ep", "etp"]) == grid._gen_rank_enum(["cp", "tp"])
+        assert grid.get_rank_enum(["edp", "etp"]) == grid._gen_rank_enum(["dp", "tp"])
+
+    @patch('torch.distributed.new_subgroups_by_enumeration')
+    def test_create_pg_primary_and_alt_have_distinct_keys(self, mock_new_subgroups):
+        """Primary 'cp' and alt 'ep' both create groups; the keys must not collide."""
+        mock_pg_cp = MagicMock(spec=dist.ProcessGroup)
+        mock_pg_ep = MagicMock(spec=dist.ProcessGroup)
+        mock_new_subgroups.side_effect = [(mock_pg_cp, None), (mock_pg_ep, None)]
+
+        grid = self._expert_grid()
+        cp_pg = grid.create_pg("cp")
+        ep_pg = grid.create_pg("ep")
+
+        assert cp_pg == mock_pg_cp
+        assert ep_pg == mock_pg_ep
+        assert grid.get_pg("cp") == mock_pg_cp
+        assert grid.get_pg("ep") == mock_pg_ep
+        assert "cp" in grid._pgs
+        assert "ep" in grid._pgs
+
+
 class TestHyperCommGridIntegration:
     """Integration tests for HyperCommGrid with real distributed initialization."""
 
@@ -512,6 +862,84 @@ class TestHyperCommGridIntegration:
 
             with pytest.raises(KeyError, match="Process group.*has already been created"):
                 grid.create_pg("tp")
+
+    def test_real_distributed_alt_factorization_overlap(self):
+        """Verify that alt-factorization expert groups live on the same ranks as the
+        primary tp/cp/dp groups (NMFW-464 overlap)."""
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        world_size = dist.get_world_size()
+        if world_size != 8:
+            pytest.skip("This test specifically requires 8 GPUs")
+
+        grid = HyperCommGrid(
+            shape=[2, 2, 2, 1],
+            dim_names=["tp", "cp", "dp", "pp"],
+            backend="nccl",
+            alt_factorizations={
+                "expert": {
+                    "shape": [2, 2, 2],
+                    "dim_names": ["etp", "ep", "edp"],
+                    "replaces": ["tp", "cp", "dp"],
+                }
+            },
+        )
+
+        # Build matching groups under each factorization.
+        tp_pg = grid.create_pg("tp")
+        cp_pg = grid.create_pg("cp")
+        dp_pg = grid.create_pg("dp")
+        etp_pg = grid.create_pg("etp")
+        ep_pg = grid.create_pg("ep")
+        edp_pg = grid.create_pg("edp")
+
+        # Each pair must enumerate the SAME physical ranks for the current process.
+        assert dist.get_process_group_ranks(tp_pg) == dist.get_process_group_ranks(
+            etp_pg
+        ), "etp must alias tp ranks under expert overlap"
+        assert dist.get_process_group_ranks(cp_pg) == dist.get_process_group_ranks(
+            ep_pg
+        ), "ep must alias cp ranks under expert overlap"
+        assert dist.get_process_group_ranks(dp_pg) == dist.get_process_group_ranks(
+            edp_pg
+        ), "edp must alias dp ranks under expert overlap"
+
+        # Sanity: communication actually works on the alt group (all-reduce within ep).
+        rank = dist.get_rank()
+        device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+        tensor = torch.tensor([rank], dtype=torch.float, device=device)
+        dist.all_reduce(tensor, group=ep_pg)
+        ep_ranks = dist.get_process_group_ranks(ep_pg)
+        assert tensor.item() == sum(ep_ranks)
+
+    def test_real_distributed_alt_factorization_pp_confined(self):
+        """With PP>1, alt-factorization expert groups must stay within a PP stage's rank slab."""
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        world_size = dist.get_world_size()
+        if world_size != 8:
+            pytest.skip("This test specifically requires 8 GPUs")
+
+        # tp=2 cp=1 dp=2 pp=2 -> 8 ranks; per-PP-stage slab has 4 ranks.
+        grid = HyperCommGrid(
+            shape=[2, 1, 2, 2],
+            dim_names=["tp", "cp", "dp", "pp"],
+            backend="nccl",
+            alt_factorizations={
+                "expert": {
+                    "shape": [2, 1, 2],
+                    "dim_names": ["etp", "ep", "edp"],
+                    "replaces": ["tp", "cp", "dp"],
+                }
+            },
+        )
+        edp_pg = grid.create_pg("edp")
+        edp_ranks = dist.get_process_group_ranks(edp_pg)
+        # All ranks in the edp group must share a PP stage (ranks 0-3 or 4-7).
+        stages = {r // 4 for r in edp_ranks}
+        assert len(stages) == 1, f"edp group {edp_ranks} crosses PP stages {stages}"
 
     def test_real_distributed_rank_enumeration_verification(self):
         """Verify rank enumeration produces correct communication patterns."""
