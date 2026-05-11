@@ -67,7 +67,6 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
     debug_rank("MimoModel moved to target dtype/device")
 
     wrap_active_modules(args, mimo_model, topology)
-    broadcast_active_params(mimo_model)
     return mimo_model
 
 
@@ -162,9 +161,3 @@ def active_ddp_modules(mimo_model: MimoModel) -> list[DistributedDataParallel]:
         if isinstance(submodule, DistributedDataParallel)
     )
     return modules
-
-
-def broadcast_active_params(mimo_model: MimoModel) -> None:
-    """Synchronize initial parameters across each module's DP groups."""
-    for module in active_ddp_modules(mimo_model):
-        module.broadcast_params()
