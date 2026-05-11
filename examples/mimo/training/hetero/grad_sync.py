@@ -9,7 +9,7 @@ from contextlib import ExitStack, contextmanager
 import torch
 import torch.distributed as dist
 
-from examples.mimo.training.hetero.runtime import active_ddp_modules
+from examples.mimo.training.hetero.runtime import iter_active_ddp_modules
 from examples.mimo.training.hetero.topology import HeteroTopology
 from examples.mimo.utils.hetero import debug_rank, is_process_group_member
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
@@ -88,7 +88,7 @@ def configure_grad_sync(mimo_model: MimoModel, topology: HeteroTopology) -> None
 
 def zero_active_grad_buffers(mimo_model: MimoModel) -> None:
     """Clear MCore DDP grad buffers before each training iteration."""
-    for module in active_ddp_modules(mimo_model):
+    for module in iter_active_ddp_modules(mimo_model):
         module.zero_grad_buffer()
 
 
@@ -98,11 +98,8 @@ def build_no_sync_func(mimo_model: MimoModel):
     @contextmanager
     def no_sync_func():
         with ExitStack() as stack:
-            if mimo_model.language_model is not None:
-                stack.enter_context(mimo_model.language_model.no_sync())
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    stack.enter_context(submodule.no_sync())
+            for module in iter_active_ddp_modules(mimo_model):
+                stack.enter_context(module.no_sync())
             yield
 
     return no_sync_func

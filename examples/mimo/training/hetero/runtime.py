@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 
@@ -34,12 +34,12 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
         "building model specs "
         f"rank_in_encoder={rank_in_encoder_grid} rank_in_language={rank_in_language_grid}"
     )
+    # The CUDA RNG tracker is process-global; this runtime assumes non-colocated module grids,
+    # so each rank configures RNG state for exactly one module role.
     if rank_in_language_grid:
-        set_model_init_seed(args, language_pg, role_offset=20_000)
-        initialize_model_parallel_rng(args, language_pg)
+        configure_module_rng(args, language_pg, role_seed_offset=20_000)
     elif rank_in_encoder_grid:
-        set_model_init_seed(args, vision_pg, role_offset=10_000)
-        initialize_model_parallel_rng(args, vision_pg)
+        configure_module_rng(args, vision_pg, role_seed_offset=10_000)
 
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec(
@@ -66,11 +66,11 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
         mimo_model.to(torch.bfloat16)
     debug_rank("MimoModel moved to target dtype/device")
 
-    wrap_active_modules(args, mimo_model, topology)
+    wrap_active_modules_with_ddp(args, mimo_model, topology)
     return mimo_model
 
 
-def wrap_active_modules(
+def wrap_active_modules_with_ddp(
     args: argparse.Namespace, mimo_model: MimoModel, topology: HeteroTopology
 ) -> None:
     """Freeze and DDP-wrap active local MIMO modules."""
@@ -125,24 +125,22 @@ def set_module_requires_grad(module: Optional[torch.nn.Module], requires_grad: b
         param.requires_grad = requires_grad
 
 
-def set_model_init_seed(
-    args: argparse.Namespace, pg_collection: ProcessGroupCollection, role_offset: int
+def configure_module_rng(
+    args: argparse.Namespace, pg_collection: ProcessGroupCollection, role_seed_offset: int
 ) -> None:
-    """Seed CPU model init consistently across TP/DP peers for one module role."""
-    pp_rank = get_group_rank_or(getattr(pg_collection, "pp", None))
-    torch.manual_seed(args.seed + role_offset + (100 * pp_rank))
+    """Seed module init and CUDA RNG tracker for the active module role.
 
-
-def initialize_model_parallel_rng(
-    args: argparse.Namespace, pg_collection: ProcessGroupCollection
-) -> None:
-    """Initialize CUDA RNG tracker using the active module's hetero process groups."""
+    The seed is identical across DP/CP replicas for a module PP stage, and differs across
+    module roles and PP stages.
+    """
     pp_rank = get_group_rank_or(getattr(pg_collection, "pp", None))
     tp_rank = get_group_rank_or(getattr(pg_collection, "tp", None))
     ep_rank = get_group_rank_or(getattr(pg_collection, "ep", None))
     expt_tp_rank = get_group_rank_or(getattr(pg_collection, "expt_tp", None))
+    seed = args.seed + role_seed_offset + (100 * pp_rank)
+    torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(
-        args.seed + (100 * pp_rank),
+        seed,
         tp_rank=tp_rank,
         ep_rank=ep_rank,
         etp_rank=expt_tp_rank,
@@ -150,14 +148,10 @@ def initialize_model_parallel_rng(
     )
 
 
-def active_ddp_modules(mimo_model: MimoModel) -> list[DistributedDataParallel]:
-    """Return active DDP-wrapped submodules owned by this rank."""
-    modules = []
+def iter_active_ddp_modules(mimo_model: MimoModel) -> Iterator[DistributedDataParallel]:
+    """Yield active DDP-wrapped submodules owned by this rank."""
     if isinstance(mimo_model.language_model, DistributedDataParallel):
-        modules.append(mimo_model.language_model)
-    modules.extend(
-        submodule
-        for submodule in mimo_model.modality_submodules.values()
-        if isinstance(submodule, DistributedDataParallel)
-    )
-    return modules
+        yield mimo_model.language_model
+    for submodule in mimo_model.modality_submodules.values():
+        if isinstance(submodule, DistributedDataParallel):
+            yield submodule
