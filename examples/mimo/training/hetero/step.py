@@ -17,7 +17,6 @@ from examples.mimo.training.hetero.grad_sync import zero_active_grad_buffers
 from examples.mimo.training.hetero.optimizer import get_global_batch_size
 from examples.mimo.training.hetero.topology import HeteroTopology
 from examples.mimo.utils.hetero import debug_rank
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 
@@ -34,25 +33,16 @@ class TrainStepResult:
 
 
 def loss_func(loss_mask: Optional[torch.Tensor], output_tensor):
-    """Return raw loss sum, local token count, and logging tensors."""
+    """Return terminal language-model loss sum, local token count, and logging tensors."""
     if output_tensor is None:
-        zero = torch.tensor(0.0, device="cuda", requires_grad=True)
-        zero_count = torch.tensor(0, device="cuda", dtype=torch.int)
-        return zero, zero_count, {"lm loss": torch.stack((zero.detach(), zero_count.float()))}
-
-    if isinstance(output_tensor, dict):
-        output = output_tensor.get(
-            MIMO_LANGUAGE_MODULE_KEY, next(iter(output_tensor.values()), None)
+        raise RuntimeError("terminal language stage returned no loss tensor")
+    if not isinstance(output_tensor, torch.Tensor):
+        raise TypeError(
+            "loss_func expects the terminal language stage to return a tensor, "
+            f"got {type(output_tensor).__name__}"
         )
-    else:
-        output = output_tensor
 
-    if output is None:
-        zero = torch.tensor(0.0, device="cuda", requires_grad=True)
-        zero_count = torch.tensor(0, device="cuda", dtype=torch.int)
-        return zero, zero_count, {"lm loss": torch.stack((zero.detach(), zero_count.float()))}
-
-    output = output.float()
+    output = output_tensor.float()
     if loss_mask is None:
         raise RuntimeError("train_hetero.py requires a loss_mask for per-token loss")
     if output.shape != loss_mask.shape:
