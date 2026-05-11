@@ -68,9 +68,6 @@ class HeteroTrainingLogger:
         elapsed_ms = (elapsed / interval_iters) * 1000.0
         loss_value = self.loss_total / self.loss_count if self.loss_count else None
         learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
-        learning_rate = reduce_max_optional_float(learning_rate)
-        grad_norm = reduce_max_optional_float(result.grad_norm)
-        num_zeros_in_grad = reduce_max_optional_float(result.num_zeros_in_grad)
         loss_scale = optimizer.get_loss_scale().item()
 
         if is_language_log_rank(self.topology):
@@ -84,10 +81,10 @@ class HeteroTrainingLogger:
             if loss_value is not None:
                 log_string += f" lm loss: {loss_value:.6E} |"
             log_string += f" loss scale: {loss_scale:.1f} |"
-            if grad_norm is not None:
-                log_string += f" grad norm: {grad_norm:.3f} |"
-            if num_zeros_in_grad is not None:
-                log_string += f" num zeros: {int(num_zeros_in_grad)} |"
+            if result.grad_norm is not None:
+                log_string += f" grad norm: {result.grad_norm:.3f} |"
+            if result.num_zeros_in_grad is not None:
+                log_string += f" num zeros: {int(result.num_zeros_in_grad)} |"
             log_string += " number of skipped iterations: {:3d} |".format(self.skipped_iterations)
             log_string += " number of nan iterations: {:3d} |".format(self.nan_iterations)
             sys.stdout.write(f"{log_string}\n")
@@ -104,6 +101,7 @@ class HeteroTrainingLogger:
         self.interval_start = time.time()
 
 
+@torch.no_grad()
 def reduce_language_loss(losses: list[dict], topology: HeteroTopology) -> Optional[float]:
     """Reduce raw loss/token vectors over the language DP/CP logging group."""
     language_pg = topology.language_pg
@@ -118,16 +116,11 @@ def reduce_language_loss(losses: list[dict], topology: HeteroTopology) -> Option
 
     if losses:
         for loss_dict in losses:
-            loss_sum = loss_dict.get("lm loss sum")
-            num_tokens = loss_dict.get("lm tokens")
-            if isinstance(loss_sum, torch.Tensor):
-                loss_acc[0] += loss_sum.float()
-            elif loss_sum is not None:
-                loss_acc[0] += float(loss_sum)
-            if isinstance(num_tokens, torch.Tensor):
-                loss_acc[1] += num_tokens.float()
-            elif num_tokens is not None:
-                loss_acc[1] += float(num_tokens)
+            loss = loss_dict.get("lm loss")
+            if isinstance(loss, torch.Tensor):
+                loss_acc += loss.detach().to(device="cuda", dtype=torch.float32).view(2)
+            elif loss is not None:
+                loss_acc += torch.tensor(loss, dtype=torch.float32, device="cuda").view(2)
 
     dist.all_reduce(loss_acc, op=dist.ReduceOp.SUM, group=language_pg.dp_cp)
     return loss_acc[0].item() / loss_acc[1].item() if loss_acc[1].item() else None
@@ -142,15 +135,4 @@ def is_language_log_rank(topology: HeteroTopology) -> bool:
         and language_pg.tp.rank() == 0
     ):
         return False
-    language_group_ranks = dist.get_process_group_ranks(language_pg.dp_cp)
-    return dist.get_rank() == min(language_group_ranks)
-
-
-def reduce_max_optional_float(value) -> Optional[float]:
-    """Reduce optional scalar stats so the language log rank can see non-local optimizers."""
-    if isinstance(value, torch.Tensor):
-        value = value.item()
-    local_value = -1.0 if value is None else float(value)
-    stat = torch.tensor([local_value], dtype=torch.float32, device="cuda")
-    dist.all_reduce(stat, op=dist.ReduceOp.MAX)
-    return None if stat.item() == -1.0 else stat.item()
+    return dist.get_rank() == dist.get_global_rank(language_pg.dp_cp, 0)

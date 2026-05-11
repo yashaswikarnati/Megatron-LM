@@ -102,7 +102,7 @@ def loss_func(loss_mask: Optional[torch.Tensor], output_tensor):
     if output_tensor is None:
         zero = torch.tensor(0.0, device="cuda", requires_grad=True)
         zero_count = torch.tensor(0, device="cuda", dtype=torch.int)
-        return zero, zero_count, {"lm loss sum": zero.detach(), "lm tokens": zero_count}
+        return zero, zero_count, {"lm loss": torch.stack((zero.detach(), zero_count.float()))}
 
     if isinstance(output_tensor, dict):
         output = output_tensor.get(
@@ -114,7 +114,7 @@ def loss_func(loss_mask: Optional[torch.Tensor], output_tensor):
     if output is None:
         zero = torch.tensor(0.0, device="cuda", requires_grad=True)
         zero_count = torch.tensor(0, device="cuda", dtype=torch.int)
-        return zero, zero_count, {"lm loss sum": zero.detach(), "lm tokens": zero_count}
+        return zero, zero_count, {"lm loss": torch.stack((zero.detach(), zero_count.float()))}
 
     output = output.float()
     if loss_mask is None:
@@ -131,7 +131,7 @@ def loss_func(loss_mask: Optional[torch.Tensor], output_tensor):
     return (
         loss_sum,
         num_tokens,
-        {"lm loss sum": loss_sum.detach(), "lm tokens": num_tokens.detach()},
+        {"lm loss": torch.stack((loss_sum.detach(), num_tokens.detach().float()))},
     )
 
 
