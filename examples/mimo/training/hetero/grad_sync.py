@@ -34,11 +34,18 @@ def configure_grad_sync(mimo_model: MimoModel, topology: HeteroTopology) -> None
         if num_tokens is None:
             raise RuntimeError("train_hetero.py expects calculate_per_token_loss=True")
 
-        token_count = torch.zeros(1, dtype=torch.float32, device="cuda")
+        global_num_tokens = torch.zeros(1, dtype=torch.float32, device="cuda")
         if is_token_source_rank():
-            token_count[0] = num_tokens.to(device="cuda", dtype=torch.float32).sum()
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-        global_num_tokens = token_count.item()
+            # MCore has already summed loss-mask token counts across microbatches
+            # for this gradient-accumulation step. Match Megatron's normalization
+            # domain by reducing the language last-stage count over DP and CP.
+            token_count = num_tokens.to(device="cuda", dtype=torch.float32).sum().view(1)
+            dist.all_reduce(token_count, op=dist.ReduceOp.SUM, group=language_pg.dp_cp)
+            if dist.get_rank(language_pg.dp_cp) == 0:
+                global_num_tokens.copy_(token_count)
+        # Publish the already DP/CP-reduced language token count to encoder ranks too.
+        dist.all_reduce(global_num_tokens, op=dist.ReduceOp.MAX)
+        global_num_tokens_value = global_num_tokens.item()
 
         if mimo_model.language_model is not None:
             debug_rank("finalizing language grads")
@@ -60,8 +67,8 @@ def configure_grad_sync(mimo_model: MimoModel, topology: HeteroTopology) -> None
                 )
                 debug_rank("vision grads finalized")
 
-        if global_num_tokens > 0:
-            scale = 1.0 / global_num_tokens
+        if global_num_tokens_value > 0:
+            scale = 1.0 / global_num_tokens_value
             if mimo_model.language_model is not None:
                 debug_rank("scaling language grads")
                 mimo_model.language_model.scale_gradients(scale)

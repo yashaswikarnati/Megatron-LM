@@ -2,7 +2,7 @@
 
 import logging
 import warnings
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -379,16 +379,14 @@ class MimoModel(MegatronModule):
                 return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
 
             if self.role.has_language_module:
-                return (
-                    self._forward_language_module(
-                        input_ids,
-                        position_ids,
-                        attention_mask,
-                        labels,
-                        input_tensors,
-                        packing_kwargs,
-                    ),
+                return self._forward_language_module(
+                    input_ids,
+                    position_ids,
+                    attention_mask,
                     loss_mask,
+                    labels,
+                    input_tensors,
+                    packing_kwargs,
                 )
 
             raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
@@ -463,21 +461,23 @@ class MimoModel(MegatronModule):
         input_ids: torch.Tensor,
         position_ids: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         input_tensors: Optional[Dict[str, torch.Tensor]],
         packing_kwargs: Optional[dict] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[Any, Optional[torch.Tensor]]:
         """Forward pass for language module on this rank.
 
         Args:
             input_ids: Token IDs
             position_ids: Position IDs
             attention_mask: Attention mask
+            loss_mask: Loss mask for per-token loss normalization
             labels: Labels for loss computation
             input_tensors: Hidden states or embeddings from previous stage
 
         Returns:
-            Language model output (hidden states, logits, or loss depending on stage)
+            Tuple of language model output and the matching, possibly sharded loss mask.
         """
         lang_name = MIMO_LANGUAGE_MODULE_KEY
         packed_seq_params = self._build_packed_seq_params(packing_kwargs)
@@ -506,11 +506,12 @@ class MimoModel(MegatronModule):
 
             if self.partition_adapter is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
-                combined_embeddings, labels, _, attention_mask, packed_seq_params = (
+                shard_loss_inputs = self.role.is_last_stage(lang_name)
+                combined_embeddings, labels, loss_mask, attention_mask, packed_seq_params = (
                     self.partition_adapter.shard(
                         embeddings=combined_embeddings,
-                        labels=labels,
-                        loss_mask=None,
+                        labels=labels if shard_loss_inputs else None,
+                        loss_mask=loss_mask if shard_loss_inputs else None,
                         attention_mask=attention_mask,
                         packed_seq_params=packed_seq_params,
                     )
@@ -530,6 +531,18 @@ class MimoModel(MegatronModule):
             # Non-first stage: receive hidden states from previous LM stage
             hidden_states = input_tensors.get(lang_name) if input_tensors else None
 
+            if self.partition_adapter is not None:
+                shard_loss_inputs = self.role.is_last_stage(lang_name)
+                _, labels, loss_mask, attention_mask, packed_seq_params = (
+                    self.partition_adapter.shard(
+                        embeddings=None,
+                        labels=labels if shard_loss_inputs else None,
+                        loss_mask=loss_mask if shard_loss_inputs else None,
+                        attention_mask=attention_mask,
+                        packed_seq_params=packed_seq_params,
+                    )
+                )
+
             # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
             if hidden_states is not None:
                 underlying_lm = unwrap_model(self.language_model)
@@ -547,9 +560,9 @@ class MimoModel(MegatronModule):
 
         # Key output for non-last stages so schedule can route to next LM stage
         if not self.role.is_last_stage(lang_name):
-            return {lang_name: lm_output}
+            return {lang_name: lm_output}, loss_mask
 
-        return lm_output
+        return lm_output, loss_mask
 
     @staticmethod
     def _build_packed_seq_params(packing_kwargs: Optional[dict]) -> Optional[PackedSeqParams]:
