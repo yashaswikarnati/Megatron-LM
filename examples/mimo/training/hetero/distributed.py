@@ -20,11 +20,37 @@ def initialize_distributed() -> None:
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
+    assert_megatron_parallel_state_uninitialized()
     try:
         parallel_state.get_global_memory_buffer()
     except AssertionError:
         parallel_state._set_global_memory_buffer()
     dist.barrier()
+
+
+def assert_megatron_parallel_state_uninitialized() -> None:
+    """Ensure this standalone hetero path owns Megatron process-group setup."""
+    initialized_groups = []
+    if parallel_state.is_initialized():
+        initialized_groups.append("data_parallel")
+    if parallel_state.get_model_parallel_group(check_initialized=False) is not None:
+        initialized_groups.append("model_parallel")
+    if parallel_state.get_tensor_model_parallel_group(check_initialized=False) is not None:
+        initialized_groups.append("tensor_model_parallel")
+    if parallel_state.get_pipeline_model_parallel_group(check_initialized=False) is not None:
+        initialized_groups.append("pipeline_model_parallel")
+    if parallel_state.get_context_parallel_group(check_initialized=False) is not None:
+        initialized_groups.append("context_parallel")
+    if parallel_state.get_embedding_group(check_initialized=False) is not None:
+        initialized_groups.append("embedding")
+    if parallel_state.get_position_embedding_group(check_initialized=False) is not None:
+        initialized_groups.append("position_embedding")
+
+    if initialized_groups:
+        raise RuntimeError(
+            "train_hetero.py expects Megatron parallel_state process groups to be "
+            f"uninitialized, but found: {', '.join(initialized_groups)}"
+        )
 
 
 def print_rank_0(message: str) -> None:
