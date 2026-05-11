@@ -13,15 +13,13 @@ import torch
 import torch.distributed as dist
 
 import megatron.core.pipeline_parallel.schedules as schedule
-from examples.mimo.training.hetero.runtime import build_no_sync_func, zero_active_grad_buffers
-from examples.mimo.training.hetero.scheduler import get_global_batch_size
+from examples.mimo.training.hetero.grad_sync import zero_active_grad_buffers
+from examples.mimo.training.hetero.optimizer import get_global_batch_size
 from examples.mimo.training.hetero.topology import HeteroTopology
-from examples.mimo.utils.hetero import debug_rank, is_process_group_member
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from examples.mimo.utils.hetero import debug_rank
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 
 
 @dataclass
@@ -33,68 +31,6 @@ class TrainStepResult:
     update_successful: bool
     grad_norm: Optional[float]
     num_zeros_in_grad: Optional[int]
-
-
-def wire_training_hooks(mimo_model: MimoModel, topology: HeteroTopology) -> None:
-    """Attach MIMO-specific grad sync hooks expected by the pipeline schedule."""
-    language_pg = topology.language_pg
-    vision_pg = topology.vision_pg
-
-    def is_token_source_rank() -> bool:
-        return (
-            is_process_group_member(getattr(language_pg, "pp", None))
-            and is_process_group_member(getattr(language_pg, "tp", None))
-            and is_pp_last_stage(language_pg.pp)
-            and language_pg.tp.rank() == 0
-        )
-
-    def finalize_grads_func(_model_list, num_tokens, force_all_reduce=False, **_kwargs):
-        if num_tokens is None:
-            raise RuntimeError("train_hetero.py expects calculate_per_token_loss=True")
-
-        token_count = torch.zeros(1, dtype=torch.float32, device="cuda")
-        if is_token_source_rank():
-            token_count[0] = num_tokens.to(device="cuda", dtype=torch.float32).sum()
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-        global_num_tokens = token_count.item()
-
-        if mimo_model.language_model is not None:
-            debug_rank("finalizing language grads")
-            finalize_model_grads(
-                [mimo_model.language_model],
-                num_tokens=None,
-                pg_collection=language_pg,
-                force_all_reduce=force_all_reduce,
-            )
-            debug_rank("language grads finalized")
-        for submodule in mimo_model.modality_submodules.values():
-            if submodule is not None:
-                debug_rank("finalizing vision grads")
-                finalize_model_grads(
-                    [submodule],
-                    num_tokens=None,
-                    pg_collection=vision_pg,
-                    force_all_reduce=force_all_reduce,
-                )
-                debug_rank("vision grads finalized")
-
-        if global_num_tokens > 0:
-            scale = 1.0 / global_num_tokens
-            if mimo_model.language_model is not None:
-                debug_rank("scaling language grads")
-                mimo_model.language_model.scale_gradients(scale)
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    debug_rank("scaling vision grads")
-                    submodule.scale_gradients(scale)
-
-    mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
-    mimo_model.config.finalize_model_grads_func = finalize_grads_func
-    mimo_model.config.grad_scale_func = lambda loss: (
-        torch.tensor(loss, dtype=torch.float32, device="cuda", requires_grad=True)
-        if isinstance(loss, (int, float))
-        else loss
-    )
 
 
 def loss_func(loss_mask: Optional[torch.Tensor], output_tensor):

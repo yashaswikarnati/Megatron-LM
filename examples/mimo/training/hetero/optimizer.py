@@ -1,12 +1,34 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Optimizer scheduler helpers for heterogeneous MIMO training."""
+"""Optimizer and scheduler construction for heterogeneous MIMO training."""
 
 from __future__ import annotations
 
 import argparse
 
+from megatron.core.models.mimo.model.base import MimoModel
+from megatron.core.models.mimo.optimizer import get_mimo_optimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+
+def build_optimizer(args: argparse.Namespace, model: MimoModel):
+    """Build the MIMO optimizer for active hetero module optimizers."""
+    return get_mimo_optimizer(
+        model,
+        OptimizerConfig(
+            optimizer="adam",
+            lr=args.lr,
+            min_lr=args.min_lr,
+            weight_decay=args.weight_decay,
+            adam_beta1=args.adam_beta1,
+            adam_beta2=args.adam_beta2,
+            clip_grad=args.clip_grad,
+            bf16=not args.fp32,
+            use_distributed_optimizer=True,
+            log_num_zeros_in_grad=args.log_num_zeros_in_grad,
+        ),
+    )
 
 
 def get_global_batch_size(args: argparse.Namespace) -> int:

@@ -15,13 +15,12 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage
-
-from examples.mimo.training.hetero.scheduler import get_global_batch_size
+from examples.mimo.training.hetero.optimizer import get_global_batch_size
 from examples.mimo.training.hetero.step import TrainStepResult
 from examples.mimo.training.hetero.topology import HeteroTopology
 from examples.mimo.utils.hetero import is_process_group_member
+from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 
 
 @dataclass

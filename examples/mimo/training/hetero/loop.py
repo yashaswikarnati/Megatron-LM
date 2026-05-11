@@ -9,25 +9,18 @@ from typing import Optional
 
 import torch
 
-from examples.mimo.data.hetero_mock import MockVLMIterator
 from examples.mimo.training.hetero.args import prepare_args
+from examples.mimo.training.hetero.data import select_data_iterator, validate_data_iterator
 from examples.mimo.training.hetero.distributed import print_rank_0
+from examples.mimo.training.hetero.grad_sync import configure_grad_sync
 from examples.mimo.training.hetero.logging import HeteroTrainingLogger
+from examples.mimo.training.hetero.optimizer import build_optimizer, build_optimizer_param_scheduler
 from examples.mimo.training.hetero.runtime import build_mimo_runtime
-from examples.mimo.training.hetero.scheduler import build_optimizer_param_scheduler
-from examples.mimo.training.hetero.step import train_step, wire_training_hooks
-from examples.mimo.training.hetero.topology import (
-    HeteroTopology,
-    create_topology,
-    get_grid_coordinate,
-    is_rank_in_grid,
-)
+from examples.mimo.training.hetero.step import train_step
+from examples.mimo.training.hetero.topology import HeteroTopology, create_topology
 from examples.mimo.utils.hetero import debug_rank
 from megatron.core.models.mimo.model.base import MimoModel
-from megatron.core.models.mimo.optimizer import get_mimo_optimizer
-from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
-from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 
 
 def run_train_loop(args: argparse.Namespace) -> None:
@@ -43,8 +36,8 @@ def run_train_loop(args: argparse.Namespace) -> None:
         torch.manual_seed(args.seed)
         debug_rank("building MIMO model")
         model = build_mimo_runtime(args, topology)
-        debug_rank("wiring training hooks")
-        wire_training_hooks(model, topology)
+        debug_rank("configuring gradient sync")
+        configure_grad_sync(model, topology)
 
         debug_rank("building MIMO optimizer")
         optimizer = build_optimizer(args, model)
@@ -52,13 +45,7 @@ def run_train_loop(args: argparse.Namespace) -> None:
         debug_rank("MIMO optimizer ready")
 
         debug_rank("building pipeline communicator")
-        communicator = MultiModulePipelineCommunicator(
-            topology.module_to_grid_map,
-            topology.module_dependency_map,
-            model.config,
-            dim_mapping={"s": 0, "h": 2, "b": 1},
-            module_output_ndim={topology.encoder_name: 2},
-        )
+        communicator = build_pipeline_communicator(model, topology)
         debug_rank("selecting data iterator")
         data_iterator = select_data_iterator(args, topology)
         validate_data_iterator(args, data_iterator, topology)
@@ -87,89 +74,14 @@ def run_train_loop(args: argparse.Namespace) -> None:
             topology.destroy()
 
 
-def build_optimizer(args: argparse.Namespace, model: MimoModel):
-    """Build the MIMO optimizer for active hetero module optimizers."""
-    return get_mimo_optimizer(
-        model,
-        OptimizerConfig(
-            optimizer="adam",
-            lr=args.lr,
-            min_lr=args.min_lr,
-            weight_decay=args.weight_decay,
-            adam_beta1=args.adam_beta1,
-            adam_beta2=args.adam_beta2,
-            clip_grad=args.clip_grad,
-            bf16=not args.fp32,
-            use_distributed_optimizer=True,
-            log_num_zeros_in_grad=args.log_num_zeros_in_grad,
-        ),
+def build_pipeline_communicator(
+    model: MimoModel, topology: HeteroTopology
+) -> MultiModulePipelineCommunicator:
+    """Build the MIMO pipeline communicator used by the train schedule."""
+    return MultiModulePipelineCommunicator(
+        topology.module_to_grid_map,
+        topology.module_dependency_map,
+        model.config,
+        dim_mapping={"s": 0, "h": 2, "b": 1},
+        module_output_ndim={topology.encoder_name: 2},
     )
-
-
-def select_data_iterator(args: argparse.Namespace, topology: HeteroTopology) -> Optional[object]:
-    """Create the per-role data iterator needed by local ranks."""
-    if args.dataset_provider == "mock":
-        return select_mock_data_iterator(args, topology)
-    if args.dataset_provider == "energon_multimodal":
-        from examples.mimo.data.hetero_energon import build_energon_iterator
-
-        return build_energon_iterator(args, topology)
-    raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
-
-
-def validate_data_iterator(
-    args: argparse.Namespace, data_iterator, topology: HeteroTopology
-) -> None:
-    """Run data-provider checks that must happen outside the pipeline schedule."""
-    if args.dataset_provider == "energon_multimodal":
-        from examples.mimo.data.hetero_energon import validate_energon_data_alignment
-
-        validate_energon_data_alignment(data_iterator, topology)
-
-
-def select_mock_data_iterator(
-    args: argparse.Namespace, topology: HeteroTopology
-) -> Optional[MockVLMIterator]:
-    """Create the per-role mock-data iterator needed by local ranks."""
-    llm_mbs = args.micro_batch_size
-    if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
-        raise ValueError("micro_batch_size * llm_dp must be divisible by encoder_dp")
-    encoder_mbs = args.micro_batch_size * args.llm_dp // args.encoder_dp
-
-    encoder_grid = topology.encoder_grid
-    llm_grid = topology.llm_grid
-    encoder_needs_data = is_rank_in_grid(encoder_grid) and is_pp_first_stage(
-        encoder_grid.get_pg("pp")
-    )
-    llm_needs_data = is_rank_in_grid(llm_grid) and (
-        is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp"))
-    )
-
-    if encoder_needs_data and not llm_needs_data:
-        return MockVLMIterator(
-            args,
-            encoder_mbs,
-            topology.encoder_name,
-            get_mock_data_seed(args, encoder_grid, module_seed_offset=0),
-        )
-    if llm_needs_data and not encoder_needs_data:
-        return MockVLMIterator(
-            args,
-            llm_mbs,
-            topology.encoder_name,
-            get_mock_data_seed(args, llm_grid, module_seed_offset=100_000),
-        )
-    if encoder_needs_data and llm_needs_data:
-        return MockVLMIterator(
-            args,
-            llm_mbs,
-            topology.encoder_name,
-            get_mock_data_seed(args, llm_grid, module_seed_offset=100_000),
-        )
-    return None
-
-
-def get_mock_data_seed(args: argparse.Namespace, grid, module_seed_offset: int) -> int:
-    """Seed mock data by data-parallel lane so PP/TP stages see coherent batches."""
-    dp_lane = get_grid_coordinate(grid, "dp") if "dp" in grid.dim_names else 0
-    return args.seed + module_seed_offset + dp_lane

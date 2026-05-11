@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, contextmanager
 from typing import Optional
 
 import torch
@@ -169,25 +168,3 @@ def broadcast_active_params(mimo_model: MimoModel) -> None:
     """Synchronize initial parameters across each module's DP groups."""
     for module in active_ddp_modules(mimo_model):
         module.broadcast_params()
-
-
-def zero_active_grad_buffers(mimo_model: MimoModel) -> None:
-    """Clear MCore DDP grad buffers before each training iteration."""
-    for module in active_ddp_modules(mimo_model):
-        module.zero_grad_buffer()
-
-
-def build_no_sync_func(mimo_model: MimoModel):
-    """Build a no_sync context spanning all active MIMO submodules."""
-
-    @contextmanager
-    def no_sync_func():
-        with ExitStack() as stack:
-            if mimo_model.language_model is not None:
-                stack.enter_context(mimo_model.language_model.no_sync())
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    stack.enter_context(submodule.no_sync())
-            yield
-
-    return no_sync_func
