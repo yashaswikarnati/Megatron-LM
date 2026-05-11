@@ -21,7 +21,7 @@ from megatron.core.process_groups_config import (
 )
 
 ENCODER_MODULE_NAME = "images"
-EmbeddingGroupMap = dict[tuple[int, ...], tuple[dist.ProcessGroup, dist.ProcessGroup]]
+LanguageEmbeddingGroups = dict[tuple[int, ...], Optional[dist.ProcessGroup]]
 
 
 @dataclass
@@ -33,7 +33,7 @@ class HeteroTopology:
     language_pg: ProcessGroupCollection
     vision_pg: ProcessGroupCollection
     schedule_pg_collection: MultiModuleProcessGroupCollection
-    embedding_groups: EmbeddingGroupMap
+    language_embedding_groups: LanguageEmbeddingGroups
     encoder_size: int
     llm_size: int
     encoder_name: str = ENCODER_MODULE_NAME
@@ -50,7 +50,7 @@ class HeteroTopology:
 
     def destroy(self) -> None:
         """Destroy all process groups owned by this topology."""
-        destroy_embedding_groups(self.embedding_groups)
+        destroy_embedding_groups(self.language_embedding_groups)
         self.encoder_grid.destroy()
         self.llm_grid.destroy()
         BridgeCommunicator.destroy_broadcast_pgs()
@@ -60,7 +60,7 @@ def create_topology(args: argparse.Namespace, encoder_size: int, llm_size: int) 
     """Create all rank-global process groups in one deterministic order."""
     encoder_grid = None
     llm_grid = None
-    embedding_groups: Optional[EmbeddingGroupMap] = None
+    language_embedding_groups: Optional[LanguageEmbeddingGroups] = None
     try:
         debug_rank("creating encoder grid")
         encoder_grid = create_hypercomm_grid(
@@ -84,16 +84,14 @@ def create_topology(args: argparse.Namespace, encoder_size: int, llm_size: int) 
             expt_tp=args.llm_expt_tp,
             expt_dp=args.llm_expt_dp,
         )
-        debug_rank("creating embedding groups")
-        embedding_groups = create_embedding_groups([encoder_grid, llm_grid])
-        debug_rank("embedding groups ready")
+        debug_rank("creating language embedding groups")
+        language_embedding_groups = create_language_embedding_groups(llm_grid)
+        debug_rank("language embedding groups ready")
 
-        language_pg = populate_embedding_groups(
-            get_pg_collection(llm_grid), embedding_groups, is_language_model=True
+        language_pg = populate_language_embedding_groups(
+            get_pg_collection(llm_grid), language_embedding_groups
         )
-        vision_pg = populate_embedding_groups(
-            get_pg_collection(encoder_grid), embedding_groups, is_language_model=False
-        )
+        vision_pg = clear_embedding_groups(get_pg_collection(encoder_grid))
         schedule_pg_collection = build_schedule_pg_collection(
             ENCODER_MODULE_NAME, encoder_grid, llm_grid, vision_pg, language_pg
         )
@@ -104,13 +102,13 @@ def create_topology(args: argparse.Namespace, encoder_size: int, llm_size: int) 
             language_pg=language_pg,
             vision_pg=vision_pg,
             schedule_pg_collection=schedule_pg_collection,
-            embedding_groups=embedding_groups,
+            language_embedding_groups=language_embedding_groups,
             encoder_size=encoder_size,
             llm_size=llm_size,
         )
     except Exception:
-        if embedding_groups is not None:
-            destroy_embedding_groups(embedding_groups)
+        if language_embedding_groups is not None:
+            destroy_embedding_groups(language_embedding_groups)
         if encoder_grid is not None:
             encoder_grid.destroy()
         if llm_grid is not None:
@@ -202,37 +200,26 @@ def get_pg_collection(grid: HyperCommGrid) -> ProcessGroupCollection:
     )
 
 
-def create_embedding_groups(grids: list[HyperCommGrid]) -> EmbeddingGroupMap:
-    """Create PP-derived embedding groups and return handles by PP rank tuple.
+def create_language_embedding_groups(grid: HyperCommGrid) -> LanguageEmbeddingGroups:
+    """Create language-model embedding groups keyed by PP rank tuple.
 
-    These groups must be created collectively by all ranks in one deterministic order before
-    module-local ProcessGroupCollections are populated.
+    A language grid has one PP group per TP/CP/DP lane, so the rank tuple is the stable key used
+    to attach the matching first/last-stage embedding group to each ProcessGroupCollection.
     """
-    embedding_groups: EmbeddingGroupMap = {}
-    pp_rank_sets: list[tuple[int, ...]] = []
-    seen_pp_rank_sets = set()
-    for grid in sorted(grids, key=lambda candidate: (candidate.rank_offset, candidate.size)):
-        for pp_ranks in grid.get_rank_enum("pp"):
-            pp_rank_tuple = tuple(pp_ranks)
-            if pp_rank_tuple in seen_pp_rank_sets:
-                continue
-            pp_rank_sets.append(pp_rank_tuple)
-            seen_pp_rank_sets.add(pp_rank_tuple)
+    embedding_groups: LanguageEmbeddingGroups = {}
 
     try:
-        for pp_ranks in pp_rank_sets:
-            pos_embd_ranks = [pp_ranks[0]]
-            embd_ranks = [pp_ranks[0]]
-            if pp_ranks[-1] != pp_ranks[0]:
-                embd_ranks.append(pp_ranks[-1])
-            pos_embd_pg = None
+        for pp_ranks in grid.get_rank_enum("pp"):
+            pp_rank_tuple = tuple(pp_ranks)
+            if pp_rank_tuple[0] == pp_rank_tuple[-1]:
+                embedding_groups[pp_rank_tuple] = None
+                continue
+
             embd_pg = None
             try:
-                pos_embd_pg = dist.new_group(ranks=pos_embd_ranks)
-                embd_pg = dist.new_group(ranks=embd_ranks)
-                embedding_groups[pp_ranks] = (pos_embd_pg, embd_pg)
+                embd_pg = dist.new_group(ranks=[pp_rank_tuple[0], pp_rank_tuple[-1]])
+                embedding_groups[pp_rank_tuple] = embd_pg
             except Exception:
-                destroy_process_group_if_member(pos_embd_pg)
                 destroy_process_group_if_member(embd_pg)
                 raise
     except Exception:
@@ -242,40 +229,38 @@ def create_embedding_groups(grids: list[HyperCommGrid]) -> EmbeddingGroupMap:
     return embedding_groups
 
 
-def destroy_embedding_groups(embedding_groups: EmbeddingGroupMap) -> None:
-    """Destroy embedding process groups returned by create_embedding_groups."""
+def destroy_embedding_groups(embedding_groups: LanguageEmbeddingGroups) -> None:
+    """Destroy embedding process groups returned by create_language_embedding_groups."""
     destroyed_embedding_pgs = set()
-    for pos_embd_pg, embd_pg in embedding_groups.values():
-        for pg in (pos_embd_pg, embd_pg):
-            if id(pg) in destroyed_embedding_pgs:
-                continue
-            destroy_process_group_if_member(pg)
-            destroyed_embedding_pgs.add(id(pg))
+    for embd_pg in embedding_groups.values():
+        if embd_pg is None or id(embd_pg) in destroyed_embedding_pgs:
+            continue
+        destroy_process_group_if_member(embd_pg)
+        destroyed_embedding_pgs.add(id(embd_pg))
     embedding_groups.clear()
 
 
-def populate_embedding_groups(
+def populate_language_embedding_groups(
     pg_collection: ProcessGroupCollection,
-    embedding_groups: EmbeddingGroupMap,
-    is_language_model: bool = False,
+    embedding_groups: LanguageEmbeddingGroups,
 ) -> ProcessGroupCollection:
-    """Populate Megatron's required embedding fields on a ProcessGroupCollection."""
+    """Populate language embedding fields required by finalize_model_grads."""
+    pg_collection.pos_embd = None
+    pg_collection.embd = None
     if not is_process_group_member(getattr(pg_collection, "pp", None)):
         return pg_collection
 
     pp_ranks = tuple(dist.get_process_group_ranks(pg_collection.pp))
-    pos_embd_pg, embd_pg = embedding_groups[pp_ranks]
+    if is_pp_last_stage(pg_collection.pp) or is_pp_first_stage(pg_collection.pp):
+        pg_collection.embd = embedding_groups[pp_ranks]
 
-    pg_collection.pos_embd = pos_embd_pg if is_pp_first_stage(pg_collection.pp) else None
-    if is_language_model:
-        pg_collection.embd = (
-            embd_pg
-            if is_pp_last_stage(pg_collection.pp) or is_pp_first_stage(pg_collection.pp)
-            else None
-        )
-    else:
-        pg_collection.embd = None
+    return pg_collection
 
+
+def clear_embedding_groups(pg_collection: ProcessGroupCollection) -> ProcessGroupCollection:
+    """Populate embedding fields with None for modules that do not share embeddings."""
+    pg_collection.pos_embd = None
+    pg_collection.embd = None
     return pg_collection
 
 
