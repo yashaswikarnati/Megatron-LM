@@ -51,12 +51,9 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
-        """Prepare gradients for all active module optimizers."""
         found_inf = False
-        for name, info in sorted(self.module_infos.items()):
-            if not (info.is_active and info.optimizer is not None):
-                continue
-            found_inf |= info.optimizer.prepare_grads()
+        for opt in self._active_optimizers:
+            found_inf |= opt.prepare_grads()
         return found_inf
 
     @torch.no_grad()
@@ -75,7 +72,6 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self) -> Tuple[bool, Optional[float], Optional[int]]:
-        """Run a synchronized optimizer step across active module optimizers."""
         found_inf = self.prepare_grads()
         # Synchronize found_inf across all ranks to prevent deadlock:
         # if encoder ranks detect inf but LLM ranks don't, the early return
@@ -108,25 +104,21 @@ class MimoOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
-        """Step each active optimizer using already-ready gradients."""
         success = True
         for opt in self._active_optimizers:
             success &= opt.step_with_ready_grads()
         return success
 
     def zero_grad(self, set_to_none: bool = True):
-        """Clear gradients on each active optimizer."""
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
 
     def get_loss_scale(self) -> torch.Tensor:
-        """Return the active optimizer loss scale."""
         if self._active_optimizers:
             return self._active_optimizers[0].get_loss_scale()
         return torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def count_zeros(self) -> int:
-        """Count zero gradients across active optimizers."""
         return sum(opt.count_zeros() for opt in self._active_optimizers)
 
     @property
@@ -140,7 +132,6 @@ class MimoOptimizer(MegatronOptimizer):
     # Checkpointing
 
     def state_dict(self):
-        """Return per-module optimizer state dicts."""
         return {
             name: info.optimizer.state_dict() if info.is_active and info.optimizer else None
             for name, info in self.module_infos.items()
@@ -192,7 +183,6 @@ class MimoOptimizer(MegatronOptimizer):
         return sharded_state
 
     def reload_model_params(self, state_dict=None):
-        """Reload model parameters for all active module optimizers."""
         for opt in self._active_optimizers:
             opt.reload_model_params(state_dict)
 
