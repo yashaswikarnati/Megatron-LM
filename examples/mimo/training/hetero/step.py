@@ -32,7 +32,7 @@ class TrainStepResult:
     num_zeros_in_grad: Optional[int]
 
 
-def loss_func(loss_mask: Optional[torch.Tensor], output_tensor):
+def loss_func(output_tensor: torch.Tensor, *, loss_mask: torch.Tensor):
     """Return terminal language-model loss sum, local token count, and logging tensors."""
     if output_tensor is None:
         raise RuntimeError("terminal language stage returned no loss tensor")
@@ -69,7 +69,7 @@ def forward_step(data_iterator, model):
     debug_rank("forward_step model call start")
     output_tensor, loss_mask = model(**batch)
     debug_rank("forward_step model call done")
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask=loss_mask)
 
 
 def move_batch_to_cuda(value):
