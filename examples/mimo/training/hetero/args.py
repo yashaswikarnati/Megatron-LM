@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     """Parse standalone hetero MIMO loop arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Standalone heterogeneous MIMO mock training loop. "
+            "Standalone heterogeneous MIMO training loop. "
             "This entrypoint owns one HyperCommGrid per MIMO module."
         )
     )
@@ -42,6 +42,14 @@ def parse_args() -> argparse.Namespace:
     grid.add_argument("--llm-expt-dp", type=int, default=1)
 
     add_model_provider_args(parser)
+
+    data = parser.add_argument_group("data")
+    data.add_argument("--dataset-provider", choices=["mock", "energon_multimodal"], default="mock")
+    data.add_argument("--data-path", type=str, default=None)
+    data.add_argument("--num-workers", type=int, default=2)
+    data.add_argument("--packing-buffer-size", type=int, default=None)
+    data.add_argument("--shuffle-buffer-size", type=int, default=100)
+    data.add_argument("--max-samples-per-sequence", type=int, default=100)
 
     train = parser.add_argument_group("training")
     train.add_argument("--micro-batch-size", type=int, default=2)
@@ -86,14 +94,17 @@ def prepare_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
 
 
 def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
-    """Validate the current disjoint-grid mock-training layout."""
+    """Validate the current disjoint-grid training layout."""
     if args.encoder_cp != 1 or args.llm_cp != 1:
         raise ValueError("Phase 2 mock training currently supports CP=1 only")
     if args.log_interval < 1:
         raise ValueError("--log-interval must be >= 1")
 
     validate_model_provider_args(args)
-    validate_mock_data_args(args)
+    if args.dataset_provider == "mock":
+        validate_mock_data_args(args)
+    else:
+        validate_energon_data_args(args)
     if args.num_moe_experts > 0 and args.num_moe_experts % args.llm_ep != 0:
         raise ValueError("--num-moe-experts must be divisible by --llm-ep")
     if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
@@ -117,3 +128,35 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
         )
 
     return encoder_size, llm_size
+
+
+def validate_energon_data_args(args: argparse.Namespace) -> None:
+    """Validate the actual-data non-colocated path."""
+    if not args.data_path:
+        raise ValueError("--data-path is required for --dataset-provider energon_multimodal")
+    if not args.tokenizer_model:
+        raise ValueError("--tokenizer-model is required for --dataset-provider energon_multimodal")
+    if args.model_provider != "nemotron-moe-vlm-20l":
+        raise ValueError("energon_multimodal is currently wired for the Nemotron 20L VLM provider")
+    if args.encoder_pp != 1 or args.llm_pp != 1:
+        raise ValueError("energon_multimodal currently supports encoder and LLM PP size 1")
+    if args.encoder_dp != args.llm_dp:
+        raise ValueError(
+            "energon_multimodal currently requires --encoder-dp == --llm-dp so the "
+            "encoder and LLM grids consume matching DP-lane samples"
+        )
+    if args.overlap_grad_reduce:
+        raise ValueError(
+            "energon_multimodal currently requires --no-overlap-grad-reduce because "
+            "the blend can yield text-only batches on vision ranks"
+        )
+    if args.packing_buffer_size is not None and args.packing_buffer_size > 0:
+        if args.micro_batch_size != 1:
+            raise ValueError(
+                "Energon packed multimodal batches currently require --micro-batch-size 1"
+            )
+    encoder_micro_batch_size = args.micro_batch_size * args.llm_dp // args.encoder_dp
+    if encoder_micro_batch_size != args.micro_batch_size:
+        raise ValueError(
+            "energon_multimodal currently requires equal encoder and LLM microbatch sizes"
+        )

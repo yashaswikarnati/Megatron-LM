@@ -143,11 +143,25 @@ def loss_func(loss_mask: Optional[torch.Tensor], output_tensor):
 def forward_step(data_iterator, model):
     """Forward step consumed by the MCore pipeline schedule."""
     batch = next(data_iterator) if data_iterator is not None else {"input_ids": None}
+    batch = move_batch_to_cuda(batch)
     debug_rank("forward_step batch prepared")
     debug_rank("forward_step model call start")
     output_tensor, loss_mask = model(**batch)
     debug_rank("forward_step model call done")
     return output_tensor, partial(loss_func, loss_mask)
+
+
+def move_batch_to_cuda(value):
+    """Move tensors in nested batch structures to the current CUDA device."""
+    if isinstance(value, torch.Tensor):
+        return value.cuda(non_blocking=True)
+    if isinstance(value, dict):
+        return {key: move_batch_to_cuda(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [move_batch_to_cuda(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(move_batch_to_cuda(item) for item in value)
+    return value
 
 
 def train_step(

@@ -58,10 +58,12 @@ NEMOTRON_VISION_ENCODER_KEY = "radio_encoder"
 
 
 def is_nemotron_20l(args: argparse.Namespace) -> bool:
+    """Return whether the Nemotron6-MoE VLM 20L provider is active."""
     return args.model_provider == NEMOTRON_20L_MODEL_PROVIDER
 
 
 def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
+    """Register model-provider arguments for hetero MIMO examples."""
     provider = parser.add_argument_group("model provider")
     provider.add_argument(
         "--model-provider",
@@ -88,7 +90,18 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
     provider.add_argument("--img-w", type=int, default=512)
     provider.add_argument("--patch-dim", type=int, default=16)
     provider.add_argument("--class-token-len", type=int, default=8)
-    provider.add_argument("--num-image-tiles", type=int, default=NEMOTRON_20L_MAX_NUM_TILES)
+    provider.add_argument(
+        "--num-image-tiles",
+        "--max-num-tiles",
+        dest="num_image_tiles",
+        type=int,
+        default=NEMOTRON_20L_MAX_NUM_TILES,
+    )
+    provider.add_argument("--vision-model-type", type=str, default="radio")
+    provider.add_argument("--pixel-shuffle", action="store_true")
+    provider.add_argument("--disable-vision-class-token", action="store_true")
+    provider.add_argument("--use-tiling", action="store_true")
+    provider.add_argument("--use-thumbnail", action="store_true")
     provider.add_argument("--freeze-lm", action="store_true")
     provider.add_argument("--freeze-vit", action="store_true")
     provider.add_argument("--freeze-projection", action="store_true")
@@ -97,6 +110,7 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
 
 
 def prepare_model_provider_args(args: argparse.Namespace) -> None:
+    """Apply provider defaults and derived tokenizer/vision settings."""
     apply_model_provider_defaults(args)
     apply_training_stage(args)
     resolve_image_token_id(args)
@@ -105,6 +119,7 @@ def prepare_model_provider_args(args: argparse.Namespace) -> None:
 
 
 def apply_model_provider_defaults(args: argparse.Namespace) -> None:
+    """Apply the exact Nemotron6-MoE VLM 20L model defaults."""
     if not is_nemotron_20l(args):
         return
 
@@ -116,9 +131,14 @@ def apply_model_provider_defaults(args: argparse.Namespace) -> None:
     args.moe_grouped_gemm = True
     args.seq_length = 8192
     args.image_seq_length = NEMOTRON_20L_IMAGE_SEQ_PER_TILE * args.num_image_tiles
+    args.pixel_shuffle = True
+    args.disable_vision_class_token = True
+    args.use_tiling = True
+    args.use_thumbnail = True
 
 
 def apply_training_stage(args: argparse.Namespace) -> None:
+    """Apply stage-specific freeze flags for the Nemotron VLM recipe."""
     if not is_nemotron_20l(args):
         return
 
@@ -134,6 +154,7 @@ def apply_training_stage(args: argparse.Namespace) -> None:
 
 
 def resolve_image_token_id(args: argparse.Namespace) -> None:
+    """Resolve image, pad, and vocab ids from the configured tokenizer."""
     if not is_nemotron_20l(args) or not args.tokenizer_model:
         return
 
@@ -161,6 +182,7 @@ def resolve_image_token_id(args: argparse.Namespace) -> None:
 
 
 def validate_model_provider_args(args: argparse.Namespace) -> None:
+    """Validate derived model-provider arguments."""
     if args.hidden_size % args.num_attention_heads != 0:
         raise ValueError("--hidden-size must be divisible by --num-attention-heads")
     if not 0 <= args.image_token_id < args.vocab_size:

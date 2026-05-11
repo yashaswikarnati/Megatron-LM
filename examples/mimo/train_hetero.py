@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Standalone heterogeneous MIMO mock training entrypoint."""
+"""Standalone heterogeneous MIMO training entrypoint."""
 
 import os
 import sys
@@ -27,7 +27,7 @@ def main() -> None:
     try:
         run_train_loop(args)
         dist.barrier()
-        print_rank_0("Heterogeneous MIMO mock training completed")
+        print_rank_0("Heterogeneous MIMO training completed")
     finally:
         shutdown_distributed()
 

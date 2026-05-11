@@ -376,12 +376,17 @@ class MimoModel(MegatronModule):
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
-                return self._forward_encoders(modality_inputs, input_tensors), loss_mask
+                return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
 
             if self.role.has_language_module:
                 return (
                     self._forward_language_module(
-                        input_ids, position_ids, attention_mask, labels, input_tensors
+                        input_ids,
+                        position_ids,
+                        attention_mask,
+                        labels,
+                        input_tensors,
+                        packing_kwargs,
                     ),
                     loss_mask,
                 )
@@ -392,6 +397,7 @@ class MimoModel(MegatronModule):
 
     def _forward_encoders(
         self,
+        input_ids: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
         input_tensors: Optional[Dict[str, torch.Tensor]],
     ) -> Dict[str, torch.Tensor]:
@@ -411,15 +417,46 @@ class MimoModel(MegatronModule):
                 continue
 
             submodule = self.modality_submodules[encoder_name]
-            output = submodule.forward(
-                encoder_inputs=modality_inputs.get(encoder_name) if modality_inputs else None,
-                hidden_states=input_tensors.get(encoder_name) if input_tensors else None,
-            )
+            encoder_inputs = modality_inputs.get(encoder_name) if modality_inputs else None
+            hidden_states = input_tensors.get(encoder_name) if input_tensors else None
+            output = submodule.forward(encoder_inputs=encoder_inputs, hidden_states=hidden_states)
+            if output is None and encoder_inputs is None and hidden_states is None:
+                if self._has_encoder_tokens(input_ids, encoder_name):
+                    raise RuntimeError(
+                        f"{encoder_name} inputs are missing, but matching special tokens exist"
+                    )
+                output = self._empty_modality_output(submodule)
 
             if output is not None:
                 outputs[encoder_name] = output
 
         return outputs
+
+    def _has_encoder_tokens(self, input_ids: Optional[torch.Tensor], encoder_name: str) -> bool:
+        """Return whether the batch contains tokens for an encoder module."""
+        if input_ids is None or encoder_name not in self.special_token_ids:
+            return False
+        return bool((input_ids == self.special_token_ids[encoder_name]).any().item())
+
+    @staticmethod
+    def _empty_modality_output(submodule: torch.nn.Module) -> torch.Tensor:
+        """Return an empty projected activation for text-only non-colocated batches."""
+        unwrapped = unwrap_model(submodule)
+        projections = getattr(unwrapped, "input_projections", None)
+        if not projections:
+            raise RuntimeError("cannot build empty modality output without input projections")
+
+        projection = projections[0]
+        hidden_size = getattr(getattr(projection, "config", None), "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(projection, "out_features", None)
+        if hidden_size is None:
+            raise RuntimeError("cannot infer hidden size for empty modality output")
+
+        param = next(projection.parameters(), None)
+        device = param.device if param is not None else torch.device("cuda")
+        dtype = param.dtype if param is not None else torch.float32
+        return torch.empty((0, hidden_size), device=device, dtype=dtype, requires_grad=True)
 
     def _forward_language_module(
         self,
@@ -428,6 +465,7 @@ class MimoModel(MegatronModule):
         attention_mask: Optional[torch.Tensor],
         labels: Optional[torch.Tensor],
         input_tensors: Optional[Dict[str, torch.Tensor]],
+        packing_kwargs: Optional[dict] = None,
     ) -> torch.Tensor:
         """Forward pass for language module on this rank.
 
@@ -442,6 +480,7 @@ class MimoModel(MegatronModule):
             Language model output (hidden states, logits, or loss depending on stage)
         """
         lang_name = MIMO_LANGUAGE_MODULE_KEY
+        packed_seq_params = self._build_packed_seq_params(packing_kwargs)
 
         if self.role.is_first_stage(lang_name):
             # First stage: receive encoder embeddings, combine with text, pass to LM
@@ -467,11 +506,14 @@ class MimoModel(MegatronModule):
 
             if self.partition_adapter is not None:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
-                combined_embeddings, labels, _, attention_mask, _ = self.partition_adapter.shard(
-                    embeddings=combined_embeddings,
-                    labels=labels,
-                    loss_mask=None,
-                    attention_mask=attention_mask,
+                combined_embeddings, labels, _, attention_mask, packed_seq_params = (
+                    self.partition_adapter.shard(
+                        embeddings=combined_embeddings,
+                        labels=labels,
+                        loss_mask=None,
+                        attention_mask=attention_mask,
+                        packed_seq_params=packed_seq_params,
+                    )
                 )
                 if combined_embeddings is not None:
                     combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
@@ -482,6 +524,7 @@ class MimoModel(MegatronModule):
                 decoder_input=combined_embeddings,
                 labels=labels,
                 attention_mask=None,
+                packed_seq_params=packed_seq_params,
             )
         else:
             # Non-first stage: receive hidden states from previous LM stage
@@ -499,6 +542,7 @@ class MimoModel(MegatronModule):
                 decoder_input=None,
                 labels=labels,
                 attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
             )
 
         # Key output for non-last stages so schedule can route to next LM stage
@@ -506,6 +550,24 @@ class MimoModel(MegatronModule):
             return {lang_name: lm_output}
 
         return lm_output
+
+    @staticmethod
+    def _build_packed_seq_params(packing_kwargs: Optional[dict]) -> Optional[PackedSeqParams]:
+        """Build packed-sequence params from dataloader kwargs."""
+        if packing_kwargs is None:
+            return None
+        converted_kwargs = {}
+        for key, value in packing_kwargs.items():
+            if 'cu_seqlens' in key and value is not None:
+                converted_kwargs[key] = value.to(dtype=torch.int32)
+            elif key == 'total_tokens' and isinstance(value, torch.Tensor):
+                converted_kwargs[key] = int(value.item())
+            else:
+                converted_kwargs[key] = value
+        packed_seq_params = PackedSeqParams(**converted_kwargs)
+        packed_seq_params.qkv_format = 'thd'
+        logger.debug(f"Packed sequence parameters: {packed_seq_params}")
+        return packed_seq_params
 
     def _build_colocated_communicators(self):
         grid_map = self.mimo_config.module_to_grid_map
@@ -562,16 +624,7 @@ class MimoModel(MegatronModule):
 
         This is the original behavior, preserved for backward compatibility.
         """
-        # If packing_kwargs is provided, construct PackedSeqParams
-        packed_seq_params = None
-        if packing_kwargs is not None:
-            # Ensure correct dtype for seqlens tensors
-            for key in packing_kwargs:
-                if 'cu_seqlens' in key and packing_kwargs[key] is not None:
-                    packing_kwargs[key] = packing_kwargs[key].to(dtype=torch.int32)
-            packed_seq_params = PackedSeqParams(**packing_kwargs)
-            packed_seq_params.qkv_format = 'thd'
-            logger.debug(f"Packed sequence parameters: {packed_seq_params}")
+        packed_seq_params = self._build_packed_seq_params(packing_kwargs)
 
         # 1. Process each modality to get embeddings
         modality_embeddings = {}

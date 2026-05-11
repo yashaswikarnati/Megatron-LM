@@ -31,7 +31,7 @@ from examples.mimo.utils.hetero import debug_rank
 
 
 def run_train_loop(args: argparse.Namespace) -> None:
-    """Run mock-data heterogeneous MIMO training."""
+    """Run heterogeneous MIMO training."""
     world_size = torch.distributed.get_world_size()
     encoder_size, llm_size = prepare_args(args, world_size)
 
@@ -61,13 +61,15 @@ def run_train_loop(args: argparse.Namespace) -> None:
         )
         debug_rank("selecting data iterator")
         data_iterator = select_data_iterator(args, topology)
+        validate_data_iterator(args, data_iterator, topology)
         logger = HeteroTrainingLogger(args=args, topology=topology)
         debug_rank("training setup ready")
 
         print_rank_0(
-            "Starting hetero MIMO mock training: "
+            "Starting hetero MIMO training: "
             f"world_size={world_size}, encoder_size={topology.encoder_size}, "
-            f"llm_size={topology.llm_size}, train_iters={args.train_iters}"
+            f"llm_size={topology.llm_size}, train_iters={args.train_iters}, "
+            f"dataset_provider={args.dataset_provider}"
         )
 
         for iteration in range(1, args.train_iters + 1):
@@ -104,7 +106,28 @@ def build_optimizer(args: argparse.Namespace, runtime: HeteroRuntime):
     )
 
 
-def select_data_iterator(
+def select_data_iterator(args: argparse.Namespace, topology: HeteroTopology) -> Optional[object]:
+    """Create the per-role data iterator needed by local ranks."""
+    if args.dataset_provider == "mock":
+        return select_mock_data_iterator(args, topology)
+    if args.dataset_provider == "energon_multimodal":
+        from examples.mimo.data.hetero_energon import build_energon_iterator
+
+        return build_energon_iterator(args, topology)
+    raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
+
+
+def validate_data_iterator(
+    args: argparse.Namespace, data_iterator, topology: HeteroTopology
+) -> None:
+    """Run data-provider checks that must happen outside the pipeline schedule."""
+    if args.dataset_provider == "energon_multimodal":
+        from examples.mimo.data.hetero_energon import validate_energon_data_alignment
+
+        validate_energon_data_alignment(data_iterator, topology)
+
+
+def select_mock_data_iterator(
     args: argparse.Namespace, topology: HeteroTopology
 ) -> Optional[MockVLMIterator]:
     """Create the per-role mock-data iterator needed by local ranks."""
