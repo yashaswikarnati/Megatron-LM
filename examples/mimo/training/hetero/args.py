@@ -71,8 +71,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Enable DDP gradient-reduce overlap. The hetero example defaults this off "
-            "to match Megatron's conservative DDP default and the 20L reference script."
+            "Enable DDP gradient-reduce overlap for the language module. Vision encoder DDP "
+            "keeps overlap disabled because actual-data batches may be text-only."
         ),
     )
     train.add_argument(
@@ -144,11 +144,6 @@ def validate_energon_data_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "energon_multimodal currently requires --encoder-dp == --llm-dp so the "
             "encoder and LLM grids consume matching DP-lane samples"
-        )
-    if args.overlap_grad_reduce:
-        raise ValueError(
-            "energon_multimodal currently requires --no-overlap-grad-reduce because "
-            "the blend can yield text-only batches on vision ranks"
         )
     if args.packing_buffer_size is not None and args.packing_buffer_size > 0:
         if args.micro_batch_size != 1:

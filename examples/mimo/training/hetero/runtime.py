@@ -76,8 +76,13 @@ def wrap_active_modules(
     args: argparse.Namespace, mimo_model: MimoModel, topology: HeteroTopology
 ) -> None:
     """Freeze and DDP-wrap active local MIMO modules."""
-    ddp_config = DistributedDataParallelConfig(
+    language_ddp_config = DistributedDataParallelConfig(
         overlap_grad_reduce=args.overlap_grad_reduce,
+        bucket_size=args.ddp_bucket_size if args.ddp_bucket_size > 0 else None,
+        use_distributed_optimizer=True,
+    )
+    vision_ddp_config = DistributedDataParallelConfig(
+        overlap_grad_reduce=False,
         bucket_size=args.ddp_bucket_size if args.ddp_bucket_size > 0 else None,
         use_distributed_optimizer=True,
     )
@@ -87,7 +92,7 @@ def wrap_active_modules(
         debug_rank("wrapping language model in DDP")
         mimo_model.language_model = DistributedDataParallel(
             config=mimo_model.language_model.config,
-            ddp_config=ddp_config,
+            ddp_config=language_ddp_config,
             module=mimo_model.language_model,
             pg_collection=topology.language_pg,
         )
@@ -107,7 +112,7 @@ def wrap_active_modules(
         debug_rank("wrapping vision submodule in DDP")
         mimo_model.modality_submodules[topology.encoder_name] = DistributedDataParallel(
             config=encoder_module.config,
-            ddp_config=ddp_config,
+            ddp_config=vision_ddp_config,
             module=submodule,
             pg_collection=topology.vision_pg,
         )
