@@ -2792,8 +2792,8 @@ requires-dist = [
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "mamba-ssm", marker = "extra == 'dev'", specifier = "~=2.2" },
     { name = "mamba-ssm", marker = "extra == 'lts'", specifier = "~=2.2" },
-    { name = "megatron-energon", extras = ["av-decode", "multimodal"], marker = "extra == 'dev'", path = "examples/mimo/vendor/megatron_energon-7.3.3.dev30+gd456cbd4a-py3-none-any.whl" },
-    { name = "megatron-energon", extras = ["av-decode", "multimodal"], marker = "extra == 'lts'", path = "examples/mimo/vendor/megatron_energon-7.3.3.dev30+gd456cbd4a-py3-none-any.whl" },
+    { name = "megatron-energon", extras = ["av-decode", "multimodal"], marker = "extra == 'dev'", git = "https://gitlab-master.nvidia.com/sasatheesh/Megatron-Energon?rev=d456cbd4a9a8a760b20be51194a0209c9a945b0a" },
+    { name = "megatron-energon", extras = ["av-decode", "multimodal"], marker = "extra == 'lts'", git = "https://gitlab-master.nvidia.com/sasatheesh/Megatron-Energon?rev=d456cbd4a9a8a760b20be51194a0209c9a945b0a" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
     { name = "multi-storage-client", marker = "extra == 'lts'", specifier = "~=0.27" },
     { name = "numpy" },
@@ -2880,7 +2880,7 @@ test = [
 [[package]]
 name = "megatron-energon"
 version = "7.3.3.dev30+gd456cbd4a"
-source = { path = "examples/mimo/vendor/megatron_energon-7.3.3.dev30+gd456cbd4a-py3-none-any.whl" }
+source = { git = "https://gitlab-master.nvidia.com/sasatheesh/Megatron-Energon?rev=d456cbd4a9a8a760b20be51194a0209c9a945b0a#d456cbd4a9a8a760b20be51194a0209c9a945b0a" }
 dependencies = [
     { name = "braceexpand" },
     { name = "click" },
@@ -2898,9 +2898,6 @@ dependencies = [
     { name = "tqdm" },
     { name = "webdataset" },
 ]
-wheels = [
-    { filename = "megatron_energon-7.3.3.dev30+gd456cbd4a-py3-none-any.whl", hash = "sha256:34c309d2baa623eabedf0cc6e94d430fc5b0abb09d9f2b5d20da2464b54cce54" },
-]
 
 [package.optional-dependencies]
 av-decode = [
@@ -2915,47 +2912,6 @@ multimodal = [
     { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "transformers" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "av", marker = "extra == 'av-decode'", specifier = ">=14.4.0" },
-    { name = "bitstring", marker = "extra == 'av-decode'", specifier = ">=4.2.3" },
-    { name = "braceexpand" },
-    { name = "click" },
-    { name = "ebmlite", marker = "extra == 'av-decode'", specifier = ">=3.3.1" },
-    { name = "einops", marker = "extra == 'multimodal'" },
-    { name = "filetype", specifier = ">=1.0.0" },
-    { name = "filetype", marker = "extra == 'av-decode'", specifier = ">=1.2.0" },
-    { name = "mfusepy" },
-    { name = "multi-storage-client", specifier = ">=0.33.0" },
-    { name = "multi-storage-client", extras = ["aistore"], marker = "extra == 'aistore'" },
-    { name = "multi-storage-client", extras = ["azure-storage-blob"], marker = "extra == 'azure-storage-blob'" },
-    { name = "multi-storage-client", extras = ["boto3"], marker = "extra == 's3'" },
-    { name = "multi-storage-client", extras = ["google-cloud-storage"], marker = "extra == 'google-cloud-storage'" },
-    { name = "multi-storage-client", extras = ["huggingface"], marker = "extra == 'huggingface'" },
-    { name = "multi-storage-client", extras = ["oci"], marker = "extra == 'oci'" },
-    { name = "myst-parser", marker = "extra == 'dev'" },
-    { name = "numba", marker = "extra == 'tar-patcher'" },
-    { name = "numpy" },
-    { name = "pillow", specifier = ">=10.0.1" },
-    { name = "pyyaml" },
-    { name = "rapidyaml", specifier = ">=0.10.0" },
-    { name = "ruff", marker = "extra == 'dev'" },
-    { name = "s3fs" },
-    { name = "sortedcontainers", marker = "extra == 'av-decode'", specifier = ">=2.4.0" },
-    { name = "soundfile", marker = "extra == 'dev'" },
-    { name = "sphinx", marker = "extra == 'dev'" },
-    { name = "sphinx-click", marker = "extra == 'dev'" },
-    { name = "sphinx-rtd-theme", marker = "extra == 'dev'" },
-    { name = "sphinxcontrib-napoleon", marker = "extra == 'dev'" },
-    { name = "torch" },
-    { name = "torchvision", marker = "extra == 'multimodal'" },
-    { name = "torchvision", marker = "extra == 'transforms'" },
-    { name = "tqdm" },
-    { name = "transformers", marker = "extra == 'multimodal'" },
-    { name = "webdataset" },
-]
-provides-extras = ["aistore", "av-decode", "azure-storage-blob", "dev", "google-cloud-storage", "huggingface", "multimodal", "oci", "s3", "tar-patcher", "transforms"]
 
 [[package]]
 name = "mfusepy"

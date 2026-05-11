@@ -33,7 +33,6 @@ os.chdir(REPO_ROOT)
 from examples.mimo.data import energon_multimodal_provider as current_provider
 
 OLD_PROVIDER_REPO_PATH = "examples/mimo/data/energon_multimodal_provider.py"
-OLD_PROVIDER_BUNDLED_PATH = REPO_ROOT / "examples/mimo/vendor/old_energon_multimodal_provider.py"
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,12 +125,7 @@ def load_old_provider(args: argparse.Namespace) -> ModuleType:
     if args.old_provider_path is not None:
         provider_path = Path(args.old_provider_path)
     else:
-        try:
-            provider_path = materialize_old_provider_from_git(args.old_provider_ref)
-        except RuntimeError:
-            if not OLD_PROVIDER_BUNDLED_PATH.is_file():
-                raise
-            provider_path = OLD_PROVIDER_BUNDLED_PATH
+        provider_path = materialize_old_provider_from_git(args.old_provider_ref)
     return import_module_from_path("old_energon_multimodal_provider", provider_path)
 
 

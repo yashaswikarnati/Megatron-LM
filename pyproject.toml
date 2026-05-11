@@ -204,7 +204,7 @@ transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", 
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.2.0" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", rev = "b2bb3d728a18795807d9f76c535e005a609a1b01" }
-megatron-energon = { path = "examples/mimo/vendor/megatron_energon-7.3.3.dev30+gd456cbd4a-py3-none-any.whl" }
+megatron-energon = { git = "https://gitlab-master.nvidia.com/sasatheesh/Megatron-Energon", rev = "d456cbd4a9a8a760b20be51194a0209c9a945b0a" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible

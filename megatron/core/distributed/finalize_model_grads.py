@@ -489,10 +489,6 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
-        if tp_dp_cp_group is None:
-            raise RuntimeError(
-                "pg_collection.tp_dp_cp is required when moe_router_enable_expert_bias is enabled"
-            )
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
