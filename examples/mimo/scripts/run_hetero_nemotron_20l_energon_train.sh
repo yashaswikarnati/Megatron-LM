@@ -16,14 +16,6 @@ case "${TRAINING_STAGE}" in
     ;;
 esac
 
-if [[ "${INSTALL_ENERGON:-0}" == "1" ]]; then
-  if [[ -n "${ENERGON_PATH:-}" ]]; then
-    bash examples/mimo/scripts/install_energon.sh "${ENERGON_PATH}"
-  else
-    bash examples/mimo/scripts/install_energon.sh
-  fi
-fi
-
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 TRAIN_ITERS="${TRAIN_ITERS:-100}"
 NUM_MICROBATCHES="${NUM_MICROBATCHES:-4}"
@@ -36,10 +28,20 @@ PACKING_BUFFER_SIZE="${PACKING_BUFFER_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
 SHUFFLE_BUFFER_SIZE="${SHUFFLE_BUFFER_SIZE:-100}"
 MAX_SAMPLES_PER_SEQUENCE="${MAX_SAMPLES_PER_SEQUENCE:-100}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN=python
+  else
+    PYTHON_BIN=python3
+  fi
+fi
 
 DATA_PATH="${DATA_PATH:-/lustre/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/kshih/workspace/blends/eagle_recipe_online_packing/final_recipe/pretrain_base_non_sft_cw_dfw.yaml}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/ykarnati/checkpoints/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16-multimodal-pretraining/snapshots/7344a79074e20d9ab548e14c25b0492345394f67}"
+
+if [[ "${VERIFY_ENERGON:-1}" == "1" ]]; then
+  PYTHON_BIN="${PYTHON_BIN}" bash examples/mimo/scripts/verify_energon.sh
+fi
 
 echo "=== Hetero MIMO Nemotron6-MoE VLM 20L Energon training ==="
 echo "stage=${TRAINING_STAGE} train_iters=${TRAIN_ITERS} gbs=${GLOBAL_BATCH_SIZE}"
