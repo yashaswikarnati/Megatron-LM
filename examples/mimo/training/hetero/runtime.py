@@ -6,16 +6,9 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
-
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.models.mimo.config.base_configs import MimoModelConfig
-from megatron.core.models.mimo.model.base import MimoModel
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
 from examples.mimo.model_providers.nemotron_moe_vlm import (
     get_vision_encoder_module,
@@ -25,20 +18,14 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 )
 from examples.mimo.training.hetero.topology import HeteroTopology, is_rank_in_grid
 from examples.mimo.utils.hetero import debug_rank, get_group_rank_or
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.models.mimo.config.base_configs import MimoModelConfig
+from megatron.core.models.mimo.model.base import MimoModel
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
 
-@dataclass
-class HeteroRuntime:
-    """Runtime-owned model state for a hetero MIMO training run."""
-
-    model: MimoModel
-
-    def destroy(self) -> None:
-        """Destroy runtime-owned model communication state."""
-        self.model.destroy()
-
-
-def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> HeteroRuntime:
+def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> MimoModel:
     """Build the MIMO model and wrap active modules in MCore DDP."""
     language_pg = topology.language_pg
     vision_pg = topology.vision_pg
@@ -82,7 +69,7 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> He
 
     wrap_active_modules(args, mimo_model, topology)
     broadcast_active_params(mimo_model)
-    return HeteroRuntime(model=mimo_model)
+    return mimo_model
 
 
 def wrap_active_modules(

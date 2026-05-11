@@ -9,16 +9,11 @@ from typing import Optional
 
 import torch
 
-from megatron.core.models.mimo.optimizer import get_mimo_optimizer
-from megatron.core.optimizer.optimizer_config import OptimizerConfig
-from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
-from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-
 from examples.mimo.data.hetero_mock import MockVLMIterator
 from examples.mimo.training.hetero.args import prepare_args
 from examples.mimo.training.hetero.distributed import print_rank_0
 from examples.mimo.training.hetero.logging import HeteroTrainingLogger
-from examples.mimo.training.hetero.runtime import HeteroRuntime, build_mimo_runtime
+from examples.mimo.training.hetero.runtime import build_mimo_runtime
 from examples.mimo.training.hetero.scheduler import build_optimizer_param_scheduler
 from examples.mimo.training.hetero.step import train_step, wire_training_hooks
 from examples.mimo.training.hetero.topology import (
@@ -28,6 +23,11 @@ from examples.mimo.training.hetero.topology import (
     is_rank_in_grid,
 )
 from examples.mimo.utils.hetero import debug_rank
+from megatron.core.models.mimo.model.base import MimoModel
+from megatron.core.models.mimo.optimizer import get_mimo_optimizer
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 
 
 def run_train_loop(args: argparse.Namespace) -> None:
@@ -36,18 +36,18 @@ def run_train_loop(args: argparse.Namespace) -> None:
     encoder_size, llm_size = prepare_args(args, world_size)
 
     topology: Optional[HeteroTopology] = None
-    runtime: Optional[HeteroRuntime] = None
+    model: Optional[MimoModel] = None
     try:
         topology = create_topology(args, encoder_size, llm_size)
 
         torch.manual_seed(args.seed)
         debug_rank("building MIMO model")
-        runtime = build_mimo_runtime(args, topology)
+        model = build_mimo_runtime(args, topology)
         debug_rank("wiring training hooks")
-        wire_training_hooks(runtime, topology)
+        wire_training_hooks(model, topology)
 
         debug_rank("building MIMO optimizer")
-        optimizer = build_optimizer(args, runtime)
+        optimizer = build_optimizer(args, model)
         opt_param_scheduler = build_optimizer_param_scheduler(args, optimizer)
         debug_rank("MIMO optimizer ready")
 
@@ -55,7 +55,7 @@ def run_train_loop(args: argparse.Namespace) -> None:
         communicator = MultiModulePipelineCommunicator(
             topology.module_to_grid_map,
             topology.module_dependency_map,
-            runtime.model.config,
+            model.config,
             dim_mapping={"s": 0, "h": 2, "b": 1},
             module_output_ndim={topology.encoder_name: 2},
         )
@@ -75,22 +75,22 @@ def run_train_loop(args: argparse.Namespace) -> None:
         for iteration in range(1, args.train_iters + 1):
             debug_rank(f"iteration {iteration}: train step start")
             result = train_step(
-                args, runtime, topology, optimizer, opt_param_scheduler, communicator, data_iterator
+                args, model, topology, optimizer, opt_param_scheduler, communicator, data_iterator
             )
             logger.record_step(result)
             logger.maybe_log(iteration, optimizer, result)
             debug_rank(f"iteration {iteration}: train step complete")
     finally:
-        if runtime is not None:
-            runtime.destroy()
+        if model is not None:
+            model.destroy()
         if topology is not None:
             topology.destroy()
 
 
-def build_optimizer(args: argparse.Namespace, runtime: HeteroRuntime):
+def build_optimizer(args: argparse.Namespace, model: MimoModel):
     """Build the MIMO optimizer for active hetero module optimizers."""
     return get_mimo_optimizer(
-        runtime.model,
+        model,
         OptimizerConfig(
             optimizer="adam",
             lr=args.lr,

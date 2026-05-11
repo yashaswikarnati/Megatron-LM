@@ -13,19 +13,15 @@ import torch
 import torch.distributed as dist
 
 import megatron.core.pipeline_parallel.schedules as schedule
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
-from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage
-
-from examples.mimo.training.hetero.runtime import (
-    HeteroRuntime,
-    build_no_sync_func,
-    zero_active_grad_buffers,
-)
+from examples.mimo.training.hetero.runtime import build_no_sync_func, zero_active_grad_buffers
 from examples.mimo.training.hetero.scheduler import get_global_batch_size
 from examples.mimo.training.hetero.topology import HeteroTopology
 from examples.mimo.utils.hetero import debug_rank, is_process_group_member
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.models.mimo.model.base import MimoModel
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 
 
 @dataclass
@@ -39,9 +35,8 @@ class TrainStepResult:
     num_zeros_in_grad: Optional[int]
 
 
-def wire_training_hooks(runtime: HeteroRuntime, topology: HeteroTopology) -> None:
+def wire_training_hooks(mimo_model: MimoModel, topology: HeteroTopology) -> None:
     """Attach MIMO-specific grad sync hooks expected by the pipeline schedule."""
-    mimo_model = runtime.model
     language_pg = topology.language_pg
     vision_pg = topology.vision_pg
 
@@ -166,7 +161,7 @@ def move_batch_to_cuda(value):
 
 def train_step(
     args: argparse.Namespace,
-    runtime: HeteroRuntime,
+    model: MimoModel,
     topology: HeteroTopology,
     optimizer,
     opt_param_scheduler,
@@ -174,14 +169,14 @@ def train_step(
     data_iterator,
 ) -> TrainStepResult:
     """Run one Megatron-shaped hetero training step."""
-    zero_active_grad_buffers(runtime.model)
+    zero_active_grad_buffers(model)
     optimizer.zero_grad()
 
     debug_rank("starting forward/backward schedule")
     losses = schedule.forward_backward_pipelining_without_interleaving(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
-        model=[runtime.model],
+        model=[model],
         num_microbatches=args.num_microbatches,
         seq_length=args.seq_length,
         micro_batch_size=args.micro_batch_size,
