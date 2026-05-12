@@ -152,7 +152,7 @@ class MimoModel(MegatronModule):
             special_token_ids: Dictionary mapping modality names to their special token IDs
 
         Returns:
-            Combined embeddings tensor. Shape: (S, B, H)
+            Combined embeddings tensor. Shape: (B, S, H)
         """
         # Ensure we have at least one modality
         if not modality_embeddings:
@@ -170,7 +170,7 @@ class MimoModel(MegatronModule):
 
         batch_size, seq_length = input_ids.size()  # input_ids is [B, S]
         logger.debug(
-            f"Combined output tensor will have shape: [{seq_length}, {batch_size}, {hidden_dim}]"
+            f"Combined output tensor will have shape: [{batch_size}, {seq_length}, {hidden_dim}]"
         )
 
         combined_embeddings = torch.zeros(
@@ -199,7 +199,7 @@ class MimoModel(MegatronModule):
             expanded_mask = mask.unsqueeze(-1).expand_as(combined_embeddings)
             combined_embeddings.masked_scatter_(expanded_mask, modality_emb.flatten())
 
-        return combined_embeddings.transpose(0, 1).contiguous()  # [S, B, H]
+        return combined_embeddings
 
     def _initialize_submodules(self) -> None:
         """Initialize modality submodules from the ModuleSpec configurations.
@@ -304,10 +304,23 @@ class MimoModel(MegatronModule):
             position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
         )
 
-        text_embeddings = (
-            unwrap_model(self.language_model)
-            .embedding(input_ids=input_ids_text, position_ids=position_ids_text)
-            .squeeze(1)
+        language_model = unwrap_model(self.language_model)
+        embedding_layer = language_model.embedding
+        if (
+            self.partition_adapter is not None
+            and self.partition_adapter.cfg.seq_parallel
+            and getattr(embedding_layer, 'scatter_to_sequence_parallel', False)
+        ):
+            raise RuntimeError(
+                "MIMO sequence parallelism requires language embedding scatter to be disabled; "
+                "pass scatter_embedding_sequence_parallel=False when constructing the "
+                "language model"
+            )
+
+        text_embeddings = embedding_layer(
+            input_ids=input_ids_text, position_ids=position_ids_text
+        ).squeeze(
+            1
         )  # Shape: [num_text_tokens, hidden_dim]
         return text_embeddings
 
@@ -326,7 +339,9 @@ class MimoModel(MegatronModule):
         Args:
             input_ids: Input token IDs. Shape: (B, S)
             position_ids: Position IDs. Shape: (B, S)
-            attention_mask: Attention mask. Shape: (B, S)
+            attention_mask: Accepted for API compatibility. This path currently relies on
+                the language model's causal/packed-sequence masking and does not forward
+                dataloader attention masks to the language model.
             loss_mask: Loss mask. Shape: (B, S)
             labels: Labels for training. Shape: (B, S)
             modality_inputs: Dictionary mapping modality names to encoder inputs. For example:
@@ -491,7 +506,7 @@ class MimoModel(MegatronModule):
         Args:
             input_ids: Token IDs
             position_ids: Position IDs
-            attention_mask: Attention mask
+            attention_mask: Accepted for API compatibility; not forwarded to the language model.
             loss_mask: Loss mask for per-token loss normalization
             labels: Labels for loss computation
             input_tensors: Hidden states or embeddings from previous stage
@@ -525,19 +540,17 @@ class MimoModel(MegatronModule):
             )
 
             if self.partition_adapter is not None:
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
                 shard_loss_inputs = self.role.is_last_stage(lang_name)
-                combined_embeddings, labels, loss_mask, attention_mask, packed_seq_params = (
+                combined_embeddings, labels, loss_mask, packed_seq_params = (
                     self.partition_adapter.shard(
                         embeddings=combined_embeddings,
                         labels=labels if shard_loss_inputs else None,
                         loss_mask=loss_mask if shard_loss_inputs else None,
-                        attention_mask=attention_mask,
                         packed_seq_params=packed_seq_params,
                     )
                 )
-                if combined_embeddings is not None:
-                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+            else:
+                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
             lm_output = self.language_model(
                 input_ids=None,
@@ -553,14 +566,11 @@ class MimoModel(MegatronModule):
 
             if self.partition_adapter is not None:
                 shard_loss_inputs = self.role.is_last_stage(lang_name)
-                _, labels, loss_mask, attention_mask, packed_seq_params = (
-                    self.partition_adapter.shard(
-                        embeddings=None,
-                        labels=labels if shard_loss_inputs else None,
-                        loss_mask=loss_mask if shard_loss_inputs else None,
-                        attention_mask=attention_mask,
-                        packed_seq_params=packed_seq_params,
-                    )
+                _, labels, loss_mask, packed_seq_params = self.partition_adapter.shard(
+                    embeddings=None,
+                    labels=labels if shard_loss_inputs else None,
+                    loss_mask=loss_mask if shard_loss_inputs else None,
+                    packed_seq_params=packed_seq_params,
                 )
 
             # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
@@ -574,7 +584,7 @@ class MimoModel(MegatronModule):
                 position_ids=None,
                 decoder_input=None,
                 labels=labels,
-                attention_mask=attention_mask,
+                attention_mask=None,
                 packed_seq_params=packed_seq_params,
             )
 
@@ -696,24 +706,17 @@ class MimoModel(MegatronModule):
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
         # 3. If sharding is needed, apply PartitionAdapter.
-        # combined_embeddings is [S, B, H]; transpose to [B, S, H] for shard() which expects
-        # batch-first layout (required by get_batch_on_this_cp_rank). After CP sharding each
-        # rank holds [B, S/cp, H]; transpose back to [S/cp, B, H] for the language model.
         if self.partition_adapter is not None:
-            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [B, S, H]
-            combined_embeddings, labels, loss_mask, _, packed_seq_params = (
+            combined_embeddings, labels, loss_mask, packed_seq_params = (
                 self.partition_adapter.shard(
                     embeddings=combined_embeddings,
                     labels=labels,
                     loss_mask=loss_mask,
-                    attention_mask=attention_mask,
                     packed_seq_params=packed_seq_params,
                 )
             )
-            # shard() returns embeddings in [B, S/cp, H]; transpose to [S/cp, B, H]
-            # which is what the language model expects.
-            if combined_embeddings is not None:
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+        else:
+            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
