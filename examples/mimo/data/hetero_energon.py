@@ -51,9 +51,7 @@ def validate_energon_data_alignment(data_iterator, _topology) -> None:
         if candidate is None:
             continue
         target = (
-            encoder_signatures_by_lane
-            if candidate["role"] == "encoder"
-            else llm_signatures_by_lane
+            encoder_signatures_by_lane if candidate["role"] == "encoder" else llm_signatures_by_lane
         )
         for lane, signature in zip(candidate["llm_lanes"], candidate["signatures"]):
             target.setdefault(lane, set()).add(signature)
@@ -63,10 +61,7 @@ def validate_energon_data_alignment(data_iterator, _topology) -> None:
         encoder_values = encoder_signatures_by_lane.get(lane, set())
         llm_values = llm_signatures_by_lane.get(lane, set())
         if len(encoder_values) != 1 or len(llm_values) != 1 or encoder_values != llm_values:
-            mismatched[lane] = {
-                "encoder": sorted(encoder_values),
-                "llm": sorted(llm_values),
-            }
+            mismatched[lane] = {"encoder": sorted(encoder_values), "llm": sorted(llm_values)}
     if mismatched:
         raise RuntimeError(f"hetero Energon data loaders diverged across grids: {mismatched}")
 
@@ -77,20 +72,12 @@ def _build_llm_iterator(args, grid):
     if get_grid_coordinate(grid, "tp") != 0:
         lane = get_grid_coordinate(grid, "dp")
         return EnergonIterator(
-            None,
-            tp_group=tp_group,
-            source_rank=False,
-            alignment_role="llm",
-            llm_lanes=[lane],
+            None, tp_group=tp_group, source_rank=False, alignment_role="llm", llm_lanes=[lane]
         )
 
     lane = get_grid_coordinate(grid, "dp")
     return _build_single_lane_iterator(
-        args,
-        tp_group=tp_group,
-        lane=lane,
-        role="llm",
-        random_seed=args.seed + lane,
+        args, tp_group=tp_group, lane=lane, role="llm", random_seed=args.seed + lane
     )
 
 
@@ -119,11 +106,7 @@ def _build_encoder_iterator(args, grid):
 
     lane_iterators = [
         _build_single_lane_iterator(
-            args,
-            tp_group=None,
-            lane=lane,
-            role="encoder-component",
-            random_seed=args.seed + lane,
+            args, tp_group=None, lane=lane, role="encoder-component", random_seed=args.seed + lane
         )
         for lane in llm_lanes
     ]
@@ -200,7 +183,9 @@ def _combine_encoder_batches(batches: list[dict]) -> dict:
             combined[key] = torch.cat(values, dim=0)
 
     modality_values = [
-        batch.get("modality_inputs") for batch in batches if batch.get("modality_inputs") is not None
+        batch.get("modality_inputs")
+        for batch in batches
+        if batch.get("modality_inputs") is not None
     ]
     if modality_values:
         combined["modality_inputs"] = _concat_nested_tensors(modality_values)
@@ -403,6 +388,8 @@ class EnergonIterator:
                 value_checksum = cls._checksum_tensor(value)
             elif value is None:
                 value_checksum = 0
+            elif isinstance(value, str):
+                value_checksum = sum(value.encode("utf-8"))
             else:
                 value_checksum = int(value)
             checksum = (checksum * 131 + value_checksum) % 2_147_483_647

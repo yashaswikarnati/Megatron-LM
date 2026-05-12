@@ -234,13 +234,14 @@ def _build_packing_kwargs(sample: PackedSample, max_len: int) -> dict[str, torch
         )
     max_seqlen = segment_lens.max()
     return {
+        "qkv_format": "thd",
         "cu_seqlens_q": cu_seqlens,
         "cu_seqlens_kv": cu_seqlens,
         "cu_seqlens_q_padded": cu_seqlens,
         "cu_seqlens_kv_padded": cu_seqlens,
-        "max_seqlen_q": max_seqlen,
-        "max_seqlen_kv": max_seqlen,
-        "total_tokens": torch.tensor(max_len, dtype=torch.int32),
+        "max_seqlen_q": int(max_seqlen.item()),
+        "max_seqlen_kv": int(max_seqlen.item()),
+        "total_tokens": int(max_len),
     }
 
 

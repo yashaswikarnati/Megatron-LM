@@ -438,7 +438,7 @@ class MimoModel(MegatronModule):
                     raise RuntimeError(
                         f"{encoder_name} inputs are missing, but matching special tokens exist"
                     )
-                output = self._empty_modality_output(submodule)
+                output = self._empty_modality_output(submodule, input_ids)
 
             if output is not None:
                 self._attach_modality_split_sizes(output, input_ids, encoder_name)
@@ -450,17 +450,10 @@ class MimoModel(MegatronModule):
         self, output: torch.Tensor, input_ids: Optional[torch.Tensor], encoder_name: str
     ) -> None:
         """Annotate flat modality outputs with per-sample split sizes for bridge fan-out."""
-        if (
-            not isinstance(output, torch.Tensor)
-            or output.ndim != 2
-            or input_ids is None
-            or input_ids.ndim != 2
-            or encoder_name not in self.special_token_ids
-            or input_ids.size(0) <= 1
-        ):
+        token_id = self.special_token_ids.get(encoder_name)
+        if token_id is None or input_ids is None or output.ndim != 2 or input_ids.size(0) <= 1:
             return
 
-        token_id = self.special_token_ids[encoder_name]
         split_sizes = (input_ids == token_id).sum(dim=1).to(torch.long).tolist()
         if sum(split_sizes) == output.size(0):
             output._mimo_bridge_split_sizes = split_sizes
@@ -471,24 +464,23 @@ class MimoModel(MegatronModule):
             return False
         return bool((input_ids == self.special_token_ids[encoder_name]).any().item())
 
-    @staticmethod
-    def _empty_modality_output(submodule: torch.nn.Module) -> torch.Tensor:
+    def _empty_modality_output(
+        self, submodule: torch.nn.Module, input_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         """Return an empty projected activation for text-only non-colocated batches."""
-        unwrapped = unwrap_model(submodule)
-        projections = getattr(unwrapped, "input_projections", None)
-        if not projections:
-            raise RuntimeError("cannot build empty modality output without input projections")
-
-        projection = projections[0]
-        hidden_size = getattr(getattr(projection, "config", None), "hidden_size", None)
-        if hidden_size is None:
-            hidden_size = getattr(projection, "out_features", None)
-        if hidden_size is None:
-            raise RuntimeError("cannot infer hidden size for empty modality output")
-
-        param = next(projection.parameters(), None)
-        device = param.device if param is not None else torch.device("cuda")
-        dtype = param.dtype if param is not None else torch.float32
+        hidden_size = self.config.hidden_size
+        param = next(submodule.parameters(), None)
+        if param is not None:
+            device = param.device
+        elif input_ids is not None:
+            device = input_ids.device
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = (
+            param.dtype
+            if param is not None
+            else getattr(self.config, 'params_dtype', None) or torch.float32
+        )
         return torch.empty((0, hidden_size), device=device, dtype=dtype, requires_grad=True)
 
     def _forward_language_module(
@@ -539,18 +531,15 @@ class MimoModel(MegatronModule):
                 special_token_ids=self.special_token_ids,
             )
 
-            if self.partition_adapter is not None:
-                shard_loss_inputs = self.role.is_last_stage(lang_name)
-                combined_embeddings, labels, loss_mask, packed_seq_params = (
-                    self.partition_adapter.shard(
-                        embeddings=combined_embeddings,
-                        labels=labels if shard_loss_inputs else None,
-                        loss_mask=loss_mask if shard_loss_inputs else None,
-                        packed_seq_params=packed_seq_params,
-                    )
+            combined_embeddings, labels, loss_mask, packed_seq_params = (
+                self._prepare_language_inputs(
+                    embeddings=combined_embeddings,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params,
+                    shard_loss_inputs=self.role.is_last_stage(lang_name),
                 )
-            else:
-                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+            )
 
             lm_output = self.language_model(
                 input_ids=None,
@@ -564,14 +553,13 @@ class MimoModel(MegatronModule):
             # Non-first stage: receive hidden states from previous LM stage
             hidden_states = input_tensors.get(lang_name) if input_tensors else None
 
-            if self.partition_adapter is not None:
-                shard_loss_inputs = self.role.is_last_stage(lang_name)
-                _, labels, loss_mask, packed_seq_params = self.partition_adapter.shard(
-                    embeddings=None,
-                    labels=labels if shard_loss_inputs else None,
-                    loss_mask=loss_mask if shard_loss_inputs else None,
-                    packed_seq_params=packed_seq_params,
-                )
+            _, labels, loss_mask, packed_seq_params = self._prepare_language_inputs(
+                embeddings=None,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                shard_loss_inputs=self.role.is_last_stage(lang_name),
+            )
 
             # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
             if hidden_states is not None:
@@ -596,21 +584,41 @@ class MimoModel(MegatronModule):
 
     @staticmethod
     def _build_packed_seq_params(packing_kwargs: Optional[dict]) -> Optional[PackedSeqParams]:
-        """Build packed-sequence params from dataloader kwargs."""
+        """Build packed-sequence params from dataloader-provided metadata."""
         if packing_kwargs is None:
             return None
-        converted_kwargs = {}
-        for key, value in packing_kwargs.items():
-            if 'cu_seqlens' in key and value is not None:
-                converted_kwargs[key] = value.to(dtype=torch.int32)
-            elif key == 'total_tokens' and isinstance(value, torch.Tensor):
-                converted_kwargs[key] = int(value.item())
-            else:
-                converted_kwargs[key] = value
-        packed_seq_params = PackedSeqParams(**converted_kwargs)
-        packed_seq_params.qkv_format = 'thd'
+        if isinstance(packing_kwargs, PackedSeqParams):
+            return packing_kwargs
+        packed_seq_params = PackedSeqParams(**packing_kwargs)
         logger.debug(f"Packed sequence parameters: {packed_seq_params}")
         return packed_seq_params
+
+    def _prepare_language_inputs(
+        self,
+        embeddings: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        *,
+        shard_loss_inputs: bool,
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[PackedSeqParams],
+    ]:
+        """Return LM-layout embeddings and matching loss tensors."""
+        if self.partition_adapter is None:
+            if embeddings is not None:
+                embeddings = embeddings.transpose(0, 1).contiguous()
+            return embeddings, labels, loss_mask, packed_seq_params
+
+        return self.partition_adapter.shard(
+            embeddings=embeddings,
+            labels=labels if shard_loss_inputs else None,
+            loss_mask=loss_mask if shard_loss_inputs else None,
+            packed_seq_params=packed_seq_params,
+        )
 
     def _build_colocated_communicators(self):
         grid_map = self.mimo_config.module_to_grid_map
@@ -706,17 +714,13 @@ class MimoModel(MegatronModule):
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
         # 3. If sharding is needed, apply PartitionAdapter.
-        if self.partition_adapter is not None:
-            combined_embeddings, labels, loss_mask, packed_seq_params = (
-                self.partition_adapter.shard(
-                    embeddings=combined_embeddings,
-                    labels=labels,
-                    loss_mask=loss_mask,
-                    packed_seq_params=packed_seq_params,
-                )
-            )
-        else:
-            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+        combined_embeddings, labels, loss_mask, packed_seq_params = self._prepare_language_inputs(
+            embeddings=combined_embeddings,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+            shard_loss_inputs=True,
+        )
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
