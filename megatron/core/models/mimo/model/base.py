@@ -426,9 +426,29 @@ class MimoModel(MegatronModule):
                 output = self._empty_modality_output(submodule)
 
             if output is not None:
+                self._attach_modality_split_sizes(output, input_ids, encoder_name)
                 outputs[encoder_name] = output
 
         return outputs
+
+    def _attach_modality_split_sizes(
+        self, output: torch.Tensor, input_ids: Optional[torch.Tensor], encoder_name: str
+    ) -> None:
+        """Annotate flat modality outputs with per-sample split sizes for bridge fan-out."""
+        if (
+            not isinstance(output, torch.Tensor)
+            or output.ndim != 2
+            or input_ids is None
+            or input_ids.ndim != 2
+            or encoder_name not in self.special_token_ids
+            or input_ids.size(0) <= 1
+        ):
+            return
+
+        token_id = self.special_token_ids[encoder_name]
+        split_sizes = (input_ids == token_id).sum(dim=1).to(torch.long).tolist()
+        if sum(split_sizes) == output.size(0):
+            output._mimo_bridge_split_sizes = split_sizes
 
     def _has_encoder_tokens(self, input_ids: Optional[torch.Tensor], encoder_name: str) -> bool:
         """Return whether the batch contains tokens for an encoder module."""

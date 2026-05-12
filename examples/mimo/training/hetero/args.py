@@ -140,18 +140,22 @@ def validate_energon_data_args(args: argparse.Namespace) -> None:
         raise ValueError("energon_multimodal is currently wired for the Nemotron 20L VLM provider")
     if args.encoder_pp != 1 or args.llm_pp != 1:
         raise ValueError("energon_multimodal currently supports encoder and LLM PP size 1")
-    if args.encoder_dp != args.llm_dp:
+    if args.encoder_dp > args.llm_dp:
         raise ValueError(
-            "energon_multimodal currently requires --encoder-dp == --llm-dp so the "
-            "encoder and LLM grids consume matching DP-lane samples"
+            "energon_multimodal currently supports fan-out only: --encoder-dp must be "
+            "<= --llm-dp"
+        )
+    if args.llm_dp % args.encoder_dp != 0:
+        raise ValueError(
+            "energon_multimodal fan-out requires --llm-dp to be divisible by --encoder-dp"
+        )
+    if args.encoder_dp != args.llm_dp and args.micro_batch_size != 1:
+        raise ValueError(
+            "energon_multimodal fan-out currently requires --micro-batch-size 1 so bridge "
+            "splits map one encoder sample to one LLM DP lane"
         )
     if args.packing_buffer_size is not None and args.packing_buffer_size > 0:
         if args.micro_batch_size != 1:
             raise ValueError(
                 "Energon packed multimodal batches currently require --micro-batch-size 1"
             )
-    encoder_micro_batch_size = args.micro_batch_size * args.llm_dp // args.encoder_dp
-    if encoder_micro_batch_size != args.micro_batch_size:
-        raise ValueError(
-            "energon_multimodal currently requires equal encoder and LLM microbatch sizes"
-        )

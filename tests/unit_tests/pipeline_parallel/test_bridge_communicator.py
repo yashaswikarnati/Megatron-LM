@@ -521,11 +521,49 @@ class TestBridgeCommunicator:
         )
 
         rank = dist.get_rank()
+        split_sizes = [257, 577, 773, 989]
+        total_rows = sum(split_sizes)
         if bridge.is_current_rank_in_grid(src_grid):
-            tensor = torch.randn(577 * 4, 128, device='cuda')
+            tensor = torch.cat(
+                [
+                    torch.full((split_size, 128), float(index), device='cuda')
+                    for index, split_size in enumerate(split_sizes)
+                ],
+                dim=0,
+            )
+            tensor._mimo_bridge_split_sizes = split_sizes
             grad = bridge.send_forward_recv_backward(tensor)
-            assert grad.shape == (577 * 4, 128)
+            assert grad.shape == (total_rows, 128)
+            expected_grad = torch.cat(
+                [
+                    torch.full(
+                        (split_size, 128), float(dest_grid.rank_offset + index), device='cuda'
+                    )
+                    for index, split_size in enumerate(split_sizes)
+                ],
+                dim=0,
+            )
+            assert torch.equal(grad, expected_grad)
         else:
-            grad = torch.full((577, 128), float(rank), device='cuda')
+            split_index = rank - dest_grid.rank_offset
+            grad = torch.full((split_sizes[split_index], 128), float(rank), device='cuda')
             activation = bridge.send_backward_recv_forward(grad)
-            assert activation.shape == (577, 128)
+            assert activation.shape == (split_sizes[split_index], 128)
+            assert torch.equal(activation, torch.full_like(activation, float(split_index)))
+
+    def test_2d_metadata_split_allows_zero_size_chunks(self):
+        """Metadata split supports text-only lanes that have no image embeddings."""
+        bridge = BridgeCommunicator.__new__(BridgeCommunicator)
+        bridge.tensor_ndim = 2
+        bridge.dim_mapping = {'s': 0, 'h': 1, 'b': 0}
+
+        tensor = torch.arange(20, device='cuda').reshape(10, 2)
+        tensor._mimo_bridge_split_sizes = [3, 0, 4, 3]
+
+        splits = bridge._split_tensor_at_batch_dim(tensor, 4)
+
+        assert [split.shape[0] for split in splits] == [3, 0, 4, 3]
+        assert torch.equal(splits[0], tensor[:3])
+        assert splits[1].numel() == 0
+        assert torch.equal(splits[2], tensor[3:7])
+        assert torch.equal(splits[3], tensor[7:])

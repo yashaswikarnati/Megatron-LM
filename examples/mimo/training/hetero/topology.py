@@ -179,25 +179,24 @@ def create_hypercomm_grid(
 
 def get_pg_collection(grid: HyperCommGrid) -> ProcessGroupCollection:
     """Build a ProcessGroupCollection from a populated HyperCommGrid."""
-    return ProcessGroupCollection.from_hyper_comm_grid(
-        grid,
-        required_pgs=[
-            "tp",
-            "cp",
-            "pp",
-            "dp",
-            "dp_cp",
-            "tp_cp",
-            "mp",
-            "tp_dp_cp",
-            "ep",
-            "expt_tp",
-            "expt_dp",
-            "tp_ep",
-            "tp_ep_pp",
-            "intra_dist_opt",
-        ],
-    )
+    pg = ProcessGroupCollection()
+    pg.tp = grid.get_pg("tp")
+    pg.cp = grid.get_pg("cp")
+    pg.pp = grid.get_pg("pp")
+    pg.dp = grid.get_pg("dp")
+    pg.dp_cp = grid.get_pg(["dp", "cp"])
+    pg.intra_dp_cp = pg.dp_cp
+    pg.tp_cp = grid.get_pg(["tp", "cp"])
+    pg.mp = grid.get_pg(["tp", "pp"])
+    pg.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
+    pg.ep = grid.get_pg("ep")
+    pg.expt_tp = grid.get_pg("expt_tp")
+    pg.expt_dp = grid.get_pg("expt_dp")
+    pg.intra_expt_dp = pg.expt_dp
+    pg.tp_ep = grid.get_pg(["expt_tp", "ep"])
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"])
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+    return pg
 
 
 def create_language_embedding_groups(grid: HyperCommGrid) -> LanguageEmbeddingGroups:

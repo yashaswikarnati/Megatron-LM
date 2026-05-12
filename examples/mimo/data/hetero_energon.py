@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import random
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -29,47 +29,129 @@ def build_energon_iterator(args, topology):
     )
 
     if encoder_needs_data:
-        return _build_iterator_for_grid(args, encoder_grid)
+        return _build_encoder_iterator(args, encoder_grid)
     if llm_needs_data:
-        return _build_iterator_for_grid(args, llm_grid)
+        return _build_llm_iterator(args, llm_grid)
     return None
 
 
-def validate_energon_data_alignment(data_iterator, topology) -> None:
+def validate_energon_data_alignment(data_iterator, _topology) -> None:
     """Check the first actual-data batch aligns across non-colocated module grids."""
     if not dist.is_initialized():
         return
 
-    signature = data_iterator.peek_signature() if data_iterator is not None else None
-    local = (get_current_dp_lane(topology), signature)
     gathered = [None for _ in range(dist.get_world_size())]
-    dist.all_gather_object(gathered, local)
+    dist.all_gather_object(
+        gathered, data_iterator.peek_alignment() if data_iterator is not None else None
+    )
 
-    signatures_by_lane = {}
-    for lane, candidate in gathered:
-        if lane < 0 or candidate is None:
+    encoder_signatures_by_lane = {}
+    llm_signatures_by_lane = {}
+    for candidate in gathered:
+        if candidate is None:
             continue
-        signatures_by_lane.setdefault(lane, set()).add(candidate)
-    mismatched = {lane: values for lane, values in signatures_by_lane.items() if len(values) > 1}
+        target = (
+            encoder_signatures_by_lane
+            if candidate["role"] == "encoder"
+            else llm_signatures_by_lane
+        )
+        for lane, signature in zip(candidate["llm_lanes"], candidate["signatures"]):
+            target.setdefault(lane, set()).add(signature)
+
+    mismatched = {}
+    for lane in sorted(set(encoder_signatures_by_lane) | set(llm_signatures_by_lane)):
+        encoder_values = encoder_signatures_by_lane.get(lane, set())
+        llm_values = llm_signatures_by_lane.get(lane, set())
+        if len(encoder_values) != 1 or len(llm_values) != 1 or encoder_values != llm_values:
+            mismatched[lane] = {
+                "encoder": sorted(encoder_values),
+                "llm": sorted(llm_values),
+            }
     if mismatched:
         raise RuntimeError(f"hetero Energon data loaders diverged across grids: {mismatched}")
 
 
-def get_current_dp_lane(topology) -> int:
-    """Return the active module DP lane for this rank, or -1 for inactive ranks."""
-    if is_rank_in_grid(topology.encoder_grid):
-        return get_grid_coordinate(topology.encoder_grid, "dp")
-    if is_rank_in_grid(topology.llm_grid):
-        return get_grid_coordinate(topology.llm_grid, "dp")
-    return -1
-
-
-def _build_iterator_for_grid(args, grid):
-    """Build a deterministic per-DP-lane loader for one module grid."""
+def _build_llm_iterator(args, grid):
+    """Build the single-lane LLM iterator for this grid coordinate."""
     tp_group = grid.get_pg("tp")
     if get_grid_coordinate(grid, "tp") != 0:
-        return EnergonIterator(None, tp_group=tp_group, source_rank=False)
+        lane = get_grid_coordinate(grid, "dp")
+        return EnergonIterator(
+            None,
+            tp_group=tp_group,
+            source_rank=False,
+            alignment_role="llm",
+            llm_lanes=[lane],
+        )
 
+    lane = get_grid_coordinate(grid, "dp")
+    return _build_single_lane_iterator(
+        args,
+        tp_group=tp_group,
+        lane=lane,
+        role="llm",
+        random_seed=args.seed + lane,
+    )
+
+
+def _build_encoder_iterator(args, grid):
+    """Build the encoder iterator, composing LLM-lane samples for DP fan-out."""
+    tp_group = grid.get_pg("tp")
+    encoder_dp_rank = get_grid_coordinate(grid, "dp")
+    llm_lanes = _llm_lanes_for_encoder_rank(args, encoder_dp_rank)
+    if get_grid_coordinate(grid, "tp") != 0:
+        return EnergonIterator(
+            None,
+            tp_group=tp_group,
+            source_rank=False,
+            alignment_role="encoder",
+            llm_lanes=llm_lanes,
+        )
+
+    if len(llm_lanes) == 1:
+        return _build_single_lane_iterator(
+            args,
+            tp_group=tp_group,
+            lane=llm_lanes[0],
+            role="encoder",
+            random_seed=args.seed + llm_lanes[0],
+        )
+
+    lane_iterators = [
+        _build_single_lane_iterator(
+            args,
+            tp_group=None,
+            lane=lane,
+            role="encoder-component",
+            random_seed=args.seed + lane,
+        )
+        for lane in llm_lanes
+    ]
+
+    def next_encoder_batch():
+        batches = [next(iterator) for iterator in lane_iterators]
+        signatures = [EnergonIterator._batch_signature(batch) for batch in batches]
+        return _combine_encoder_batches(batches), signatures
+
+    return EnergonIterator(
+        None,
+        tp_group=tp_group,
+        source_rank=True,
+        local_batch_fn=next_encoder_batch,
+        alignment_role="encoder",
+        llm_lanes=llm_lanes,
+    )
+
+
+def _llm_lanes_for_encoder_rank(args, encoder_dp_rank: int) -> list[int]:
+    """Return the contiguous LLM DP lanes owned by one encoder DP lane."""
+    scale = args.llm_dp // args.encoder_dp
+    start = encoder_dp_rank * scale
+    return list(range(start, start + scale))
+
+
+def _build_single_lane_iterator(args, tp_group, lane: int, role: str, random_seed: int):
+    """Build a deterministic loader for one LLM data lane."""
     from examples.mimo.data.energon_multimodal_provider import build_multimodal_encoder
     from megatron.energon import WorkerConfig, get_loader, get_train_dataset
 
@@ -80,13 +162,12 @@ def _build_iterator_for_grid(args, grid):
         encoder_name=getattr(args, "vision_encoder_key", "radio_encoder"),
         encoder_input_key="x",
     )
-    dp_rank = get_grid_coordinate(grid, "dp")
     worker_config = WorkerConfig(
-        rank=dp_rank, world_size=args.llm_dp, num_workers=args.num_workers, data_parallel_group=None
+        rank=lane, world_size=args.llm_dp, num_workers=args.num_workers, data_parallel_group=None
     )
     debug_rank(
         "building energon dataloader "
-        f"dp_rank={dp_rank} dp_world={args.llm_dp} batch_size={args.micro_batch_size}"
+        f"role={role} lane={lane} dp_world={args.llm_dp} batch_size={args.micro_batch_size}"
     )
     dataset = get_train_dataset(
         args.data_path,
@@ -98,8 +179,52 @@ def _build_iterator_for_grid(args, grid):
         max_samples_per_sequence=args.max_samples_per_sequence,
     )
     return EnergonIterator(
-        get_loader(dataset), tp_group=tp_group, source_rank=True, random_seed=args.seed + dp_rank
+        get_loader(dataset),
+        tp_group=tp_group,
+        source_rank=True,
+        random_seed=random_seed,
+        alignment_role="encoder" if role.startswith("encoder") else "llm",
+        llm_lanes=[lane],
     )
+
+
+def _combine_encoder_batches(batches: list[dict]) -> dict:
+    """Combine LLM-lane batches into one encoder batch and drop LLM-only metadata."""
+    if not batches:
+        raise RuntimeError("cannot combine an empty encoder batch list")
+
+    combined = {}
+    for key in ("input_ids", "labels", "loss_mask", "position_ids"):
+        values = [batch.get(key) for batch in batches if batch.get(key) is not None]
+        if values:
+            combined[key] = torch.cat(values, dim=0)
+
+    modality_values = [
+        batch.get("modality_inputs") for batch in batches if batch.get("modality_inputs") is not None
+    ]
+    if modality_values:
+        combined["modality_inputs"] = _concat_nested_tensors(modality_values)
+
+    return combined
+
+
+def _concat_nested_tensors(values):
+    """Concatenate a list of matching nested tensor structures along leading dim."""
+    present = [value for value in values if value is not None]
+    if not present:
+        return None
+    first = present[0]
+    if isinstance(first, torch.Tensor):
+        return torch.cat(present, dim=0)
+    if isinstance(first, dict):
+        keys = set().union(*(value.keys() for value in present if isinstance(value, dict)))
+        merged = {}
+        for key in sorted(keys):
+            value = _concat_nested_tensors([item.get(key) for item in present])
+            if value is not None:
+                merged[key] = value
+        return merged
+    raise TypeError(f"cannot concatenate encoder batch value of type {type(first).__name__}")
 
 
 def _build_tokenizer(args):
@@ -120,13 +245,25 @@ class EnergonIterator:
     """Endless wrapper around an Energon dataloader with TP-rank-0 ownership."""
 
     def __init__(
-        self, dataloader, tp_group=None, source_rank: bool = True, random_seed: Optional[int] = None
+        self,
+        dataloader,
+        tp_group=None,
+        source_rank: bool = True,
+        random_seed: Optional[int] = None,
+        local_batch_fn: Optional[Callable[[], dict]] = None,
+        alignment_role: Optional[str] = None,
+        llm_lanes: Optional[list[int]] = None,
     ) -> None:
         self._dataloader = dataloader
-        self._iterator = iter(dataloader) if dataloader is not None else None
+        self._iterator = None
         self._tp_group = tp_group
         self._source_rank = source_rank
+        self._local_batch_fn = local_batch_fn
+        self._alignment_role = alignment_role
+        self._llm_lanes = llm_lanes or []
         self._prefetched = None
+        self._prefetched_component_signatures = None
+        self._local_component_signatures = None
         self._python_random_state = None
         if random_seed is not None:
             rng = random.Random(random_seed)
@@ -142,39 +279,73 @@ class EnergonIterator:
             return batch
 
         batch = self._next_local_batch() if self._source_rank else None
+        component_signatures = self._current_component_signatures(batch)
         if is_process_group_member(self._tp_group) and self._tp_group.size() > 1:
-            obj = [batch]
+            obj = [(batch, component_signatures)]
             dist.broadcast_object_list(obj, src=self._tp_source_rank(), group=self._tp_group)
-            batch = obj[0]
+            batch, component_signatures = obj[0]
+        self._prefetched_component_signatures = component_signatures
         return batch
 
-    def peek_signature(self):
-        """Read and retain the next batch, returning a compact deterministic signature."""
+    def peek_alignment(self):
+        """Read and retain the next batch, returning lane signatures from TP source ranks."""
         if self._prefetched is None:
             self._prefetched = next(self)
-        return self._batch_signature(self._prefetched)
+        if not self._source_rank or self._alignment_role is None:
+            return None
+        signatures = self._prefetched_component_signatures
+        if signatures is None:
+            signatures = [self._batch_signature(self._prefetched)]
+        return {
+            "role": self._alignment_role,
+            "llm_lanes": self._llm_lanes,
+            "signatures": signatures,
+        }
 
     def _next_local_batch(self):
         """Read the next local Energon batch on the TP source rank."""
         if self._python_random_state is None:
-            return self._read_next_local_batch()
+            result = self._read_next_local_batch()
+            return self._extract_batch_and_signatures(result)
 
         global_random_state = random.getstate()
         try:
             random.setstate(self._python_random_state)
-            batch = self._read_next_local_batch()
+            result = self._read_next_local_batch()
+            batch = self._extract_batch_and_signatures(result)
             self._python_random_state = random.getstate()
             return batch
         finally:
             random.setstate(global_random_state)
 
+    def _extract_batch_and_signatures(self, result):
+        """Handle local batch providers that also return component signatures."""
+        self._local_component_signatures = None
+        if isinstance(result, tuple) and len(result) == 2:
+            batch, signatures = result
+            self._local_component_signatures = signatures
+            return batch
+        return result
+
     def _read_next_local_batch(self):
         """Read from the underlying dataloader, cycling at epoch boundaries."""
+        if self._local_batch_fn is not None:
+            return self._local_batch_fn()
+        if self._iterator is None:
+            self._iterator = iter(self._dataloader)
         try:
             return next(self._iterator)
         except StopIteration:
             self._iterator = iter(self._dataloader)
             return next(self._iterator)
+
+    def _current_component_signatures(self, batch):
+        """Return per-lane signatures for the current batch if they can be inferred."""
+        if batch is None:
+            return None
+        if self._local_component_signatures is not None:
+            return self._local_component_signatures
+        return [self._batch_signature(batch)]
 
     def _tp_source_rank(self) -> int:
         """Return the global source rank for the local TP batch broadcast."""

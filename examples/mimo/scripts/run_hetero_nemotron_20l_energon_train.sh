@@ -16,11 +16,26 @@ case "${TRAINING_STAGE}" in
     ;;
 esac
 
-GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-}"
 TRAIN_ITERS="${TRAIN_ITERS:-100}"
 NUM_MICROBATCHES="${NUM_MICROBATCHES:-4}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
-LLM_DP=2
+ENCODER_TP="${ENCODER_TP:-2}"
+ENCODER_PP="${ENCODER_PP:-1}"
+ENCODER_DP="${ENCODER_DP:-2}"
+LLM_TP="${LLM_TP:-2}"
+LLM_PP="${LLM_PP:-1}"
+LLM_DP="${LLM_DP:-2}"
+LLM_EP="${LLM_EP:-4}"
+ENCODER_SIZE=$((ENCODER_TP * ENCODER_PP * ENCODER_DP))
+LLM_SIZE=$((LLM_TP * LLM_PP * LLM_DP))
+LLM_OFFSET="${LLM_OFFSET:-${ENCODER_SIZE}}"
+EXPECTED_WORLD_SIZE=$((ENCODER_SIZE + LLM_SIZE))
+GPUS_PER_NODE="${GPUS_PER_NODE:-${EXPECTED_WORLD_SIZE}}"
+if [[ "${GPUS_PER_NODE}" -ne "${EXPECTED_WORLD_SIZE}" ]]; then
+  echo "ERROR: GPUS_PER_NODE=${GPUS_PER_NODE} but hetero layout requires ${EXPECTED_WORLD_SIZE}" >&2
+  exit 1
+fi
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * LLM_DP))}"
 LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-2}"
 LR_DECAY_ITERS="${LR_DECAY_ITERS:-10}"
@@ -45,6 +60,7 @@ fi
 
 echo "=== Hetero MIMO Nemotron6-MoE VLM 20L Energon training ==="
 echo "stage=${TRAINING_STAGE} train_iters=${TRAIN_ITERS} gbs=${GLOBAL_BATCH_SIZE}"
+echo "layout=encoder(tp=${ENCODER_TP},pp=${ENCODER_PP},dp=${ENCODER_DP}) llm(tp=${LLM_TP},pp=${LLM_PP},dp=${LLM_DP},ep=${LLM_EP}) world=${EXPECTED_WORLD_SIZE}"
 echo "data=${DATA_PATH}"
 echo "tokenizer=${TOKENIZER_MODEL}"
 echo "==========================================================="
@@ -65,14 +81,14 @@ fi
   --model-provider nemotron-moe-vlm-20l \
   --dataset-provider energon_multimodal \
   --training-stage "${TRAINING_STAGE}" \
-  --encoder-tp 2 \
-  --encoder-pp 1 \
-  --encoder-dp 2 \
-  --llm-offset 4 \
-  --llm-tp 2 \
-  --llm-pp 1 \
+  --encoder-tp "${ENCODER_TP}" \
+  --encoder-pp "${ENCODER_PP}" \
+  --encoder-dp "${ENCODER_DP}" \
+  --llm-offset "${LLM_OFFSET}" \
+  --llm-tp "${LLM_TP}" \
+  --llm-pp "${LLM_PP}" \
   --llm-dp "${LLM_DP}" \
-  --llm-ep 4 \
+  --llm-ep "${LLM_EP}" \
   --llm-expt-tp 1 \
   --llm-expt-dp 1 \
   --vocab-size 131072 \
