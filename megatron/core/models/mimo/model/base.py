@@ -438,7 +438,7 @@ class MimoModel(MegatronModule):
                     raise RuntimeError(
                         f"{encoder_name} inputs are missing, but matching special tokens exist"
                     )
-                output = self._empty_modality_output(submodule, input_ids)
+                output = self._empty_encoder_output(submodule, input_ids)
 
             if output is not None:
                 self._attach_modality_split_sizes(output, input_ids, encoder_name)
@@ -464,24 +464,25 @@ class MimoModel(MegatronModule):
             return False
         return bool((input_ids == self.special_token_ids[encoder_name]).any().item())
 
-    def _empty_modality_output(
+    def _empty_encoder_output(
         self, submodule: torch.nn.Module, input_ids: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        """Return an empty projected activation for text-only non-colocated batches."""
-        hidden_size = self.config.hidden_size
+        """Return the bridge payload for text-only non-colocated batches."""
         param = next(submodule.parameters(), None)
-        if param is not None:
-            device = param.device
-        elif input_ids is not None:
-            device = input_ids.device
-        else:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = (
-            param.dtype
-            if param is not None
-            else getattr(self.config, 'params_dtype', None) or torch.float32
+        reference = param if param is not None else input_ids
+        device = (
+            reference.device
+            if reference is not None
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
-        return torch.empty((0, hidden_size), device=device, dtype=dtype, requires_grad=True)
+        dtype = param.dtype if param is not None else self.config.params_dtype or torch.float32
+
+        # The bridge schedule communicates every module edge each microbatch.
+        # For a text-only batch, send shape [0, H] so the LLM receives no
+        # modality embeddings without changing the communication schedule.
+        return torch.empty(
+            (0, self.config.hidden_size), device=device, dtype=dtype, requires_grad=True
+        )
 
     def _forward_language_module(
         self,
