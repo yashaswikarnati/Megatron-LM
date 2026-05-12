@@ -1,72 +1,112 @@
 # E2E Training Parity Plan
 
-This note tracks the plan for checking end-to-end training parity between the
-previous `examples/mimo/train.py` flow from `feat/nemotron-moe-vlm-mimo` and the
-new heterogenous `examples/mimo/train_hetero.py` flow.
+This note tracks the validation plan for proving that the new heterogeneous MIMO
+training loop preserves the behavior of the existing Megatron-style homogeneous
+path before we use it for larger Nemotron VLM runs.
 
 ## Goal
 
-Verify that the new heterogenous MIMO training loop matches the previous
-Megatron `pretrain()`-based flow for the Nemotron 20L VLM workflow. The strongest
-parity signal is matching behavior on a frozen batch stream before comparing live
-Energon training runs.
+Validate the new hetero training loop by comparing it against a homogeneous
+baseline built in the same branch. The homogeneous runner initializes Megatron
+`parallel_state`, uses the same current model provider, starts from the same
+explicit checkpoint, and consumes the same deterministic sample stream. This
+keeps the old branch as reference material only; the executable comparator lives
+in the current branch so model/provider changes are not another variable.
 
-## Plan
+## Harness
 
-1. Compare resolved training configuration.
-   - Dump the final args used by old `train.py`.
-   - Dump the final args used by new `train_hetero.py`.
-   - Compare behavior-relevant fields: model config, vision config, MoE config,
-     TP/PP/EP/ETP/EDP, batch sizes, optimizer, scheduler, seeds, loss scaling,
-     per-token loss, and dataloader settings.
+The validation entry points are:
 
-2. Start both runs from the same initial weights.
-   - Prefer a canonical initialized checkpoint or state dict over relying only on
-     seed-based initialization.
-   - Compare parameter hashes by logical module: vision encoder, LLM backbone,
-     MoE experts, router parameters, and projector/MIMO bridge.
+- `examples/mimo/validation/training_parity.py`
+- `examples/mimo/validation/compare_training_parity.py`
+- `examples/mimo/scripts/run_mimo_training_parity.sh`
 
-3. Validate data parity before training.
-   - First use a recorded frozen batch stream, not live Energon.
-   - Dump exact batch tensors and metadata from the old path: tokens, labels,
-     loss mask, position ids, modality inputs, packed sequence params, and sample
-     signatures if available.
-   - Feed the same frozen batches to the new heterogenous loop and compare batch
-     hashes before forward.
+The runner has three modes:
 
-4. Run forward-only parity.
-   - Use the same initialized weights and same frozen batch.
-   - Disable optimizer updates.
-   - Compare logits checksums where practical, unreduced loss numerator, token
-     denominator, normalized loss, and auxiliary/router losses.
+- `init`: build a colocated MIMO model under `parallel_state` and save the
+  initial state.
+- `homo`: run the homogeneous baseline with standard Megatron process groups,
+  MCore DDP, distributed optimizer, optimizer step, LR scheduler step, and loss
+  logging.
+- `hetero`: run the new non-colocated hetero runtime, bridge communicator,
+  MIMO optimizer, grad finalization, optimizer step, LR scheduler step, and loss
+  logging.
 
-5. Run single-step training parity.
-   - Use the same frozen batch.
-   - Run forward, backward, optimizer step, and LR scheduler step.
-   - Compare loss before step, grad norm, skipped/nan flags, LR, selected
-     parameter deltas, and post-step parameter hashes.
+The deterministic iterator assigns global sample ids by LLM DP lane. In the
+`encoder_dp < llm_dp` case, the encoder iterator consumes the union of the LLM
+samples for the microbatch and uses bridge split metadata to route the matching
+image embeddings back to each LLM DP rank.
 
-6. Run short frozen-stream loss-curve parity.
-   - Use a fixed stream of 10 to 20 frozen batches.
-   - Compare per-iteration loss, grad norm, LR, loss scale, skipped/nan counts,
-     consumed samples, and token counts.
+## Success Criteria
 
-7. Run actual Energon parity.
-   - Run the old `train.py` flow and the new `train_hetero.py` flow against the
-     real Nemotron 20L Energon setup.
-   - Log sample signatures per global step in both paths.
-   - First verify that both paths consume the same samples in the same order.
-   - Compare loss curves only after sample order parity is established.
+1. Short strict parity, equal DP:
+   - same initial checkpoint
+   - deterministic data stream
+   - same consumed sample ids
+   - compare losses, params, grads, and optimizer states after each step
+   - state tolerance: `atol=2e-4`, `rtol=2e-4`
+   - loss tolerance: `1e-5`
 
-## Expected Limits
+2. Long loss-curve parity, equal DP:
+   - 250 iterations
+   - same consumed sample ids
+   - compare loss curves only
+   - loss tolerance: `2e-4`
 
-Bitwise parity may not be realistic between the old colocated Megatron
-`pretrain()` path and the new non-colocated heterogenous grids because collective
-ordering, parameter partitioning, and optimizer sharding can differ. The first
-strict gates should therefore be configuration parity, initial-weight parity,
-frozen-batch forward parity, token-count parity, LR schedule parity, and a short
-frozen-batch training curve within a tight tolerance.
+3. Fanout parity, `encoder_dp < llm_dp`:
+   - `llm_dp=2`, `encoder_dp=1`
+   - same initial checkpoint
+   - deterministic data stream
+   - same consumed sample ids
+   - compare losses, params, grads, and optimizer states after each step
+   - state tolerance: `atol=1e-3`, `rtol=1e-3`
+   - loss tolerance: `1e-4`
 
-The known parity gap is the old `--use-loss-scaling` path. The new heterogenous
-loop uses per-token global loss normalization, but it does not yet implement the
-old optional sqrt-weighted scaled loss behavior.
+The fanout state tolerance is intentionally looser than the equal-DP strict
+gate. The baseline computes each encoder sample on separate DP replicas, while
+the hetero path computes the same samples on one encoder rank with a larger
+local batch and routes activations to the LLM ranks. That changes local batch
+shape and floating-point accumulation order, so the fanout gate checks close
+numerical agreement plus exact sample routing rather than treating it as a
+bitwise-equivalent same-layout comparison.
+
+## CW Results
+
+All jobs below ran through Cog on CW with `--skip-uv-sync` to reuse the prepared
+cluster uv environment.
+
+| Case | Job | Result | Max loss diff | Max state abs diff |
+| --- | --- | --- | --- | --- |
+| short | `11710390` | pass | `2.5431315098245477e-06` | `5.97536563873291e-05` |
+| curve | `11710442` | pass | `0.00011698404947946273` | n/a |
+| fanout | `11710246` | pass | `6.230672200580045e-05` | `0.0008821713272482157` |
+
+Artifact roots:
+
+- `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/ykarnati/cog-scratch/runs/nmfw-464-validation-parity/mimo_training_parity_short_11710390`
+- `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/ykarnati/cog-scratch/runs/nmfw-464-validation-parity/mimo_training_parity_curve_11710442`
+- `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/ykarnati/cog-scratch/runs/nmfw-464-validation-parity/mimo_training_parity_fanout_11710246`
+
+## Commands
+
+```bash
+cog submit --repo . --run-name nmfw-464-validation-parity --cluster-name cw-dfw \
+  --partition batch --gpus 2 --time 00:20:00 --job-name parity-short --skip-uv-sync \
+  --command 'PARITY_CASE=short examples/mimo/scripts/run_mimo_training_parity.sh'
+
+cog submit --repo . --run-name nmfw-464-validation-parity --cluster-name cw-dfw \
+  --partition batch --gpus 2 --time 00:35:00 --job-name parity-curve --skip-uv-sync \
+  --command 'PARITY_CASE=curve examples/mimo/scripts/run_mimo_training_parity.sh'
+
+cog submit --repo . --run-name nmfw-464-validation-parity --cluster-name cw-dfw \
+  --partition batch --gpus 3 --time 00:25:00 --job-name parity-fanout --skip-uv-sync \
+  --command 'PARITY_CASE=fanout examples/mimo/scripts/run_mimo_training_parity.sh'
+```
+
+## Remaining Extensions
+
+- Add a real Energon frozen-stream variant once we want data-loader parity in
+  this same harness.
+- Add larger Nemotron 20L smoke runs after the mock parity gates stay stable.
+- Consider a dedicated fanout reference that runs the encoder with the same
+  local batch shape as the hetero path if we need a stricter fanout state gate.
