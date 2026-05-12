@@ -339,9 +339,7 @@ class MimoModel(MegatronModule):
         Args:
             input_ids: Input token IDs. Shape: (B, S)
             position_ids: Position IDs. Shape: (B, S)
-            attention_mask: Accepted for API compatibility. This path currently relies on
-                the language model's causal/packed-sequence masking and does not forward
-                dataloader attention masks to the language model.
+            attention_mask: Attention mask. Shape: (B, S)
             loss_mask: Loss mask. Shape: (B, S)
             labels: Labels for training. Shape: (B, S)
             modality_inputs: Dictionary mapping modality names to encoder inputs. For example:
@@ -499,7 +497,7 @@ class MimoModel(MegatronModule):
         Args:
             input_ids: Token IDs
             position_ids: Position IDs
-            attention_mask: Accepted for API compatibility; not forwarded to the language model.
+            attention_mask: Attention mask
             loss_mask: Loss mask for per-token loss normalization
             labels: Labels for loss computation
             input_tensors: Hidden states or embeddings from previous stage
@@ -547,7 +545,7 @@ class MimoModel(MegatronModule):
                 position_ids=None,
                 decoder_input=combined_embeddings,
                 labels=labels,
-                attention_mask=None,
+                attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
         else:
@@ -573,7 +571,7 @@ class MimoModel(MegatronModule):
                 position_ids=None,
                 decoder_input=None,
                 labels=labels,
-                attention_mask=None,
+                attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
 
@@ -729,7 +727,7 @@ class MimoModel(MegatronModule):
             position_ids=None,
             decoder_input=combined_embeddings,
             labels=labels,
-            attention_mask=None,
+            attention_mask=attention_mask,
             packed_seq_params=packed_seq_params,
         )
 
