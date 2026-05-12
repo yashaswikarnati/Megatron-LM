@@ -85,12 +85,16 @@ class MegatronMultimodalTokenizer:
             pretrained_model_name_or_path=path, **kwargs
         )
 
+        # Some tokenizers, including the Nemotron6-MoE tokenizer used by the
+        # VLM recipe, already contain <image>. Re-adding such a token returns
+        # 0, so validate that each requested token resolves instead.
+        tokenizer.add_tokens(special_tokens, special_tokens=True)
         self._vocab_size = len(tokenizer)
-
-        num_added_tokens = tokenizer.add_tokens(special_tokens, special_tokens=True)
-        assert num_added_tokens == len(
-            special_tokens
-        ), f"failed to add {len(special_tokens)} special tokens; only added {num_added_tokens}"
+        for token in special_tokens:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            assert (
+                token_id is not None and token_id != tokenizer.unk_token_id
+            ), f"special token {token!r} could not be resolved (got id={token_id})"
 
         self.tokenizer = tokenizer
 
@@ -179,6 +183,14 @@ class MegatronMultimodalTokenizer:
                 pad_token_id=tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>"),
                 custom_chat_template=llama3p1_chat_template,
                 has_bos=True,
+                has_system_role=True,
+            )
+        elif prompt_format == "nemotron6-moe":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=None,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=None,
+                has_bos=False,
                 has_system_role=True,
             )
         else:

@@ -2,6 +2,8 @@
 
 """Optimizer for MIMO models with heterogeneous parallelism."""
 
+# pylint: disable=missing-function-docstring
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -119,7 +121,15 @@ class MimoOptimizer(MegatronOptimizer):
         return torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def count_zeros(self) -> int:
-        return sum(opt.count_zeros() for opt in self._active_optimizers)
+        num_modules = len(self.module_infos)
+        zeros_by_module = torch.zeros(num_modules, device="cuda", dtype=torch.float32)
+
+        for i, (name, info) in enumerate(sorted(self.module_infos.items())):
+            if info.is_active and info.optimizer:
+                zeros_by_module[i] = float(info.optimizer.count_zeros())
+
+        torch.distributed.all_reduce(zeros_by_module, op=torch.distributed.ReduceOp.MAX)
+        return int(zeros_by_module.sum().item())
 
     @property
     def param_groups(self) -> List[dict]:
@@ -285,49 +295,18 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
 
     Only fetches process groups required by the optimizer. Assumes all groups
     are pre-created in the grid via grid.create_pg() - does not create any new groups.
-
-    The following groups must be pre-created in the grid before calling this function:
-        grid.create_pg(["dp"])
-        grid.create_pg(["dp", "cp"])
-        grid.create_pg(["tp"])
-        grid.create_pg(["pp"])
-        grid.create_pg(["tp", "pp"])
-        grid.create_pg(["tp", "ep", "pp"])
-        grid.create_pg(["dp", "ep"])
-        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
-
-    Args:
-        grid: HyperCommGrid with pre-created process groups.
-
-    Returns:
-        ProcessGroupCollection containing optimizer-required groups:
-        - dp: Data parallel group
-        - dp_cp: Data parallel with context parallel
-        - tp: Tensor parallel group
-        - mp: Model parallel group (tp × pp)
-        - tp_ep_pp: Expert tensor-model-pipeline group
-        - expt_dp: Expert data parallel group
     """
     pg = ProcessGroupCollection()
-
-    # Core groups needed by optimizer and checkpointing
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
+    pg.intra_dp_cp = pg.dp_cp
     pg.tp = grid.get_pg("tp")
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
-
-    # Expert groups
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.expt_dp = grid.get_pg(["dp", "ep"])
-
-    # Distributed optimizer grad stats group: must span all dimensions so grad norm
-    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
-    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
-    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
-    # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
-
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"])
+    pg.expt_dp = grid.get_pg("expt_dp")
+    pg.intra_expt_dp = pg.expt_dp
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     return pg
 
 

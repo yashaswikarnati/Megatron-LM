@@ -1181,3 +1181,87 @@ class TestColocatedGradientScalingCorrectness:
         if failures:
             summary = "\n\n".join(f"== {oracle} ==\n{msg}" for oracle, msg in failures)
             raise AssertionError(f"{len(failures)} oracle(s) failed:\n{summary}")
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse("2.3.0"), reason="Requires PyTorch 2.3+"
+    )
+    def test_colocated_moe_lm_etp2_ep2_edp2_smoke(self):
+        """Colocated MIMO step with MoE LLM using ETP/EP/EDP registered expert groups."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        _set_deterministic_env()
+
+        encoder_name = "images"
+        hidden_size, seq_length, vocab_size = 128, 32, 512
+        micro_batch_size = 1
+        num_microbatches = 1
+
+        encoder_grid = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=4)
+        llm_grid = create_hypercomm_grid(
+            offset=0, tp=1, cp=1, pp=1, dp=8, ep=2, expt_tp=2, expt_dp=2
+        )
+        create_all_embedding_groups([encoder_grid, llm_grid])
+
+        ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+        )
+
+        torch.manual_seed(12345)
+        mimo_model, _, _, language_pg, vision_pg = get_mimo_model(
+            encoder_name=encoder_name,
+            encoder_grid=encoder_grid,
+            llm_grid=llm_grid,
+            hidden_size=hidden_size,
+            num_layers=1,
+            vocab_size=vocab_size,
+            seq_len=seq_length,
+            ddp_config=ddp_config,
+            bf16=False,
+            bias=False,
+            dropout=False,
+            per_token_loss=True,
+            language_num_moe_experts=4,
+            language_moe_router_topk=1,
+        )
+        mimo_model.model_type = ModelType.encoder_or_decoder
+        self._mimo_models.append(mimo_model)
+        _wire_training_hooks(mimo_model, language_pg, vision_pg)
+
+        opt_config = OptimizerConfig(
+            optimizer='adam',
+            lr=1e-4,
+            weight_decay=0.01,
+            clip_grad=1.0,
+            bf16=False,
+            use_distributed_optimizer=True,
+        )
+        optimizer = get_mimo_optimizer(mimo_model, opt_config)
+
+        global_batches = _generate_and_broadcast_global_batches(
+            global_mbs=micro_batch_size * llm_grid.get_pg("dp").size(),
+            seq_length=seq_length,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+            encoder_name=encoder_name,
+            num_batches=num_microbatches,
+            mask_pattern="uniform",
+        )
+        batches = [_slice_global_batch_for_dist(b, encoder_grid, llm_grid) for b in global_batches]
+
+        optimizer.zero_grad()
+        losses = _run_forward_backward(
+            mimo_model=mimo_model,
+            batches=batches,
+            enc_grid=encoder_grid,
+            llm_grid=llm_grid,
+            encoder_name=encoder_name,
+            language_pg=language_pg,
+            micro_batch_size=micro_batch_size,
+            seq_length=seq_length,
+            num_microbatches=num_microbatches,
+        )
+        success, grad_norm, _ = optimizer.step()
+        assert success, "MoE colocated optimizer step failed"
+        assert grad_norm is not None and grad_norm > 0
+        assert losses

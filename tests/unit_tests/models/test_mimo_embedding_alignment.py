@@ -107,17 +107,17 @@ class TestEmbeddingAlignment:
         )
 
         # Check output shape
-        assert combined.shape == (seq_length, batch_size, hidden_dim)
+        assert combined.shape == (batch_size, seq_length, hidden_dim)
 
         # Check special token positions have the correct embeddings
         # First vision token (Batch 0, Seq 1) should have the first vision embedding
-        assert combined[1, 0, 0] == 10.0  # First marker
-        assert torch.all(combined[1, 0, 1:] == 0.0), "Non-zero values found after marker"
+        assert combined[0, 1, 0] == 10.0  # First marker
+        assert torch.all(combined[0, 1, 1:] == 0.0), "Non-zero values found after marker"
 
         # Second vision token (Batch 1, Seq 3) should have the second vision embedding
-        assert combined[3, 1, 1] == 20.0  # Second marker
-        assert torch.all(combined[3, 1, :1] == 0.0), "Non-zero values found before marker"
-        assert torch.all(combined[3, 1, 2:] == 0.0), "Non-zero values found after marker"
+        assert combined[1, 3, 1] == 20.0  # Second marker
+        assert torch.all(combined[1, 3, :1] == 0.0), "Non-zero values found before marker"
+        assert torch.all(combined[1, 3, 2:] == 0.0), "Non-zero values found after marker"
 
         # Verify text positions have only zeros
         text_positions = [
@@ -138,7 +138,7 @@ class TestEmbeddingAlignment:
         ]
 
         for s, b in text_positions:
-            assert torch.all(combined[s, b] == 0.01)
+            assert torch.all(combined[b, s] == 0.01)
 
     def test_multiple_modalities(self):
         """Test alignment with multiple modalities with special tokens at different positions."""
@@ -215,27 +215,27 @@ class TestEmbeddingAlignment:
         )
 
         # Check output shape
-        assert combined.shape == (seq_length, batch_size, hidden_dim)
+        assert combined.shape == (batch_size, seq_length, hidden_dim)
 
         # Check that special token positions have the correct markers and only at correct positions
 
         # Batch 0 markers
-        assert torch.isclose(combined[1, 0, 0], torch.tensor(10.0, device=self.device))  # Vision
-        assert torch.isclose(combined[4, 0, 1], torch.tensor(30.0, device=self.device))  # Audio
-        assert torch.isclose(combined[8, 0, 2], torch.tensor(50.0, device=self.device))  # Video
+        assert torch.isclose(combined[0, 1, 0], torch.tensor(10.0, device=self.device))  # Vision
+        assert torch.isclose(combined[0, 4, 1], torch.tensor(30.0, device=self.device))  # Audio
+        assert torch.isclose(combined[0, 8, 2], torch.tensor(50.0, device=self.device))  # Video
 
         # Batch 1 markers
-        assert torch.isclose(combined[2, 1, 0], torch.tensor(20.0, device=self.device))  # Vision
-        assert torch.isclose(combined[5, 1, 1], torch.tensor(40.0, device=self.device))  # Audio
-        assert torch.isclose(combined[7, 1, 2], torch.tensor(60.0, device=self.device))  # Video
+        assert torch.isclose(combined[1, 2, 0], torch.tensor(20.0, device=self.device))  # Vision
+        assert torch.isclose(combined[1, 5, 1], torch.tensor(40.0, device=self.device))  # Audio
+        assert torch.isclose(combined[1, 7, 2], torch.tensor(60.0, device=self.device))  # Video
 
         # Also check that markers are ONLY at their specific positions
         # For vision in batch 0 (position 1, value at index 0)
-        assert torch.all(combined[1, 0, 1:] == 0.0), "Non-zero values found after marker"
+        assert torch.all(combined[0, 1, 1:] == 0.0), "Non-zero values found after marker"
 
         # For audio in batch 1 (position 5, value at index 1)
-        assert torch.all(combined[5, 1, :1] == 0.0), "Non-zero values found before marker"
-        assert torch.all(combined[5, 1, 2:] == 0.0), "Non-zero values found after marker"
+        assert torch.all(combined[1, 5, :1] == 0.0), "Non-zero values found before marker"
+        assert torch.all(combined[1, 5, 2:] == 0.0), "Non-zero values found after marker"
 
     def test_multiple_images_with_variable_length(self):
         """Test handling multiple images per sample with variable sequence lengths.
@@ -322,31 +322,31 @@ class TestEmbeddingAlignment:
         )
 
         # Check output shape
-        assert combined.shape == (seq_length, batch_size, hidden_dim)
+        assert combined.shape == (batch_size, seq_length, hidden_dim)
 
         # Verify vision token embeddings are placed correctly
 
         # Batch 0, first image embeddings (3 patches)
-        assert torch.isclose(combined[1, 0, 0], torch.tensor(101.0, device=self.device))
-        assert torch.isclose(combined[2, 0, 1], torch.tensor(102.0, device=self.device))
-        assert torch.isclose(combined[3, 0, 2], torch.tensor(103.0, device=self.device))
+        assert torch.isclose(combined[0, 1, 0], torch.tensor(101.0, device=self.device))
+        assert torch.isclose(combined[0, 2, 1], torch.tensor(102.0, device=self.device))
+        assert torch.isclose(combined[0, 3, 2], torch.tensor(103.0, device=self.device))
 
         # Batch 0, second image embeddings (2 patches)
-        assert torch.isclose(combined[5, 0, 3], torch.tensor(104.0, device=self.device))
-        assert torch.isclose(combined[6, 0, 4], torch.tensor(105.0, device=self.device))
+        assert torch.isclose(combined[0, 5, 3], torch.tensor(104.0, device=self.device))
+        assert torch.isclose(combined[0, 6, 4], torch.tensor(105.0, device=self.device))
 
         # Batch 1, image embeddings (4 patches)
-        assert torch.isclose(combined[2, 1, 5], torch.tensor(201.0, device=self.device))
-        assert torch.isclose(combined[3, 1, 6], torch.tensor(202.0, device=self.device))
-        assert torch.isclose(combined[4, 1, 7], torch.tensor(203.0, device=self.device))
-        assert torch.isclose(combined[5, 1, 8], torch.tensor(204.0, device=self.device))
+        assert torch.isclose(combined[1, 2, 5], torch.tensor(201.0, device=self.device))
+        assert torch.isclose(combined[1, 3, 6], torch.tensor(202.0, device=self.device))
+        assert torch.isclose(combined[1, 4, 7], torch.tensor(203.0, device=self.device))
+        assert torch.isclose(combined[1, 5, 8], torch.tensor(204.0, device=self.device))
 
         # Verify that each embedding only has one non-zero value
         for b in range(batch_size):
             # Check positions with special tokens
             positions = [(1, 2, 3, 5, 6), (2, 3, 4, 5)][b]
             for s in positions:
-                emb = combined[s, b].clone()
+                emb = combined[b, s].clone()
                 # Find the non-zero position
                 nonzero_indices = torch.nonzero(emb)
                 # Make sure we actually have non-zero values

@@ -220,6 +220,18 @@ class TestMimoModel:
         )
         assert text_embeddings.shape == (self.batch_size * self.seq_len, self.hidden_size)
 
+    def test_get_text_embeddings_rejects_embedding_sp_scatter(self):
+        """MIMO owns SP scatter after multimodal alignment."""
+        mimo_model = self._make_avlm()
+        mimo_model.partition_adapter = MagicMock()
+        mimo_model.partition_adapter.cfg.seq_parallel = True
+        mimo_model.language_model.embedding.scatter_to_sequence_parallel = True
+
+        with pytest.raises(RuntimeError, match="embedding scatter"):
+            mimo_model.get_text_embeddings(
+                self._make_input_ids(), self._make_position_ids(), self.special_token_ids
+            )
+
     def test_forward_text_only(self):
         """Test forward pass with only text input."""
         mimo_model = self._make_vlm()
@@ -343,7 +355,7 @@ class TestMimoModel:
         assert mimo_model.partition_adapter is None
 
     def test_forward_with_packing_kwargs(self):
-        """Test that packing_kwargs builds PackedSeqParams with qkv_format='thd' and int32 seqlens."""
+        """Test that dataloader-provided packing metadata reaches the language model."""
         from megatron.core.packed_seq_params import PackedSeqParams
 
         mimo_model = self._make_vlm()
@@ -351,13 +363,20 @@ class TestMimoModel:
         position_ids = self._make_position_ids()
 
         cu_seqlens = torch.tensor(
-            [0, self.seq_len, 2 * self.seq_len], dtype=torch.int64, device=self.device
+            [0, self.seq_len, 2 * self.seq_len], dtype=torch.int32, device=self.device
         )
-        packing_kwargs = {"cu_seqlens_q": cu_seqlens.clone(), "cu_seqlens_kv": cu_seqlens.clone()}
+        packing_kwargs = {
+            "qkv_format": "thd",
+            "cu_seqlens_q": cu_seqlens,
+            "cu_seqlens_kv": cu_seqlens,
+            "max_seqlen_q": self.seq_len,
+            "max_seqlen_kv": self.seq_len,
+            "total_tokens": 2 * self.seq_len,
+        }
 
         text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=self.device)
         combined_emb = torch.zeros(
-            self.seq_len, self.batch_size, self.hidden_size, device=self.device
+            self.batch_size, self.seq_len, self.hidden_size, device=self.device
         )
 
         captured = {}
@@ -383,26 +402,26 @@ class TestMimoModel:
         packed_seq_params = captured['packed_seq_params']
         assert isinstance(packed_seq_params, PackedSeqParams)
         assert packed_seq_params.qkv_format == 'thd'
-        assert packed_seq_params.cu_seqlens_q.dtype == torch.int32
-        assert packed_seq_params.cu_seqlens_kv.dtype == torch.int32
+        assert packed_seq_params.cu_seqlens_q is cu_seqlens
+        assert packed_seq_params.cu_seqlens_kv is cu_seqlens
 
     def test_forward_with_partition_adapter(self):
-        """Test that partition_adapter.shard() is called and embeddings are transposed correctly."""
+        """Test that partition_adapter.shard() receives batch-first embeddings."""
         mimo_model = self._make_vlm()
         input_ids = self._make_input_ids()
         position_ids = self._make_position_ids()
 
         sharded_seq_len = self.seq_len // 2
         sharded_emb = torch.zeros(
-            self.batch_size, sharded_seq_len, self.hidden_size, device=self.device
+            sharded_seq_len, self.batch_size, self.hidden_size, device=self.device
         )
         mock_adapter = MagicMock()
-        mock_adapter.shard.return_value = (sharded_emb, None, None, None, None)
+        mock_adapter.shard.return_value = (sharded_emb, None, None, None)
         mimo_model.partition_adapter = mock_adapter
 
         text_emb = torch.zeros(self.batch_size * self.seq_len, self.hidden_size, device=self.device)
         combined_emb = torch.zeros(
-            self.seq_len, self.batch_size, self.hidden_size, device=self.device
+            self.batch_size, self.seq_len, self.hidden_size, device=self.device
         )
 
         captured = {}

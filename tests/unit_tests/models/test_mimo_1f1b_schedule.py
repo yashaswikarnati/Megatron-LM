@@ -81,26 +81,39 @@ def build_no_sync_func(mimo_model):
     return no_sync_func
 
 
-def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
+def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1, ep=1, expt_tp=None, expt_dp=None):
     """Create a HyperCommGrid with specified parallelism."""
+    expt_tp = tp if expt_tp is None else expt_tp
+    module_world_size = tp * cp * pp * dp
+    expert_model_size = expt_tp * ep * pp
+    if expt_dp is None:
+        assert module_world_size % expert_model_size == 0, (
+            f"module_world_size ({module_world_size}) must be divisible by "
+            f"expt_tp*ep*pp ({expert_model_size})"
+        )
+        expt_dp = module_world_size // expert_model_size
+
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
-        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
+        shape=[tp, cp, dp, pp],
+        dim_names=["tp", "cp", "dp", "pp"],
         rank_offset=offset,
         backend="nccl",
     )
+    grid.register_layout("expert", [expt_tp, ep, expt_dp, pp], ["expt_tp", "ep", "expt_dp", "pp"])
     grid.create_pg(["tp"])
     grid.create_pg(["cp"])
     grid.create_pg(["pp"])
     grid.create_pg(["dp"])
     grid.create_pg(["dp", "cp"])
+    grid.create_pg(["tp", "cp"])
     grid.create_pg(["ep"])
+    grid.create_pg(["expt_tp"])
     grid.create_pg(["expt_dp"])
-    # Required by _get_pg_collection_for_optimizer
     grid.create_pg(["tp", "pp"])
-    grid.create_pg(["tp", "ep", "pp"])
-    grid.create_pg(["dp", "ep"])
-    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+    grid.create_pg(["tp", "cp", "dp"])
+    grid.create_pg(["tp", "cp", "pp", "dp"])
+    grid.create_pg(["expt_tp", "ep"])
+    grid.create_pg(["expt_tp", "ep", "pp"])
     _active_grids.append(grid)
     return grid
 
@@ -116,15 +129,24 @@ def destroy_all_grids():
 
 def get_pg_collection(grid):
     """Get ProcessGroupCollection from grid."""
-    pg_collection = ProcessGroupCollection()
-    pg_collection.tp = grid.get_pg("tp")
-    pg_collection.cp = grid.get_pg("cp")
-    pg_collection.pp = grid.get_pg("pp")
-    pg_collection.ep = grid.get_pg("ep")
-    pg_collection.dp = grid.get_pg("dp")
-    pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
-    pg_collection.expt_dp = grid.get_pg("expt_dp")
-    return pg_collection
+    pg = ProcessGroupCollection()
+    pg.tp = grid.get_pg("tp")
+    pg.cp = grid.get_pg("cp")
+    pg.pp = grid.get_pg("pp")
+    pg.dp = grid.get_pg("dp")
+    pg.dp_cp = grid.get_pg(["dp", "cp"])
+    pg.intra_dp_cp = pg.dp_cp
+    pg.tp_cp = grid.get_pg(["tp", "cp"])
+    pg.mp = grid.get_pg(["tp", "pp"])
+    pg.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
+    pg.ep = grid.get_pg("ep")
+    pg.expt_tp = grid.get_pg("expt_tp")
+    pg.expt_dp = grid.get_pg("expt_dp")
+    pg.intra_expt_dp = pg.expt_dp
+    pg.tp_ep = grid.get_pg(["expt_tp", "ep"])
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"])
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+    return pg
 
 
 def create_all_embedding_groups(grids):
@@ -214,6 +236,9 @@ def get_language_model_spec(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    num_moe_experts=None,
+    moe_router_topk=1,
+    moe_grouped_gemm=False,
 ):
     """Get the language model spec.
 
@@ -229,6 +254,8 @@ def get_language_model_spec(
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
+    ep_size = pg_collection.ep.size() if pg_collection.ep is not None else 1
+    expt_tp_size = pg_collection.expt_tp.size() if pg_collection.expt_tp is not None else tp_size
 
     pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
     extra_kwargs = {}
@@ -237,6 +264,17 @@ def get_language_model_spec(
     if not dropout:
         extra_kwargs['attention_dropout'] = 0.0
         extra_kwargs['hidden_dropout'] = 0.0
+    if num_moe_experts is not None:
+        extra_kwargs.update(
+            {
+                'num_moe_experts': num_moe_experts,
+                'moe_router_topk': moe_router_topk,
+                'moe_router_pre_softmax': moe_router_topk == 1,
+                'expert_model_parallel_size': ep_size,
+                'expert_tensor_parallel_size': expt_tp_size,
+                'moe_grouped_gemm': moe_grouped_gemm,
+            }
+        )
 
     lm_config = TransformerConfig(
         num_layers=num_layers,
@@ -258,7 +296,9 @@ def get_language_model_spec(
         module=GPTModel,
         params={
             "config": lm_config,
-            "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(),
+            "transformer_layer_spec": get_gpt_layer_with_transformer_engine_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
+            ),
             "vocab_size": vocab_size,
             "max_sequence_length": seq_len,
             "pre_process": (pp_rank == 0),
@@ -380,6 +420,9 @@ def get_mimo_model(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    language_num_moe_experts=None,
+    language_moe_router_topk=1,
+    language_moe_grouped_gemm=False,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
@@ -414,6 +457,9 @@ def get_mimo_model(
         bias=bias,
         dropout=dropout,
         per_token_loss=per_token_loss,
+        num_moe_experts=language_num_moe_experts,
+        moe_router_topk=language_moe_router_topk,
+        moe_grouped_gemm=language_moe_grouped_gemm,
     )
     vision_submodule_spec = get_vision_submodules_spec(
         num_layers=num_layers,
@@ -560,6 +606,15 @@ def run_mimo_1f1b_test(
     llm_pp,
     llm_dp,
     llm_offset,
+    encoder_ep=1,
+    encoder_expt_tp=None,
+    encoder_expt_dp=None,
+    llm_ep=1,
+    llm_expt_tp=None,
+    llm_expt_dp=None,
+    language_num_moe_experts=None,
+    language_moe_router_topk=1,
+    language_moe_grouped_gemm=False,
     hidden_size=256,
     num_layers=2,
     vocab_size=1000,
@@ -579,9 +634,25 @@ def run_mimo_1f1b_test(
     encoder_name = "images"
 
     encoder_grid = create_hypercomm_grid(
-        offset=encoder_offset, tp=encoder_tp, cp=1, pp=encoder_pp, dp=encoder_dp
+        offset=encoder_offset,
+        tp=encoder_tp,
+        cp=1,
+        pp=encoder_pp,
+        dp=encoder_dp,
+        ep=encoder_ep,
+        expt_tp=encoder_expt_tp,
+        expt_dp=encoder_expt_dp,
     )
-    llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=1, pp=llm_pp, dp=llm_dp)
+    llm_grid = create_hypercomm_grid(
+        offset=llm_offset,
+        tp=llm_tp,
+        cp=1,
+        pp=llm_pp,
+        dp=llm_dp,
+        ep=llm_ep,
+        expt_tp=llm_expt_tp,
+        expt_dp=llm_expt_dp,
+    )
 
     # Create all embedding PGs upfront — dist.new_group is a collective that
     # requires ALL ranks to participate, so we must create them before any
@@ -598,6 +669,9 @@ def run_mimo_1f1b_test(
         num_layers=num_layers,
         vocab_size=vocab_size,
         seq_len=seq_length,
+        language_num_moe_experts=language_num_moe_experts,
+        language_moe_router_topk=language_moe_router_topk,
+        language_moe_grouped_gemm=language_moe_grouped_gemm,
     )
 
     no_sync_func = build_no_sync_func(mimo_model)
@@ -842,6 +916,33 @@ class TestMimo1F1BSchedule:
             seq_length=64,
             micro_batch_size=2,
             num_microbatches=4,
+        )
+
+    def test_moe_lm_ep2_edp1_pp2_8gpu(self):
+        """MoE LLM uses EP=2/EDP=1 over a PP=2 language pipeline."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+
+        run_mimo_1f1b_test(
+            encoder_tp=2,
+            encoder_pp=2,
+            encoder_dp=1,
+            encoder_offset=0,
+            llm_tp=1,
+            llm_pp=2,
+            llm_dp=2,
+            llm_offset=4,
+            llm_ep=2,
+            llm_expt_tp=1,
+            llm_expt_dp=1,
+            language_num_moe_experts=4,
+            language_moe_router_topk=1,
+            hidden_size=128,
+            num_layers=2,
+            vocab_size=512,
+            seq_length=32,
+            micro_batch_size=2,
+            num_microbatches=2,
         )
 
     def test_fan_in_dp4_to_dp1_llm_tp2_pp2_8gpu(self):

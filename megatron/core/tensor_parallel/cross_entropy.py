@@ -228,5 +228,6 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=
 
         label_smoothing: smoothing factor, must be in range [0.0, 1.0)
                          default is no smoothing (=0.0)
+
     """
     return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing)
