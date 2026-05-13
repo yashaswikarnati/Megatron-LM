@@ -59,6 +59,15 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--packing-buffer-size", type=int, default=None)
     data.add_argument("--shuffle-buffer-size", type=int, default=100)
     data.add_argument("--max-samples-per-sequence", type=int, default=100)
+    data.add_argument(
+        "--validate-energon-data-alignment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Check that encoder and LLM Energon readers start from matching samples. "
+            "This is disabled by default because the validation all-gather is expensive at scale."
+        ),
+    )
 
     train = parser.add_argument_group("training")
     train.add_argument("--micro-batch-size", type=int, default=2)
