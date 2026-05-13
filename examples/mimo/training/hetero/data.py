@@ -31,7 +31,7 @@ def validate_data_iterator(
     args: argparse.Namespace, data_iterator, topology: HeteroTopology
 ) -> None:
     """Run data-provider checks that must happen outside the pipeline schedule."""
-    if args.dataset_provider == "energon_multimodal":
+    if args.dataset_provider == "energon_multimodal" and args.validate_energon_data_alignment:
         from examples.mimo.data.hetero_energon import validate_energon_data_alignment
 
         validate_energon_data_alignment(data_iterator, topology)
