@@ -51,6 +51,39 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable Megatron experimental kernels/features used by some MoE performance paths.",
     )
+    runtime.add_argument(
+        "--timeline-profile",
+        action="store_true",
+        help="Write rank-local 1F1B timeline JSONL traces for selected debug ranks.",
+    )
+    runtime.add_argument(
+        "--timeline-dir",
+        type=str,
+        default=None,
+        help="Directory for rank-local timeline JSONL traces.",
+    )
+    runtime.add_argument(
+        "--timeline-ranks",
+        type=str,
+        default="dp-replica",
+        help="'dp-replica', 'all', or comma-separated global ranks to trace.",
+    )
+    runtime.add_argument(
+        "--timeline-dp-replica",
+        type=int,
+        default=0,
+        help="Dense data-parallel replica to trace when --timeline-ranks=dp-replica.",
+    )
+    runtime.add_argument(
+        "--timeline-cuda-events",
+        action="store_true",
+        help="Also record CUDA event elapsed time for compute events.",
+    )
+    runtime.add_argument(
+        "--timeline-nvtx",
+        action="store_true",
+        help="Push NVTX ranges with timeline event names for Nsight Systems.",
+    )
 
     data = parser.add_argument_group("data")
     data.add_argument("--dataset-provider", choices=["mock", "energon_multimodal"], default="mock")
@@ -117,6 +150,8 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
         raise ValueError("Phase 2 mock training currently supports CP=1 only")
     if args.log_interval < 1:
         raise ValueError("--log-interval must be >= 1")
+    if args.timeline_dp_replica < 0:
+        raise ValueError("--timeline-dp-replica must be >= 0")
 
     validate_model_provider_args(args)
     if args.dataset_provider == "mock":

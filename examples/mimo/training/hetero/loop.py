@@ -17,10 +17,16 @@ from examples.mimo.training.hetero.logging import HeteroTrainingLogger
 from examples.mimo.training.hetero.optimizer import build_optimizer, build_optimizer_param_scheduler
 from examples.mimo.training.hetero.runtime import build_mimo_runtime
 from examples.mimo.training.hetero.step import train_step
+from examples.mimo.training.hetero.timeline import configure_hetero_timeline
 from examples.mimo.training.hetero.topology import HeteroTopology, create_topology
 from examples.mimo.utils.hetero import debug_rank
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+from megatron.core.pipeline_parallel.timeline import (
+    close_pipeline_timeline,
+    flush_pipeline_timeline,
+    set_pipeline_timeline_iteration,
+)
 
 
 def run_train_loop(args: argparse.Namespace) -> None:
@@ -32,6 +38,9 @@ def run_train_loop(args: argparse.Namespace) -> None:
     model: Optional[MimoModel] = None
     try:
         topology = create_topology(args, encoder_size, llm_size)
+        timeline_summary = configure_hetero_timeline(args, topology)
+        if timeline_summary is not None:
+            print_rank_0(timeline_summary)
 
         torch.manual_seed(args.seed)
         debug_rank("building MIMO model")
@@ -61,13 +70,16 @@ def run_train_loop(args: argparse.Namespace) -> None:
 
         for iteration in range(1, args.train_iters + 1):
             debug_rank(f"iteration {iteration}: train step start")
+            set_pipeline_timeline_iteration(iteration)
             result = train_step(
                 args, model, topology, optimizer, opt_param_scheduler, communicator, data_iterator
             )
+            flush_pipeline_timeline()
             logger.record_step(result)
             logger.maybe_log(iteration, optimizer, result)
             debug_rank(f"iteration {iteration}: train step complete")
     finally:
+        close_pipeline_timeline()
         if model is not None:
             model.destroy()
         if topology is not None:
