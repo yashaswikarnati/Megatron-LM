@@ -11,6 +11,8 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from megatron.core.config import set_experimental_flag
+
 from examples.mimo.training.hetero.args import parse_args
 from examples.mimo.training.hetero.distributed import (
     initialize_distributed,
@@ -23,6 +25,8 @@ from examples.mimo.training.hetero.loop import run_train_loop
 def main() -> None:
     """Program entrypoint."""
     args = parse_args()
+    if args.enable_experimental:
+        set_experimental_flag(True)
     initialize_distributed()
     try:
         run_train_loop(args)
