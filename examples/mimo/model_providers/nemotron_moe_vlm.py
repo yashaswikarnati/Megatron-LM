@@ -54,6 +54,15 @@ NEMOTRON_20L_HYBRID_PATTERN = "MEMEM*EMEMEM*EMEMEM*"
 NEMOTRON_54L_HYBRID_PATTERN = (
     "MEMEM*EMEM*EMEM*EMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEME"
 )
+NEMOTRON_MOE_VLM_HIDDEN_SIZE = 2688
+NEMOTRON_MOE_VLM_NUM_ATTENTION_HEADS = 32
+NEMOTRON_MOE_VLM_NUM_QUERY_GROUPS = 8
+NEMOTRON_MOE_VLM_FFN_HIDDEN_SIZE = 1856
+NEMOTRON_MOE_VLM_KV_CHANNELS = 128
+NEMOTRON_MOE_VLM_NUM_EXPERTS = 128
+NEMOTRON_MOE_VLM_ROUTER_TOPK = 6
+NEMOTRON_MOE_VLM_AUX_LOSS_COEFF = 1.0e-9
+NEMOTRON_MOE_VLM_SHARED_EXPERT_INTERMEDIATE_SIZE = 3712
 NEMOTRON_20L_IMAGE_SEQ_PER_TILE = 256
 NEMOTRON_20L_MAX_NUM_TILES = 12
 NEMOTRON_20L_DEFAULT_STAGE = "stage2"
@@ -82,9 +91,6 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
     provider.add_argument("--hidden-size", type=int, default=128)
     provider.add_argument("--num-layers", type=int, default=2)
     provider.add_argument("--num-attention-heads", type=int, default=8)
-    provider.add_argument("--num-query-groups", type=int, default=None)
-    provider.add_argument("--ffn-hidden-size", type=int, default=None)
-    provider.add_argument("--kv-channels", type=int, default=None)
     provider.add_argument("--vocab-size", type=int, default=512)
     provider.add_argument("--seq-length", type=int, default=32)
     provider.add_argument("--image-seq-length", type=int, default=None)
@@ -102,9 +108,7 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Use random router logits to force MoE load balancing for benchmark/debug runs.",
     )
-    provider.add_argument("--moe-shared-expert-intermediate-size", type=int, default=None)
     provider.add_argument("--moe-grouped-gemm", action="store_true")
-    provider.add_argument("--hybrid-layer-pattern", type=str, default=None)
     provider.add_argument("--img-h", type=int, default=512)
     provider.add_argument("--img-w", type=int, default=512)
     provider.add_argument("--patch-dim", type=int, default=16)
@@ -143,17 +147,10 @@ def apply_model_provider_defaults(args: argparse.Namespace) -> None:
         return
 
     args.num_layers = 54 if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER else 20
-    args.hidden_size = 2688
-    args.num_attention_heads = 32
-    args.num_query_groups = 8 if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER else 2
-    args.ffn_hidden_size = 1856
-    args.kv_channels = 128
-    args.num_moe_experts = 128
-    args.moe_router_topk = 6
-    args.moe_aux_loss_coeff = (
-        1.0e-9 if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER else 0.0001
-    )
-    args.moe_shared_expert_intermediate_size = 3712
+    args.hidden_size = NEMOTRON_MOE_VLM_HIDDEN_SIZE
+    args.num_attention_heads = NEMOTRON_MOE_VLM_NUM_ATTENTION_HEADS
+    args.num_moe_experts = NEMOTRON_MOE_VLM_NUM_EXPERTS
+    args.moe_router_topk = NEMOTRON_MOE_VLM_ROUTER_TOPK
     args.moe_grouped_gemm = True
     args.hybrid_layer_pattern = (
         NEMOTRON_54L_HYBRID_PATTERN
@@ -346,9 +343,9 @@ def nemotron_language_config(
         hidden_size=args.hidden_size,
         num_attention_heads=args.num_attention_heads,
         attention_backend=AttnBackend.flash,
-        num_query_groups=args.num_query_groups,
-        ffn_hidden_size=args.ffn_hidden_size,
-        kv_channels=args.kv_channels,
+        num_query_groups=NEMOTRON_MOE_VLM_NUM_QUERY_GROUPS,
+        ffn_hidden_size=NEMOTRON_MOE_VLM_FFN_HIDDEN_SIZE,
+        kv_channels=NEMOTRON_MOE_VLM_KV_CHANNELS,
         activation_func=squared_relu,
         gated_linear_unit=False,
         attention_dropout=0.0,
@@ -375,9 +372,9 @@ def nemotron_language_config(
         bias_dropout_fusion=False,
         recompute_granularity="selective",
         recompute_modules=["core_attn"],
-        moe_ffn_hidden_size=args.ffn_hidden_size,
-        num_moe_experts=args.num_moe_experts,
-        moe_router_topk=args.moe_router_topk,
+        moe_ffn_hidden_size=NEMOTRON_MOE_VLM_FFN_HIDDEN_SIZE,
+        num_moe_experts=NEMOTRON_MOE_VLM_NUM_EXPERTS,
+        moe_router_topk=NEMOTRON_MOE_VLM_ROUTER_TOPK,
         moe_grouped_gemm=True,
         moe_router_score_function="sigmoid",
         moe_router_topk_scaling_factor=2.5,
@@ -386,8 +383,8 @@ def nemotron_language_config(
         moe_router_load_balancing_type="seq_aux_loss",
         moe_router_force_load_balancing=args.moe_router_force_load_balancing,
         moe_router_fusion=True,
-        moe_aux_loss_coeff=args.moe_aux_loss_coeff,
-        moe_shared_expert_intermediate_size=args.moe_shared_expert_intermediate_size,
+        moe_aux_loss_coeff=NEMOTRON_MOE_VLM_AUX_LOSS_COEFF,
+        moe_shared_expert_intermediate_size=NEMOTRON_MOE_VLM_SHARED_EXPERT_INTERMEDIATE_SIZE,
         moe_shared_expert_overlap=True,
         moe_token_dispatcher_type="alltoall",
         moe_permute_fusion=True,
