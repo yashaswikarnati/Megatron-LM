@@ -326,9 +326,9 @@ def nemotron_language_config(
     bf16 = not args.fp32
     dtype = torch.bfloat16 if bf16 else torch.float32
     config = TransformerConfig(
-        num_layers=args.num_layers,
-        hidden_size=args.hidden_size,
-        num_attention_heads=args.num_attention_heads,
+        num_layers=54 if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER else 20,
+        hidden_size=2688,
+        num_attention_heads=32,
         attention_backend=AttnBackend.flash,
         num_query_groups=8,
         ffn_hidden_size=1856,
