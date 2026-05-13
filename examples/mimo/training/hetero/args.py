@@ -8,6 +8,8 @@ import argparse
 
 from examples.mimo.data.hetero_mock import validate_mock_data_args
 from examples.mimo.model_providers.nemotron_moe_vlm import (
+    NEMOTRON_20L_MODEL_PROVIDER,
+    NEMOTRON_54L_MODEL_PROVIDER,
     add_model_provider_args,
     prepare_model_provider_args,
     validate_model_provider_args,
@@ -39,9 +41,16 @@ def parse_args() -> argparse.Namespace:
     grid.add_argument("--llm-dp", type=int, default=2)
     grid.add_argument("--llm-ep", type=int, default=2)
     grid.add_argument("--llm-expt-tp", type=int, default=1)
-    grid.add_argument("--llm-expt-dp", type=int, default=1)
+    grid.add_argument("--llm-expt-dp", type=int, default=None)
 
     add_model_provider_args(parser)
+
+    runtime = parser.add_argument_group("runtime")
+    runtime.add_argument(
+        "--enable-experimental",
+        action="store_true",
+        help="Enable Megatron experimental kernels/features used by some MoE performance paths.",
+    )
 
     data = parser.add_argument_group("data")
     data.add_argument("--dataset-provider", choices=["mock", "energon_multimodal"], default="mock")
@@ -136,8 +145,10 @@ def validate_energon_data_args(args: argparse.Namespace) -> None:
         raise ValueError("--data-path is required for --dataset-provider energon_multimodal")
     if not args.tokenizer_model:
         raise ValueError("--tokenizer-model is required for --dataset-provider energon_multimodal")
-    if args.model_provider != "nemotron-moe-vlm-20l":
-        raise ValueError("energon_multimodal is currently wired for the Nemotron 20L VLM provider")
+    if args.model_provider not in (NEMOTRON_20L_MODEL_PROVIDER, NEMOTRON_54L_MODEL_PROVIDER):
+        raise ValueError(
+            "energon_multimodal is currently wired for Nemotron MoE VLM providers"
+        )
     if args.encoder_pp != 1 or args.llm_pp != 1:
         raise ValueError("energon_multimodal currently supports encoder and LLM PP size 1")
     if args.encoder_dp > args.llm_dp:

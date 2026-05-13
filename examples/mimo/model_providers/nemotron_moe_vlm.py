@@ -49,7 +49,11 @@ except ImportError:
 
 MOCK_MODEL_PROVIDER = "mock"
 NEMOTRON_20L_MODEL_PROVIDER = "nemotron-moe-vlm-20l"
+NEMOTRON_54L_MODEL_PROVIDER = "nemotron-moe-vlm-54l"
 NEMOTRON_20L_HYBRID_PATTERN = "MEMEM*EMEMEM*EMEMEM*"
+NEMOTRON_54L_HYBRID_PATTERN = (
+    "MEMEM*EMEM*EMEM*EMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEME"
+)
 NEMOTRON_20L_IMAGE_SEQ_PER_TILE = 256
 NEMOTRON_20L_MAX_NUM_TILES = 12
 NEMOTRON_20L_DEFAULT_STAGE = "stage2"
@@ -62,17 +66,25 @@ def is_nemotron_20l(args: argparse.Namespace) -> bool:
     return args.model_provider == NEMOTRON_20L_MODEL_PROVIDER
 
 
+def is_nemotron_moe_vlm(args: argparse.Namespace) -> bool:
+    """Return whether a Nemotron6-MoE VLM provider is active."""
+    return args.model_provider in (NEMOTRON_20L_MODEL_PROVIDER, NEMOTRON_54L_MODEL_PROVIDER)
+
+
 def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
     """Register model-provider arguments for hetero MIMO examples."""
     provider = parser.add_argument_group("model provider")
     provider.add_argument(
         "--model-provider",
-        choices=[MOCK_MODEL_PROVIDER, NEMOTRON_20L_MODEL_PROVIDER],
+        choices=[MOCK_MODEL_PROVIDER, NEMOTRON_20L_MODEL_PROVIDER, NEMOTRON_54L_MODEL_PROVIDER],
         default=MOCK_MODEL_PROVIDER,
     )
     provider.add_argument("--hidden-size", type=int, default=128)
     provider.add_argument("--num-layers", type=int, default=2)
     provider.add_argument("--num-attention-heads", type=int, default=8)
+    provider.add_argument("--num-query-groups", type=int, default=None)
+    provider.add_argument("--ffn-hidden-size", type=int, default=None)
+    provider.add_argument("--kv-channels", type=int, default=None)
     provider.add_argument("--vocab-size", type=int, default=512)
     provider.add_argument("--seq-length", type=int, default=32)
     provider.add_argument("--image-seq-length", type=int, default=None)
@@ -85,7 +97,14 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
     provider.add_argument("--force-system-message", action="store_true")
     provider.add_argument("--num-moe-experts", type=int, default=4)
     provider.add_argument("--moe-router-topk", type=int, default=1)
+    provider.add_argument(
+        "--moe-router-force-load-balancing",
+        action="store_true",
+        help="Use random router logits to force MoE load balancing for benchmark/debug runs.",
+    )
+    provider.add_argument("--moe-shared-expert-intermediate-size", type=int, default=None)
     provider.add_argument("--moe-grouped-gemm", action="store_true")
+    provider.add_argument("--hybrid-layer-pattern", type=str, default=None)
     provider.add_argument("--img-h", type=int, default=512)
     provider.add_argument("--img-w", type=int, default=512)
     provider.add_argument("--patch-dim", type=int, default=16)
@@ -115,20 +134,32 @@ def prepare_model_provider_args(args: argparse.Namespace) -> None:
     apply_training_stage(args)
     resolve_image_token_id(args)
     args.vision_encoder_key = get_encoder_module_name(args)
-    args.vision_input_mode = "pixels" if is_nemotron_20l(args) else "hidden_states"
+    args.vision_input_mode = "pixels" if is_nemotron_moe_vlm(args) else "hidden_states"
 
 
 def apply_model_provider_defaults(args: argparse.Namespace) -> None:
-    """Apply the exact Nemotron6-MoE VLM 20L model defaults."""
-    if not is_nemotron_20l(args):
+    """Apply Nemotron6-MoE VLM model defaults."""
+    if not is_nemotron_moe_vlm(args):
         return
 
-    args.num_layers = 20
+    args.num_layers = 54 if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER else 20
     args.hidden_size = 2688
     args.num_attention_heads = 32
+    args.num_query_groups = 8 if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER else 2
+    args.ffn_hidden_size = 1856
+    args.kv_channels = 128
     args.num_moe_experts = 128
     args.moe_router_topk = 6
+    args.moe_aux_loss_coeff = (
+        1.0e-9 if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER else 0.0001
+    )
+    args.moe_shared_expert_intermediate_size = 3712
     args.moe_grouped_gemm = True
+    args.hybrid_layer_pattern = (
+        NEMOTRON_54L_HYBRID_PATTERN
+        if args.model_provider == NEMOTRON_54L_MODEL_PROVIDER
+        else NEMOTRON_20L_HYBRID_PATTERN
+    )
     args.seq_length = 8192
     args.image_seq_length = NEMOTRON_20L_IMAGE_SEQ_PER_TILE * args.num_image_tiles
     args.pixel_shuffle = True
@@ -139,7 +170,7 @@ def apply_model_provider_defaults(args: argparse.Namespace) -> None:
 
 def apply_training_stage(args: argparse.Namespace) -> None:
     """Apply stage-specific freeze flags for the Nemotron VLM recipe."""
-    if not is_nemotron_20l(args):
+    if not is_nemotron_moe_vlm(args):
         return
 
     stage = args.training_stage or NEMOTRON_20L_DEFAULT_STAGE
@@ -155,7 +186,7 @@ def apply_training_stage(args: argparse.Namespace) -> None:
 
 def resolve_image_token_id(args: argparse.Namespace) -> None:
     """Resolve image, pad, and vocab ids from the configured tokenizer."""
-    if not is_nemotron_20l(args) or not args.tokenizer_model:
+    if not is_nemotron_moe_vlm(args) or not args.tokenizer_model:
         return
 
     from megatron.core.tokenizers.vision.libraries.multimodal_tokenizer import (
@@ -269,7 +300,7 @@ class RADIOEncoderWrapper(torch.nn.Module):
 
 def get_encoder_module_name(args: argparse.Namespace) -> str:
     """Return the concrete encoder key for the active vision provider."""
-    return NEMOTRON_VISION_ENCODER_KEY if is_nemotron_20l(args) else MOCK_VISION_ENCODER_KEY
+    return NEMOTRON_VISION_ENCODER_KEY if is_nemotron_moe_vlm(args) else MOCK_VISION_ENCODER_KEY
 
 
 def get_vision_encoder_module(args: argparse.Namespace, vision_submodule):
@@ -307,17 +338,17 @@ def nemotron_projection_layer_spec() -> ModuleSpec:
 def nemotron_language_config(
     args: argparse.Namespace, tp_size: int, pp_size: int, ep_size: int, expt_tp_size: int
 ) -> TransformerConfig:
-    """Build the exact Nemotron6-MoE 20L language TransformerConfig."""
+    """Build the Nemotron6-MoE language TransformerConfig."""
     bf16 = not args.fp32
     dtype = torch.bfloat16 if bf16 else torch.float32
     config = TransformerConfig(
-        num_layers=20,
-        hidden_size=2688,
-        num_attention_heads=32,
+        num_layers=args.num_layers,
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_attention_heads,
         attention_backend=AttnBackend.flash,
-        num_query_groups=2,
-        ffn_hidden_size=1856,
-        kv_channels=128,
+        num_query_groups=args.num_query_groups,
+        ffn_hidden_size=args.ffn_hidden_size,
+        kv_channels=args.kv_channels,
         activation_func=squared_relu,
         gated_linear_unit=False,
         attention_dropout=0.0,
@@ -344,17 +375,19 @@ def nemotron_language_config(
         bias_dropout_fusion=False,
         recompute_granularity="selective",
         recompute_modules=["core_attn"],
-        moe_ffn_hidden_size=1856,
-        num_moe_experts=128,
-        moe_router_topk=6,
+        moe_ffn_hidden_size=args.ffn_hidden_size,
+        num_moe_experts=args.num_moe_experts,
+        moe_router_topk=args.moe_router_topk,
         moe_grouped_gemm=True,
         moe_router_score_function="sigmoid",
         moe_router_topk_scaling_factor=2.5,
         moe_router_enable_expert_bias=True,
         moe_router_dtype="fp32",
         moe_router_load_balancing_type="seq_aux_loss",
-        moe_aux_loss_coeff=0.0001,
-        moe_shared_expert_intermediate_size=3712,
+        moe_router_force_load_balancing=args.moe_router_force_load_balancing,
+        moe_router_fusion=True,
+        moe_aux_loss_coeff=args.moe_aux_loss_coeff,
+        moe_shared_expert_intermediate_size=args.moe_shared_expert_intermediate_size,
         moe_shared_expert_overlap=True,
         moe_token_dispatcher_type="alltoall",
         moe_permute_fusion=True,
@@ -450,7 +483,7 @@ def language_model_spec(
     tp_size = get_group_size_or(tp_pg, fallback_tp_size)
     ep_size = get_group_size_or(ep_pg, args.llm_ep)
     expt_tp_size = get_group_size_or(expt_tp_pg, args.llm_expt_tp or fallback_tp_size)
-    if is_nemotron_20l(args):
+    if is_nemotron_moe_vlm(args):
         config = nemotron_language_config(args, tp_size, pp_size, ep_size, expt_tp_size)
         require_per_token_loss(config)
         return ModuleSpec(
@@ -462,7 +495,7 @@ def language_model_spec(
                 "max_sequence_length": args.seq_length,
                 "pre_process": pp_rank == 0,
                 "post_process": pp_rank == pp_size - 1,
-                "hybrid_override_pattern": NEMOTRON_20L_HYBRID_PATTERN,
+                "hybrid_layer_pattern": args.hybrid_layer_pattern,
                 "position_embedding_type": "none",
                 "scatter_embedding_sequence_parallel": False,
                 "pg_collection": pg_collection,
@@ -530,7 +563,7 @@ def vision_submodules_spec(
     pp_rank = get_group_rank_or(pp_pg)
     bf16 = not args.fp32
 
-    if is_nemotron_20l(args):
+    if is_nemotron_moe_vlm(args):
         vision_config = radio_vision_config(args, tp_size, pp_size)
         vision_encoder_spec = ModuleSpec(
             module=RADIOEncoderWrapper,

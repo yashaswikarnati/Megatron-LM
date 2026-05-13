@@ -27,6 +27,8 @@ LLM_TP="${LLM_TP:-2}"
 LLM_PP="${LLM_PP:-1}"
 LLM_DP="${LLM_DP:-2}"
 LLM_EP="${LLM_EP:-4}"
+ENABLE_EXPERIMENTAL="${ENABLE_EXPERIMENTAL:-1}"
+MOE_ROUTER_FORCE_LOAD_BALANCING="${MOE_ROUTER_FORCE_LOAD_BALANCING:-0}"
 ENCODER_SIZE=$((ENCODER_TP * ENCODER_PP * ENCODER_DP))
 LLM_SIZE=$((LLM_TP * LLM_PP * LLM_DP))
 LLM_OFFSET="${LLM_OFFSET:-${ENCODER_SIZE}}"
@@ -61,6 +63,8 @@ fi
 echo "=== Hetero MIMO Nemotron6-MoE VLM 20L Energon training ==="
 echo "stage=${TRAINING_STAGE} train_iters=${TRAIN_ITERS} gbs=${GLOBAL_BATCH_SIZE}"
 echo "layout=encoder(tp=${ENCODER_TP},pp=${ENCODER_PP},dp=${ENCODER_DP}) llm(tp=${LLM_TP},pp=${LLM_PP},dp=${LLM_DP},ep=${LLM_EP}) world=${EXPECTED_WORLD_SIZE}"
+echo "enable_experimental=${ENABLE_EXPERIMENTAL}"
+echo "moe_router_force_load_balancing=${MOE_ROUTER_FORCE_LOAD_BALANCING}"
 echo "data=${DATA_PATH}"
 echo "tokenizer=${TOKENIZER_MODEL}"
 echo "==========================================================="
@@ -72,6 +76,13 @@ DATA_LOADER_ARGS=(
 )
 if [[ "${PACKING_BUFFER_SIZE}" != "0" ]]; then
   DATA_LOADER_ARGS+=(--packing-buffer-size "${PACKING_BUFFER_SIZE}")
+fi
+MODEL_ARGS=()
+if [[ "${ENABLE_EXPERIMENTAL}" == "1" || "${ENABLE_EXPERIMENTAL}" == "true" ]]; then
+  MODEL_ARGS+=(--enable-experimental)
+fi
+if [[ "${MOE_ROUTER_FORCE_LOAD_BALANCING}" == "1" || "${MOE_ROUTER_FORCE_LOAD_BALANCING}" == "true" ]]; then
+  MODEL_ARGS+=(--moe-router-force-load-balancing)
 fi
 
 "${PYTHON_BIN}" -m torch.distributed.run \
@@ -91,6 +102,7 @@ fi
   --llm-ep "${LLM_EP}" \
   --llm-expt-tp 1 \
   --llm-expt-dp 1 \
+  "${MODEL_ARGS[@]}" \
   --vocab-size 131072 \
   --max-num-tiles 12 \
   --data-path "${DATA_PATH}" \
