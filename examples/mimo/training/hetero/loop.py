@@ -25,7 +25,9 @@ from megatron.core.pipeline_parallel.multimodule_communicator import MultiModule
 from megatron.core.pipeline_parallel.timeline import (
     close_pipeline_timeline,
     flush_pipeline_timeline,
+    is_pipeline_timeline_active,
     set_pipeline_timeline_iteration,
+    timeline_instant,
 )
 
 
@@ -74,6 +76,7 @@ def run_train_loop(args: argparse.Namespace) -> None:
             result = train_step(
                 args, model, topology, optimizer, opt_param_scheduler, communicator, data_iterator
             )
+            record_cuda_memory_snapshot()
             flush_pipeline_timeline()
             logger.record_step(result)
             logger.maybe_log(iteration, optimizer, result)
@@ -96,4 +99,17 @@ def build_pipeline_communicator(
         model.config,
         dim_mapping={"s": 0, "h": 2, "b": 1},
         module_output_ndim={topology.encoder_name: 2},
+    )
+
+
+def record_cuda_memory_snapshot() -> None:
+    """Record CUDA memory usage in the active timeline without cross-rank synchronization."""
+    if not torch.cuda.is_available() or not is_pipeline_timeline_active():
+        return
+    timeline_instant(
+        "cuda.memory",
+        memory_allocated_bytes=torch.cuda.memory_allocated(),
+        max_memory_allocated_bytes=torch.cuda.max_memory_allocated(),
+        memory_reserved_bytes=torch.cuda.memory_reserved(),
+        max_memory_reserved_bytes=torch.cuda.max_memory_reserved(),
     )

@@ -75,6 +75,18 @@ def parse_args() -> argparse.Namespace:
         help="Dense data-parallel replica to trace when --timeline-ranks=dp-replica.",
     )
     runtime.add_argument(
+        "--timeline-iter-start",
+        type=int,
+        default=None,
+        help="First training iteration to record in timeline traces.",
+    )
+    runtime.add_argument(
+        "--timeline-iter-end",
+        type=int,
+        default=None,
+        help="Last training iteration to record in timeline traces.",
+    )
+    runtime.add_argument(
         "--timeline-cuda-events",
         action="store_true",
         help="Also record CUDA event elapsed time for compute events.",
@@ -152,6 +164,16 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
         raise ValueError("--log-interval must be >= 1")
     if args.timeline_dp_replica < 0:
         raise ValueError("--timeline-dp-replica must be >= 0")
+    if args.timeline_iter_start is not None and args.timeline_iter_start < 1:
+        raise ValueError("--timeline-iter-start must be >= 1")
+    if args.timeline_iter_end is not None and args.timeline_iter_end < 1:
+        raise ValueError("--timeline-iter-end must be >= 1")
+    if (
+        args.timeline_iter_start is not None
+        and args.timeline_iter_end is not None
+        and args.timeline_iter_end < args.timeline_iter_start
+    ):
+        raise ValueError("--timeline-iter-end must be >= --timeline-iter-start")
 
     validate_model_provider_args(args)
     if args.dataset_provider == "mock":

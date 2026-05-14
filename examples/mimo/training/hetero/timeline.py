@@ -33,6 +33,18 @@ def configure_hetero_timeline(args: argparse.Namespace, topology: HeteroTopology
     scope = os.environ.get("MIMO_TIMELINE_RANKS", args.timeline_ranks)
     dp_replica = int(os.environ.get("MIMO_TIMELINE_DP_REPLICA", args.timeline_dp_replica))
     output_dir = args.timeline_dir or os.environ.get("MIMO_TIMELINE_DIR", "mimo_timeline")
+    iteration_start = _optional_env_int("MIMO_TIMELINE_ITER_START", args.timeline_iter_start)
+    iteration_end = _optional_env_int("MIMO_TIMELINE_ITER_END", args.timeline_iter_end)
+    if iteration_start is not None and iteration_start < 1:
+        raise ValueError("timeline iteration start must be >= 1")
+    if iteration_end is not None and iteration_end < 1:
+        raise ValueError("timeline iteration end must be >= 1")
+    if (
+        iteration_start is not None
+        and iteration_end is not None
+        and iteration_end < iteration_start
+    ):
+        raise ValueError("timeline iteration end must be >= timeline iteration start")
     selected_ranks = select_timeline_ranks(scope, dp_replica, topology, world_size)
     role, coords = rank_role_and_coords(rank, topology)
 
@@ -49,13 +61,16 @@ def configure_hetero_timeline(args: argparse.Namespace, topology: HeteroTopology
         },
         cuda_events=args.timeline_cuda_events or env_flag_enabled("MIMO_TIMELINE_CUDA_EVENTS"),
         nvtx=args.timeline_nvtx or env_flag_enabled("MIMO_TIMELINE_NVTX"),
+        iteration_start=iteration_start,
+        iteration_end=iteration_end,
     )
 
     if rank != 0:
         return None
     return (
         "Pipeline timeline enabled: "
-        f"dir={output_dir}, scope={scope}, selected_ranks={len(selected_ranks)}"
+        f"dir={output_dir}, scope={scope}, selected_ranks={len(selected_ranks)}, "
+        f"iter_start={iteration_start}, iter_end={iteration_end}"
     )
 
 
@@ -108,3 +123,10 @@ def grid_coords(grid: HyperCommGrid, rank: int) -> dict[str, int]:
 def env_flag_enabled(name: str) -> bool:
     """Return whether an environment flag is set to a truthy value."""
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_env_int(name: str, default: Optional[int]) -> Optional[int]:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return int(value)
