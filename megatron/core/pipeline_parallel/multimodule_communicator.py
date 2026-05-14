@@ -11,6 +11,7 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.timeline import timeline_event
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -342,7 +343,12 @@ class MultiModulePipelineCommunicator:
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    received_tensor = bridge_comm.recv_forward()
+                    with timeline_event(
+                        "bridge.recv_forward",
+                        src_module=bridge_comm.src_module_name,
+                        dest_module=bridge_comm.dest_module_name,
+                    ):
+                        received_tensor = bridge_comm.recv_forward()
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
@@ -364,7 +370,12 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    bridge_comm.send_forward(output_dict[module_name])
+                    with timeline_event(
+                        "bridge.send_forward",
+                        src_module=bridge_comm.src_module_name,
+                        dest_module=bridge_comm.dest_module_name,
+                    ):
+                        bridge_comm.send_forward(output_dict[module_name])
             else:
                 # If not last stage, send forward activation by using P2P communicator.
                 tensor_to_send = _prepare_tensor_for_comm(output_dict[module_name])
@@ -391,7 +402,12 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    grad = bridge_comm.send_forward_recv_backward(output_dict[module_name])
+                    with timeline_event(
+                        "bridge.send_forward_recv_backward",
+                        src_module=bridge_comm.src_module_name,
+                        dest_module=bridge_comm.dest_module_name,
+                    ):
+                        grad = bridge_comm.send_forward_recv_backward(output_dict[module_name])
                     grad_dict[bridge_comm.src_module_name] = grad
             else:
                 # If not last stage, send forward activation and receive backward gradient
@@ -424,9 +440,14 @@ class MultiModulePipelineCommunicator:
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
-                    received_tensor = bridge_comm.send_backward_recv_forward(
-                        grad_dict[bridge_comm.src_module_name]
-                    )
+                    with timeline_event(
+                        "bridge.send_backward_recv_forward",
+                        src_module=bridge_comm.src_module_name,
+                        dest_module=bridge_comm.dest_module_name,
+                    ):
+                        received_tensor = bridge_comm.send_backward_recv_forward(
+                            grad_dict[bridge_comm.src_module_name]
+                        )
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:
                 # If not first stage, send backward gradient and receive forward activation
@@ -459,7 +480,12 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has incoming modules, receive backward gradient
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
-                    grad = bridge_comm.recv_backward()
+                    with timeline_event(
+                        "bridge.recv_backward",
+                        src_module=bridge_comm.src_module_name,
+                        dest_module=bridge_comm.dest_module_name,
+                    ):
+                        grad = bridge_comm.recv_backward()
                     grad_dict[bridge_comm.src_module_name] = grad
             else:
                 # If not last stage, receive backward gradient by using P2P communicator.
@@ -480,7 +506,12 @@ class MultiModulePipelineCommunicator:
                 # If first stage, and has incoming modules, send backward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
-                    bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name])
+                    with timeline_event(
+                        "bridge.send_backward",
+                        src_module=bridge_comm.src_module_name,
+                        dest_module=bridge_comm.dest_module_name,
+                    ):
+                        bridge_comm.send_backward(grad_dict[bridge_comm.src_module_name])
             else:
                 # If not first stage, send backward activation by using P2P communicator.
                 grad_to_send = _prepare_tensor_for_comm(grad_dict[module_name])

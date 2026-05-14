@@ -13,6 +13,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.timeline import timeline_event
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -2231,25 +2232,28 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        input_tensor = p2p_communicator.recv_forward(
-            recv_tensor_shapes, p2p_communicator.is_pp_first_stage
-        )
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-            current_microbatch=i,
-            is_last_stage=p2p_communicator.is_pp_last_stage,
-        )
-        p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
+        with timeline_event("schedule.recv_forward", phase="warmup", microbatch=i):
+            input_tensor = p2p_communicator.recv_forward(
+                recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+            )
+        with timeline_event("schedule.forward", phase="warmup", microbatch=i, cuda=True):
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+                current_microbatch=i,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
+        with timeline_event("schedule.send_forward", phase="warmup", microbatch=i):
+            p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
 
         if not forward_only:
@@ -2261,13 +2265,18 @@ def forward_backward_pipelining_without_interleaving(
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
-        input_tensor = p2p_communicator.recv_forward(
-            recv_tensor_shapes, p2p_communicator.is_pp_first_stage
-        )
+        with timeline_event(
+            "schedule.recv_forward", phase="steady_prefetch", microbatch=num_warmup_microbatches
+        ):
+            input_tensor = p2p_communicator.recv_forward(
+                recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+            )
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
+        forward_microbatch = i + num_warmup_microbatches
+        backward_microbatch = i
 
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
@@ -2277,35 +2286,50 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size=cp_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
-            ),
-            current_microbatch=i + num_warmup_microbatches,
-            is_last_stage=p2p_communicator.is_pp_last_stage,
-        )
+        with timeline_event(
+            "schedule.forward", phase="steady", microbatch=forward_microbatch, cuda=True
+        ):
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size=cp_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=forward_microbatch,
+                is_last_stage=p2p_communicator.is_pp_last_stage,
+            )
         total_num_tokens += num_tokens
 
         if forward_only:
-            p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
+            with timeline_event(
+                "schedule.send_forward", phase="steady", microbatch=forward_microbatch
+            ):
+                p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
             if not last_iteration:
-                input_tensor = p2p_communicator.recv_forward(
-                    recv_tensor_shapes, p2p_communicator.is_pp_first_stage
-                )
+                with timeline_event(
+                    "schedule.recv_forward", phase="steady", microbatch=forward_microbatch + 1
+                ):
+                    input_tensor = p2p_communicator.recv_forward(
+                        recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                    )
         else:
-            output_tensor_grad = p2p_communicator.send_forward_recv_backward(
-                output_tensor, send_tensor_shapes, p2p_communicator.is_pp_last_stage
-            )
+            with timeline_event(
+                "schedule.send_forward_recv_backward",
+                phase="steady",
+                microbatch=forward_microbatch,
+                backward_microbatch=backward_microbatch,
+            ):
+                output_tensor_grad = p2p_communicator.send_forward_recv_backward(
+                    output_tensor, send_tensor_shapes, p2p_communicator.is_pp_last_stage
+                )
 
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
@@ -2323,23 +2347,36 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
                     enable_grad_sync()
 
-            input_tensor_grad = backward_func(
-                input_tensor, output_tensor, output_tensor_grad, config
-            )
+            with timeline_event(
+                "schedule.backward", phase="steady", microbatch=backward_microbatch, cuda=True
+            ):
+                input_tensor_grad = backward_func(
+                    input_tensor, output_tensor, output_tensor_grad, config
+                )
 
             if last_iteration:
                 input_tensor = None
-                p2p_communicator.send_backward(
-                    input_tensor_grad, p2p_communicator.is_pp_first_stage
-                )
+                with timeline_event(
+                    "schedule.send_backward", phase="steady", microbatch=backward_microbatch
+                ):
+                    p2p_communicator.send_backward(
+                        input_tensor_grad, p2p_communicator.is_pp_first_stage
+                    )
             else:
-                input_tensor = p2p_communicator.send_backward_recv_forward(
-                    input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
-                )
+                with timeline_event(
+                    "schedule.send_backward_recv_forward",
+                    phase="steady",
+                    microbatch=backward_microbatch,
+                    recv_microbatch=forward_microbatch + 1,
+                ):
+                    input_tensor = p2p_communicator.send_backward_recv_forward(
+                        input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
+                    )
 
     # Run cooldown backward passes.
     if not forward_only:
         for i in range(num_warmup_microbatches):
+            backward_microbatch = num_microbatches_remaining + i
 
             # Enable async grad reduction in the last backward pass
             # Note: If grad sync function is provided, only enable
@@ -2353,15 +2390,26 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
-            output_tensor_grad = p2p_communicator.recv_backward(
-                send_tensor_shapes, p2p_communicator.is_pp_last_stage
-            )
+            with timeline_event(
+                "schedule.recv_backward", phase="cooldown", microbatch=backward_microbatch
+            ):
+                output_tensor_grad = p2p_communicator.recv_backward(
+                    send_tensor_shapes, p2p_communicator.is_pp_last_stage
+                )
 
-            input_tensor_grad = backward_func(
-                input_tensor, output_tensor, output_tensor_grad, config
-            )
+            with timeline_event(
+                "schedule.backward", phase="cooldown", microbatch=backward_microbatch, cuda=True
+            ):
+                input_tensor_grad = backward_func(
+                    input_tensor, output_tensor, output_tensor_grad, config
+                )
 
-            p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
+            with timeline_event(
+                "schedule.send_backward", phase="cooldown", microbatch=backward_microbatch
+            ):
+                p2p_communicator.send_backward(
+                    input_tensor_grad, p2p_communicator.is_pp_first_stage
+                )
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
