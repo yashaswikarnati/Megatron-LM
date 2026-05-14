@@ -1,0 +1,6 @@
+# RKarimi 3B-nano SOTA 1T text subset blend.
+# The 3B-nano baseline uses TRAIN_SAMPLES=122070313 and SEQ_LEN=8192,
+# which is 1,000,000,004,096 tokens.
+__module__: megatron.energon
+__class__: McoreBlend
+mcore_json: /scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/rkarimimahab/workspace/blends/1T-phase1var-moresft.json

@@ -1,0 +1,8 @@
+# HEL text-only Energon blend for MIMO jitter isolation.
+__module__: megatron.energon
+__class__: MetadatasetV2
+splits:
+  train:
+    blend:
+    - weight: 1.0
+      path: __MEGATRON_ROOT__/examples/mimo/blend_files/1t_phase1var_moresft_wrapper.yaml
