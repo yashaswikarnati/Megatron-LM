@@ -74,19 +74,21 @@ def wrap_active_modules_with_ddp(
     args: argparse.Namespace, mimo_model: MimoModel, topology: HeteroTopology
 ) -> None:
     """Freeze and DDP-wrap active local MIMO modules."""
-    language_ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=args.overlap_grad_reduce,
-        bucket_size=args.ddp_bucket_size if args.ddp_bucket_size > 0 else None,
-        use_distributed_optimizer=True,
-    )
     vision_ddp_config = DistributedDataParallelConfig(
         overlap_grad_reduce=False,
-        bucket_size=args.ddp_bucket_size if args.ddp_bucket_size > 0 else None,
+        bucket_size=resolve_fixed_ddp_bucket_size(args.ddp_bucket_size),
         use_distributed_optimizer=True,
     )
     if mimo_model.language_model is not None:
         if args.freeze_lm:
             set_module_requires_grad(mimo_model.language_model, False)
+        language_ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=args.overlap_grad_reduce,
+            overlap_param_gather=args.overlap_param_gather,
+            bucket_size=resolve_language_ddp_bucket_size(args, mimo_model.language_model),
+            use_distributed_optimizer=True,
+            pad_buckets_for_high_nccl_busbw=args.ddp_pad_buckets_for_high_nccl_busbw,
+        )
         debug_rank("wrapping language model in DDP")
         mimo_model.language_model = DistributedDataParallel(
             config=mimo_model.language_model.config,
@@ -115,6 +117,27 @@ def wrap_active_modules_with_ddp(
             pg_collection=topology.vision_pg,
         )
         debug_rank("vision submodule DDP ready")
+
+
+def resolve_language_ddp_bucket_size(
+    args: argparse.Namespace, module: torch.nn.Module
+) -> Optional[int]:
+    """Return the configured language DDP bucket size."""
+    if args.ddp_num_buckets is not None:
+        num_trainable_params = sum(
+            param.numel() for param in module.parameters() if param.requires_grad
+        )
+        return max(1, num_trainable_params // args.ddp_num_buckets)
+    return resolve_fixed_ddp_bucket_size(args.ddp_bucket_size)
+
+
+def resolve_fixed_ddp_bucket_size(bucket_size: Optional[int]) -> Optional[int]:
+    """Return the concrete DDP bucket size, preserving the historical default."""
+    if bucket_size is None:
+        return 10000
+    if bucket_size == 0:
+        return None
+    return bucket_size
 
 
 def set_module_requires_grad(module: Optional[torch.nn.Module], requires_grad: bool) -> None:
