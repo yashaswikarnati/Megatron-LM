@@ -58,6 +58,11 @@ LLM_EP="${LLM_EP:-16}"
 LLM_EXPT_TP="${LLM_EXPT_TP:-1}"
 ENABLE_EXPERIMENTAL="${ENABLE_EXPERIMENTAL:-1}"
 MOE_ROUTER_FORCE_LOAD_BALANCING="${MOE_ROUTER_FORCE_LOAD_BALANCING:-0}"
+OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-1}"
+OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-0}"
+DDP_NUM_BUCKETS="${DDP_NUM_BUCKETS:-8}"
+DDP_BUCKET_SIZE="${DDP_BUCKET_SIZE:-}"
+DDP_PAD_BUCKETS_FOR_HIGH_NCCL_BUSBW="${DDP_PAD_BUCKETS_FOR_HIGH_NCCL_BUSBW:-1}"
 
 ENCODER_SIZE=$((ENCODER_TP * ENCODER_CP * ENCODER_PP * ENCODER_DP))
 LLM_SIZE=$((LLM_TP * LLM_CP * LLM_PP * LLM_DP))
@@ -197,6 +202,9 @@ if [[ "${RANK_ID}" -eq 0 ]]; then
   echo "enable_experimental=${ENABLE_EXPERIMENTAL}"
   echo "moe_router_force_load_balancing=${MOE_ROUTER_FORCE_LOAD_BALANCING}"
   echo "moe_router_fusion=model-provider-default"
+  echo "overlap_grad_reduce=${OVERLAP_GRAD_REDUCE} overlap_param_gather=${OVERLAP_PARAM_GATHER}"
+  echo "ddp_num_buckets=${DDP_NUM_BUCKETS:-unset} ddp_bucket_size=${DDP_BUCKET_SIZE:-unset}"
+  echo "ddp_pad_buckets_for_high_nccl_busbw=${DDP_PAD_BUCKETS_FOR_HIGH_NCCL_BUSBW}"
   echo "data=${DATA_TRAIN}"
   echo "tokenizer=${TOKENIZER_MODEL}"
   echo "run_dir=${RUN_DIR}"
@@ -217,6 +225,25 @@ if [[ "${ENABLE_EXPERIMENTAL}" == "1" || "${ENABLE_EXPERIMENTAL}" == "true" ]]; 
 fi
 if [[ "${MOE_ROUTER_FORCE_LOAD_BALANCING}" == "1" || "${MOE_ROUTER_FORCE_LOAD_BALANCING}" == "true" ]]; then
   MODEL_ARGS+=(--moe-router-force-load-balancing)
+fi
+DDP_ARGS=()
+if [[ "${OVERLAP_GRAD_REDUCE}" == "1" || "${OVERLAP_GRAD_REDUCE}" == "true" ]]; then
+  DDP_ARGS+=(--overlap-grad-reduce)
+else
+  DDP_ARGS+=(--no-overlap-grad-reduce)
+fi
+if [[ "${OVERLAP_PARAM_GATHER}" == "1" || "${OVERLAP_PARAM_GATHER}" == "true" ]]; then
+  DDP_ARGS+=(--overlap-param-gather)
+else
+  DDP_ARGS+=(--no-overlap-param-gather)
+fi
+if [[ -n "${DDP_NUM_BUCKETS}" ]]; then
+  DDP_ARGS+=(--ddp-num-buckets "${DDP_NUM_BUCKETS}")
+elif [[ -n "${DDP_BUCKET_SIZE}" ]]; then
+  DDP_ARGS+=(--ddp-bucket-size "${DDP_BUCKET_SIZE}")
+fi
+if [[ "${DDP_PAD_BUCKETS_FOR_HIGH_NCCL_BUSBW}" == "1" || "${DDP_PAD_BUCKETS_FOR_HIGH_NCCL_BUSBW}" == "true" ]]; then
+  DDP_ARGS+=(--ddp-pad-buckets-for-high-nccl-busbw)
 fi
 
 CMD=(
@@ -257,8 +284,7 @@ CMD=(
   --adam-beta1 0.9
   --adam-beta2 0.95
   --clip-grad 1.0
-  --no-overlap-grad-reduce
-  --ddp-bucket-size 0
+  "${DDP_ARGS[@]}"
   --log-interval "${LOG_INTERVAL}"
   --train-iters "${TRAIN_ITERS}"
   "$@"

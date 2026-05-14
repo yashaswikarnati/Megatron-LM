@@ -26,6 +26,7 @@ def build_optimizer(args: argparse.Namespace, model: MimoModel):
             clip_grad=args.clip_grad,
             bf16=not args.fp32,
             use_distributed_optimizer=True,
+            overlap_param_gather=args.overlap_param_gather and model.language_model is not None,
             log_num_zeros_in_grad=args.log_num_zeros_in_grad,
         ),
     )

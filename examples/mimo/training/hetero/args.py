@@ -127,10 +127,37 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     train.add_argument(
+        "--overlap-param-gather",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable DDP parameter-gather overlap for the language module. Vision encoder DDP "
+            "keeps overlap disabled because actual-data batches may be text-only."
+        ),
+    )
+    train.add_argument(
+        "--ddp-num-buckets",
+        type=int,
+        default=None,
+        help=(
+            "Number of language-model DDP buckets. Mutually exclusive with "
+            "--ddp-bucket-size."
+        ),
+    )
+    train.add_argument(
         "--ddp-bucket-size",
         type=int,
-        default=10000,
-        help="DDP bucket size. Use 0 for a single unbounded bucket.",
+        default=None,
+        help="DDP bucket size. Defaults to 10000. Use 0 for a single unbounded bucket.",
+    )
+    train.add_argument(
+        "--ddp-pad-buckets-for-high-nccl-busbw",
+        action="store_true",
+        default=False,
+        help=(
+            "Pad language-model distributed-optimizer buckets to improve NCCL bus bandwidth "
+            "at large DP sizes."
+        ),
     )
     train.add_argument("--seed", type=int, default=12345)
     train.add_argument("--log-interval", type=int, default=1)
@@ -150,6 +177,14 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
         raise ValueError("Phase 2 mock training currently supports CP=1 only")
     if args.log_interval < 1:
         raise ValueError("--log-interval must be >= 1")
+    if args.ddp_num_buckets is not None and args.ddp_num_buckets < 1:
+        raise ValueError("--ddp-num-buckets must be >= 1")
+    if args.ddp_bucket_size is not None and args.ddp_bucket_size < 0:
+        raise ValueError("--ddp-bucket-size must be >= 0")
+    if args.ddp_num_buckets is not None and args.ddp_bucket_size is not None:
+        raise ValueError("--ddp-num-buckets and --ddp-bucket-size are mutually exclusive")
+    if args.overlap_param_gather and not args.overlap_grad_reduce:
+        raise ValueError("--overlap-param-gather requires --overlap-grad-reduce")
     if args.timeline_dp_replica < 0:
         raise ValueError("--timeline-dp-replica must be >= 0")
 
