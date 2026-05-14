@@ -19,6 +19,7 @@ from examples.mimo.training.hetero.topology import HeteroTopology
 from examples.mimo.utils.hetero import debug_rank
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+from megatron.core.pipeline_parallel.timeline import timeline_event
 
 
 @dataclass
@@ -63,8 +64,10 @@ def loss_func(output_tensor: torch.Tensor, *, loss_mask: torch.Tensor):
 
 def forward_step(data_iterator, model):
     """Forward step consumed by the MCore pipeline schedule."""
-    batch = next(data_iterator) if data_iterator is not None else {"input_ids": None}
-    batch = move_batch_to_cuda(batch)
+    with timeline_event("data.next"):
+        batch = next(data_iterator) if data_iterator is not None else {"input_ids": None}
+    with timeline_event("data.to_cuda", cuda=True):
+        batch = move_batch_to_cuda(batch)
     debug_rank("forward_step batch prepared")
     debug_rank("forward_step model call start")
     output_tensor, loss_mask = model(**batch)
