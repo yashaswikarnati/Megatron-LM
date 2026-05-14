@@ -12,6 +12,7 @@ from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.timeline import timeline_event
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -132,6 +133,19 @@ class MimoModel(MegatronModule):
                     )
                 )
         return sharded_sd
+
+    @staticmethod
+    def _timeline_tensor_meta(
+        tensor: Optional[torch.Tensor], prefix: str = "tensor"
+    ) -> Dict[str, Any]:
+        """Return shape-only tensor metadata without forcing device synchronization."""
+        if tensor is None:
+            return {f"{prefix}_is_none": True}
+        return {
+            f"{prefix}_shape": tuple(tensor.shape),
+            f"{prefix}_numel": int(tensor.numel()),
+            f"{prefix}_dtype": str(tensor.dtype),
+        }
 
     def align_embeddings_by_token_positions(
         self,
@@ -430,16 +444,31 @@ class MimoModel(MegatronModule):
             submodule = self.modality_submodules[encoder_name]
             encoder_inputs = modality_inputs.get(encoder_name) if modality_inputs else None
             hidden_states = input_tensors.get(encoder_name) if input_tensors else None
-            output = submodule.forward(encoder_inputs=encoder_inputs, hidden_states=hidden_states)
+            with timeline_event(
+                "mimo.encoder_forward",
+                cuda=True,
+                encoder_name=encoder_name,
+                has_encoder_inputs=encoder_inputs is not None,
+                has_hidden_states=hidden_states is not None,
+            ):
+                output = submodule.forward(
+                    encoder_inputs=encoder_inputs, hidden_states=hidden_states
+                )
             if output is None and encoder_inputs is None and hidden_states is None:
                 if self._has_encoder_tokens(input_ids, encoder_name):
                     raise RuntimeError(
                         f"{encoder_name} inputs are missing, but matching special tokens exist"
                     )
-                output = self._empty_encoder_output(submodule, input_ids)
+                with timeline_event("mimo.encoder_empty_output", encoder_name=encoder_name):
+                    output = self._empty_encoder_output(submodule, input_ids)
 
             if output is not None:
-                self._attach_modality_split_sizes(output, input_ids, encoder_name)
+                with timeline_event(
+                    "mimo.encoder_attach_split_sizes",
+                    encoder_name=encoder_name,
+                    **self._timeline_tensor_meta(output, "output"),
+                ):
+                    self._attach_modality_split_sizes(output, input_ids, encoder_name)
                 outputs[encoder_name] = output
 
         return outputs
@@ -506,74 +535,125 @@ class MimoModel(MegatronModule):
             Tuple of language model output and the matching, possibly sharded loss mask.
         """
         lang_name = MIMO_LANGUAGE_MODULE_KEY
-        packed_seq_params = self._build_packed_seq_params(packing_kwargs)
+        with timeline_event(
+            "mimo.build_packed_seq_params", has_packing_kwargs=packing_kwargs is not None
+        ):
+            packed_seq_params = self._build_packed_seq_params(packing_kwargs)
 
         if self.role.is_first_stage(lang_name):
             # First stage: receive encoder embeddings, combine with text, pass to LM
             # Build modality embeddings dict from encoder outputs
             modality_embeddings = {}
-            if input_tensors:
-                for name, tensor in input_tensors.items():
-                    if name != lang_name:
-                        modality_embeddings[name] = tensor
+            with timeline_event(
+                "mimo.collect_modality_embeddings",
+                input_tensor_names=list(input_tensors.keys()) if input_tensors else [],
+            ):
+                if input_tensors:
+                    for name, tensor in input_tensors.items():
+                        if name != lang_name:
+                            modality_embeddings[name] = tensor
 
             # Get text embeddings
-            text_embeddings = self.get_text_embeddings(
-                input_ids, position_ids, self.special_token_ids
-            )
+            with timeline_event(
+                "mimo.text_embeddings",
+                cuda=True,
+                **self._timeline_tensor_meta(input_ids, "input_ids"),
+            ):
+                text_embeddings = self.get_text_embeddings(
+                    input_ids, position_ids, self.special_token_ids
+                )
             modality_embeddings["text"] = text_embeddings
 
             # Combine all embeddings
-            combined_embeddings = self.align_embeddings_by_token_positions(
-                modality_embeddings=modality_embeddings,
-                input_ids=input_ids,
-                special_token_ids=self.special_token_ids,
-            )
+            with timeline_event(
+                "mimo.align_embeddings",
+                cuda=True,
+                modality_names=list(modality_embeddings.keys()),
+                modality_shapes={
+                    name: tuple(tensor.shape) for name, tensor in modality_embeddings.items()
+                },
+                **self._timeline_tensor_meta(input_ids, "input_ids"),
+            ):
+                combined_embeddings = self.align_embeddings_by_token_positions(
+                    modality_embeddings=modality_embeddings,
+                    input_ids=input_ids,
+                    special_token_ids=self.special_token_ids,
+                )
 
-            combined_embeddings, labels, loss_mask, packed_seq_params = (
-                self._prepare_language_inputs(
-                    embeddings=combined_embeddings,
+            with timeline_event(
+                "mimo.prepare_language_inputs",
+                cuda=True,
+                shard_loss_inputs=self.role.is_last_stage(lang_name),
+                **self._timeline_tensor_meta(combined_embeddings, "embeddings"),
+            ):
+                combined_embeddings, labels, loss_mask, packed_seq_params = (
+                    self._prepare_language_inputs(
+                        embeddings=combined_embeddings,
+                        labels=labels,
+                        loss_mask=loss_mask,
+                        packed_seq_params=packed_seq_params,
+                        shard_loss_inputs=self.role.is_last_stage(lang_name),
+                    )
+                )
+
+            with timeline_event(
+                "mimo.language_model",
+                cuda=True,
+                is_first_stage=True,
+                is_last_stage=self.role.is_last_stage(lang_name),
+                **self._timeline_tensor_meta(combined_embeddings, "decoder_input"),
+            ):
+                lm_output = self.language_model(
+                    input_ids=None,
+                    position_ids=None,
+                    decoder_input=combined_embeddings,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    packed_seq_params=packed_seq_params,
+                )
+        else:
+            # Non-first stage: receive hidden states from previous LM stage
+            hidden_states = input_tensors.get(lang_name) if input_tensors else None
+
+            with timeline_event(
+                "mimo.prepare_language_inputs",
+                cuda=True,
+                shard_loss_inputs=self.role.is_last_stage(lang_name),
+                **self._timeline_tensor_meta(hidden_states, "hidden_states"),
+            ):
+                _, labels, loss_mask, packed_seq_params = self._prepare_language_inputs(
+                    embeddings=None,
                     labels=labels,
                     loss_mask=loss_mask,
                     packed_seq_params=packed_seq_params,
                     shard_loss_inputs=self.role.is_last_stage(lang_name),
                 )
-            )
-
-            lm_output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                decoder_input=combined_embeddings,
-                labels=labels,
-                attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
-            )
-        else:
-            # Non-first stage: receive hidden states from previous LM stage
-            hidden_states = input_tensors.get(lang_name) if input_tensors else None
-
-            _, labels, loss_mask, packed_seq_params = self._prepare_language_inputs(
-                embeddings=None,
-                labels=labels,
-                loss_mask=loss_mask,
-                packed_seq_params=packed_seq_params,
-                shard_loss_inputs=self.role.is_last_stage(lang_name),
-            )
 
             # Set input tensor on language model for PP (unwrap DDP to reach GPTModel)
             if hidden_states is not None:
-                underlying_lm = unwrap_model(self.language_model)
-                if hasattr(underlying_lm, 'set_input_tensor'):
-                    underlying_lm.set_input_tensor(hidden_states)
+                with timeline_event(
+                    "mimo.set_language_input_tensor",
+                    **self._timeline_tensor_meta(hidden_states, "hidden_states"),
+                ):
+                    underlying_lm = unwrap_model(self.language_model)
+                    if hasattr(underlying_lm, 'set_input_tensor'):
+                        underlying_lm.set_input_tensor(hidden_states)
 
-            lm_output = self.language_model(
-                input_ids=None,
-                position_ids=None,
-                decoder_input=None,
-                labels=labels,
-                attention_mask=attention_mask,
-                packed_seq_params=packed_seq_params,
-            )
+            with timeline_event(
+                "mimo.language_model",
+                cuda=True,
+                is_first_stage=False,
+                is_last_stage=self.role.is_last_stage(lang_name),
+                **self._timeline_tensor_meta(hidden_states, "hidden_states"),
+            ):
+                lm_output = self.language_model(
+                    input_ids=None,
+                    position_ids=None,
+                    decoder_input=None,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                    packed_seq_params=packed_seq_params,
+                )
 
         # Key output for non-last stages so schedule can route to next LM stage
         if not self.role.is_last_stage(lang_name):

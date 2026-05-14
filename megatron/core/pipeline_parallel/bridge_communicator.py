@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.pipeline_parallel.timeline import timeline_event
 
 
 class CommRole(Enum):
@@ -330,6 +331,31 @@ class BridgeCommunicator:
                         role=CommRole.RECEIVER, recv_from_ranks=[src_rank]
                     )
 
+    def _timeline_meta(self, **metadata):
+        """Return bridge metadata shared by detailed timeline events."""
+        return {
+            "src_module": self.src_module_name,
+            "dest_module": self.dest_module_name,
+            **metadata,
+        }
+
+    @staticmethod
+    def _tensor_timeline_meta(tensor: torch.Tensor, prefix: str = "tensor") -> Dict[str, object]:
+        """Return shape-only tensor metadata without forcing device synchronization."""
+        return {
+            f"{prefix}_shape": tuple(tensor.shape),
+            f"{prefix}_numel": int(tensor.numel()),
+            f"{prefix}_dtype": str(tensor.dtype),
+        }
+
+    @staticmethod
+    def _shapes_timeline_meta(shapes: List[Tuple[int, ...]], prefix: str) -> Dict[str, object]:
+        """Return compact metadata for a list of communicated tensor shapes."""
+        return {
+            f"{prefix}_shapes": [tuple(shape) for shape in shapes],
+            f"{prefix}_numel": [int(torch.Size(shape).numel()) for shape in shapes],
+        }
+
     def send_forward(self, tensor_to_send: torch.Tensor):
         """Send forward activation tensor.
 
@@ -349,14 +375,28 @@ class BridgeCommunicator:
             # Send splits to destination ranks
             num_sends = len(rank_info.send_to_ranks)
             if num_sends > 0:
-                tensor_splits = self._split_tensor_at_batch_dim(tensor_to_send, num_sends)
+                with timeline_event(
+                    "bridge.split.forward",
+                    **self._timeline_meta(
+                        peers=rank_info.send_to_ranks,
+                        num_peers=num_sends,
+                        **self._tensor_timeline_meta(tensor_to_send, "input"),
+                    ),
+                ):
+                    tensor_splits = self._split_tensor_at_batch_dim(tensor_to_send, num_sends)
                 self._communicate_shapes(tensor_to_send_next=tensor_splits)
                 for dest_rank, tensor_split in zip(rank_info.send_to_ranks, tensor_splits):
                     logging.debug(
                         f"[Bridge Comunicator] [send_forward] Rank {self.current_rank} "
                         f"send to rank {dest_rank}"
                     )
-                    dist.send(tensor_split, dst=dest_rank)
+                    with timeline_event(
+                        "bridge.tensor_send.forward.peer",
+                        **self._timeline_meta(
+                            peer_rank=dest_rank, **self._tensor_timeline_meta(tensor_split)
+                        ),
+                    ):
+                        dist.send(tensor_split, dst=dest_rank)
 
     def recv_forward(self) -> torch.Tensor:
         """Receive forward activation tensor.
@@ -399,14 +439,26 @@ class BridgeCommunicator:
                     dtype=self.comm_dtype,
                     requires_grad=True,
                 )
-                dist.recv(tensor_to_recv, src=src_rank)
+                with timeline_event(
+                    "bridge.tensor_recv.forward.peer",
+                    **self._timeline_meta(peer_rank=src_rank, tensor_shape=tuple(shape)),
+                ):
+                    dist.recv(tensor_to_recv, src=src_rank)
                 logging.debug(
                     f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
                     f"received tensor from src rank {src_rank} "
                     f"shape {tensor_to_recv.shape} sum {tensor_to_recv.sum()}"
                 )
                 received_tensors_list.append(tensor_to_recv)
-            aggregated_tensor = torch.cat(received_tensors_list, dim=self._batch_dim)
+            with timeline_event(
+                "bridge.cat.forward",
+                **self._timeline_meta(
+                    num_tensors=len(received_tensors_list),
+                    batch_dim=self._batch_dim,
+                    **self._shapes_timeline_meta(recv_forward_shapes, "input"),
+                ),
+            ):
+                aggregated_tensor = torch.cat(received_tensors_list, dim=self._batch_dim)
             logging.debug(
                 f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
                 f"broadcasting tensor {aggregated_tensor.shape} sum {aggregated_tensor.sum()}"
@@ -416,12 +468,30 @@ class BridgeCommunicator:
             shape_tensor = torch.tensor(
                 aggregated_tensor.shape, device=aggregated_tensor.device, dtype=torch.int64
             )
-            dist.broadcast(shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg)
+            with timeline_event(
+                "bridge.broadcast.forward_shape",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value,
+                    src_rank=self.current_rank,
+                    **self._tensor_timeline_meta(aggregated_tensor),
+                ),
+            ):
+                dist.broadcast(
+                    shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
+                )
 
             # Step 2: broadcast the actual tensor
-            dist.broadcast(
-                aggregated_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.forward_tensor",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value,
+                    src_rank=self.current_rank,
+                    **self._tensor_timeline_meta(aggregated_tensor),
+                ),
+            ):
+                dist.broadcast(
+                    aggregated_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
+                )
 
             return aggregated_tensor
 
@@ -433,9 +503,15 @@ class BridgeCommunicator:
             shape_tensor = torch.empty(
                 (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
             )
-            dist.broadcast(
-                shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.forward_shape",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value, src_rank=self.dest_local_leader_rank
+                ),
+            ):
+                dist.broadcast(
+                    shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
+                )
 
             received_shape = tuple(shape_tensor.tolist())
             received_tensor = torch.empty(
@@ -446,9 +522,19 @@ class BridgeCommunicator:
             )
 
             # Receive the full tensor via broadcast
-            dist.broadcast(
-                received_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.forward_tensor",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value,
+                    src_rank=self.dest_local_leader_rank,
+                    tensor_shape=received_shape,
+                ),
+            ):
+                dist.broadcast(
+                    received_tensor,
+                    src=self.dest_local_leader_rank,
+                    group=self.dest_grid_broadcast_pg,
+                )
 
             logging.debug(
                 f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
@@ -479,7 +565,15 @@ class BridgeCommunicator:
             ), f"Rank {self.current_rank} is not the leader rank"
             # Send gradients back to source ranks
             num_receives = len(rank_info.recv_from_ranks)
-            tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
+            with timeline_event(
+                "bridge.split.backward",
+                **self._timeline_meta(
+                    peers=rank_info.recv_from_ranks,
+                    num_peers=num_receives,
+                    **self._tensor_timeline_meta(grad_tensor, "input"),
+                ),
+            ):
+                tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
             self._communicate_shapes(tensor_to_send_prev=tensor_splits)
             if num_receives > 0:
                 for src_rank, tensor_split in zip(rank_info.recv_from_ranks, tensor_splits):
@@ -489,7 +583,13 @@ class BridgeCommunicator:
                         f"sending gradient to src rank {src_rank} "
                         f"shape {tensor_split.shape} sum {tensor_split.sum()}"
                     )
-                    dist.send(tensor_split, dst=src_rank)
+                    with timeline_event(
+                        "bridge.tensor_send.backward.peer",
+                        **self._timeline_meta(
+                            peer_rank=src_rank, **self._tensor_timeline_meta(tensor_split)
+                        ),
+                    ):
+                        dist.send(tensor_split, dst=src_rank)
 
     def recv_backward(self) -> torch.Tensor:
         """Receive backward gradient tensor.
@@ -528,7 +628,11 @@ class BridgeCommunicator:
                 grad_tensor = torch.empty(
                     grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
                 )
-                dist.recv(grad_tensor, src=dest_rank)
+                with timeline_event(
+                    "bridge.tensor_recv.backward.peer",
+                    **self._timeline_meta(peer_rank=dest_rank, tensor_shape=tuple(grad_shape)),
+                ):
+                    dist.recv(grad_tensor, src=dest_rank)
                 logging.debug(
                     f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
                     f"received gradient from dest rank {dest_rank} "
@@ -537,7 +641,15 @@ class BridgeCommunicator:
                 received_gradients_list.append(grad_tensor)
 
             # Concatenate received gradients
-            aggregated_gradient = torch.cat(received_gradients_list, dim=self._batch_dim)
+            with timeline_event(
+                "bridge.cat.backward",
+                **self._timeline_meta(
+                    num_tensors=len(received_gradients_list),
+                    batch_dim=self._batch_dim,
+                    **self._shapes_timeline_meta(recv_grad_shapes, "input"),
+                ),
+            ):
+                aggregated_gradient = torch.cat(received_gradients_list, dim=self._batch_dim)
             logging.debug(
                 f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
                 f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
@@ -546,12 +658,30 @@ class BridgeCommunicator:
             shape_tensor = torch.tensor(
                 aggregated_gradient.shape, device=torch.cuda.current_device(), dtype=torch.int64
             )
-            dist.broadcast(shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg)
+            with timeline_event(
+                "bridge.broadcast.backward_shape",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value,
+                    src_rank=self.current_rank,
+                    **self._tensor_timeline_meta(aggregated_gradient),
+                ),
+            ):
+                dist.broadcast(
+                    shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
+                )
 
             # Scatter the tensors to all ranks in the group
-            dist.broadcast(
-                aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.backward_tensor",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value,
+                    src_rank=self.current_rank,
+                    **self._tensor_timeline_meta(aggregated_gradient),
+                ),
+            ):
+                dist.broadcast(
+                    aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
+                )
             return aggregated_gradient
 
         elif (
@@ -562,9 +692,15 @@ class BridgeCommunicator:
             shape_tensor = torch.empty(
                 (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
             )
-            dist.broadcast(
-                shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.backward_shape",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value, src_rank=self.src_local_leader_rank
+                ),
+            ):
+                dist.broadcast(
+                    shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
+                )
 
             logging.debug(
                 f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
@@ -575,9 +711,19 @@ class BridgeCommunicator:
                 received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
             )
 
-            dist.broadcast(
-                received_gradient, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.backward_tensor",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value,
+                    src_rank=self.src_local_leader_rank,
+                    tensor_shape=received_shape,
+                ),
+            ):
+                dist.broadcast(
+                    received_gradient,
+                    src=self.src_local_leader_rank,
+                    group=self.src_grid_broadcast_pg,
+                )
             logging.debug(
                 f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
                 f"received gradient from scatter operation, shape {received_gradient.shape}"
@@ -615,7 +761,16 @@ class BridgeCommunicator:
             ), f"Rank {self.current_rank} is not the leader rank"
 
             num_sends = len(rank_info.send_to_ranks)
-            activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
+            with timeline_event(
+                "bridge.split.forward",
+                **self._timeline_meta(
+                    op="send_forward_recv_backward",
+                    peers=rank_info.send_to_ranks,
+                    num_peers=num_sends,
+                    **self._tensor_timeline_meta(input_tensor, "input"),
+                ),
+            ):
+                activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
             # Communicate shapes for both directions (send forward, receive backward)
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
                 tensor_to_send_next=activation_splits, recv_next=True
@@ -655,12 +810,31 @@ class BridgeCommunicator:
                     f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
                     f"executing {len(ops)} simultaneous P2P operations"
                 )
-                reqs = torch.distributed.batch_isend_irecv(ops)
-                for req in reqs:
-                    req.wait()
+                with timeline_event(
+                    "bridge.p2p.forward_backward",
+                    **self._timeline_meta(
+                        peers=rank_info.send_to_ranks,
+                        num_ops=len(ops),
+                        **self._shapes_timeline_meta(
+                            [tuple(tensor.shape) for tensor in activation_splits], "send"
+                        ),
+                        **self._shapes_timeline_meta(recv_grad_shapes, "recv"),
+                    ),
+                ):
+                    reqs = torch.distributed.batch_isend_irecv(ops)
+                    for req in reqs:
+                        req.wait()
 
                 # Concatenate received gradients
-                aggregated_gradient = torch.cat(received_gradients_list, dim=self._batch_dim)
+                with timeline_event(
+                    "bridge.cat.backward",
+                    **self._timeline_meta(
+                        num_tensors=len(received_gradients_list),
+                        batch_dim=self._batch_dim,
+                        **self._shapes_timeline_meta(recv_grad_shapes, "input"),
+                    ),
+                ):
+                    aggregated_gradient = torch.cat(received_gradients_list, dim=self._batch_dim)
                 logging.debug(
                     f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
                     f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
@@ -670,14 +844,30 @@ class BridgeCommunicator:
                 shape_tensor = torch.tensor(
                     tensor_shape_to_broadcast, device=torch.cuda.current_device(), dtype=torch.int64
                 )
-                dist.broadcast(
-                    shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
-                )
+                with timeline_event(
+                    "bridge.broadcast.backward_shape",
+                    **self._timeline_meta(
+                        bridge_role=rank_info.role.value,
+                        src_rank=self.current_rank,
+                        **self._tensor_timeline_meta(aggregated_gradient),
+                    ),
+                ):
+                    dist.broadcast(
+                        shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
+                    )
 
                 # Broadcast the tensors to all ranks in the group
-                dist.broadcast(
-                    aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
-                )
+                with timeline_event(
+                    "bridge.broadcast.backward_tensor",
+                    **self._timeline_meta(
+                        bridge_role=rank_info.role.value,
+                        src_rank=self.current_rank,
+                        **self._tensor_timeline_meta(aggregated_gradient),
+                    ),
+                ):
+                    dist.broadcast(
+                        aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
+                    )
 
                 return aggregated_gradient
 
@@ -689,18 +879,34 @@ class BridgeCommunicator:
             shape_tensor = torch.empty(
                 (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
             )
-            dist.broadcast(
-                shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.backward_shape",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value, src_rank=self.src_local_leader_rank
+                ),
+            ):
+                dist.broadcast(
+                    shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
+                )
 
             # Use the received shape to create tensor for broadcast
             received_shape = tuple(shape_tensor.tolist())
             received_gradient = torch.empty(
                 received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
             )
-            dist.broadcast(
-                received_gradient, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.backward_tensor",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value,
+                    src_rank=self.src_local_leader_rank,
+                    tensor_shape=received_shape,
+                ),
+            ):
+                dist.broadcast(
+                    received_gradient,
+                    src=self.src_local_leader_rank,
+                    group=self.src_grid_broadcast_pg,
+                )
             logging.debug(
                 f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
                 f"received gradient from broadcast, shape {received_gradient.shape}"
@@ -734,7 +940,16 @@ class BridgeCommunicator:
             ), f"Rank {self.current_rank} is not the leader rank"
 
             num_receives = len(rank_info.recv_from_ranks)
-            gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
+            with timeline_event(
+                "bridge.split.backward",
+                **self._timeline_meta(
+                    op="send_backward_recv_forward",
+                    peers=rank_info.recv_from_ranks,
+                    num_peers=num_receives,
+                    **self._tensor_timeline_meta(grad_tensor, "input"),
+                ),
+            ):
+                gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
             # Communicate shapes for both directions (send backward, receive forward)
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
                 tensor_to_send_prev=gradient_splits, recv_prev=True
@@ -779,12 +994,33 @@ class BridgeCommunicator:
                     f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
                     f"executing {len(ops)} simultaneous P2P operations"
                 )
-                reqs = torch.distributed.batch_isend_irecv(ops)
-                for req in reqs:
-                    req.wait()
+                with timeline_event(
+                    "bridge.p2p.backward_forward",
+                    **self._timeline_meta(
+                        peers=rank_info.recv_from_ranks,
+                        num_ops=len(ops),
+                        **self._shapes_timeline_meta(
+                            [tuple(tensor.shape) for tensor in gradient_splits], "send"
+                        ),
+                        **self._shapes_timeline_meta(recv_forward_shapes, "recv"),
+                    ),
+                ):
+                    reqs = torch.distributed.batch_isend_irecv(ops)
+                    for req in reqs:
+                        req.wait()
 
                 # Concatenate received activations
-                aggregated_activation = torch.cat(received_activations_list, dim=self._batch_dim)
+                with timeline_event(
+                    "bridge.cat.forward",
+                    **self._timeline_meta(
+                        num_tensors=len(received_activations_list),
+                        batch_dim=self._batch_dim,
+                        **self._shapes_timeline_meta(recv_forward_shapes, "input"),
+                    ),
+                ):
+                    aggregated_activation = torch.cat(
+                        received_activations_list, dim=self._batch_dim
+                    )
                 logging.debug(
                     f"[Bridge Communicator] [send_backward_recv_forward] Rank {self.current_rank} "
                     f"agg act shape {aggregated_activation.shape} sum {aggregated_activation.sum()}"
@@ -795,14 +1031,32 @@ class BridgeCommunicator:
                 shape_tensor = torch.tensor(
                     tensor_shape_to_scatter, device=torch.cuda.current_device(), dtype=torch.int64
                 )
-                dist.broadcast(
-                    shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
-                )
+                with timeline_event(
+                    "bridge.broadcast.forward_shape",
+                    **self._timeline_meta(
+                        bridge_role=rank_info.role.value,
+                        src_rank=self.current_rank,
+                        **self._tensor_timeline_meta(aggregated_activation),
+                    ),
+                ):
+                    dist.broadcast(
+                        shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
+                    )
 
                 # Scatter the tensors to all ranks in the group
-                dist.broadcast(
-                    aggregated_activation, src=self.current_rank, group=self.dest_grid_broadcast_pg
-                )
+                with timeline_event(
+                    "bridge.broadcast.forward_tensor",
+                    **self._timeline_meta(
+                        bridge_role=rank_info.role.value,
+                        src_rank=self.current_rank,
+                        **self._tensor_timeline_meta(aggregated_activation),
+                    ),
+                ):
+                    dist.broadcast(
+                        aggregated_activation,
+                        src=self.current_rank,
+                        group=self.dest_grid_broadcast_pg,
+                    )
                 return aggregated_activation
 
         elif (
@@ -812,9 +1066,15 @@ class BridgeCommunicator:
             shape_tensor = torch.empty(
                 (self.tensor_ndim,), device=torch.cuda.current_device(), dtype=torch.int64
             )
-            dist.broadcast(
-                shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
-            )
+            with timeline_event(
+                "bridge.broadcast.forward_shape",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value, src_rank=self.dest_local_leader_rank
+                ),
+            ):
+                dist.broadcast(
+                    shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
+                )
 
             # Use the received shape to create tensor for scatter operation
             received_shape = tuple(shape_tensor.tolist())
@@ -824,11 +1084,19 @@ class BridgeCommunicator:
                 dtype=self.comm_dtype,
                 requires_grad=True,
             )
-            dist.broadcast(
-                received_activation,
-                src=self.dest_local_leader_rank,
-                group=self.dest_grid_broadcast_pg,
-            )
+            with timeline_event(
+                "bridge.broadcast.forward_tensor",
+                **self._timeline_meta(
+                    bridge_role=rank_info.role.value,
+                    src_rank=self.dest_local_leader_rank,
+                    tensor_shape=received_shape,
+                ),
+            ):
+                dist.broadcast(
+                    received_activation,
+                    src=self.dest_local_leader_rank,
+                    group=self.dest_grid_broadcast_pg,
+                )
             logging.debug(
                 f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank}  "
                 f"received activation from scatter operation, shape {received_activation.shape}"
@@ -874,6 +1142,8 @@ class BridgeCommunicator:
         ops = []
         recv_forward_shape_tensors = []
         recv_grad_shape_tensors = []
+        send_forward_shapes = []
+        send_grad_shapes = []
 
         if rank_info.role == CommRole.SENDER:
             # Prepare send operations for forward shapes
@@ -883,6 +1153,7 @@ class BridgeCommunicator:
                 )
                 # Add send operations for each destination
                 for dest_rank, tensor in zip(rank_info.send_to_ranks, tensors_to_send):
+                    send_forward_shapes.append(tuple(tensor.shape))
                     send_shape_tensor = torch.tensor(
                         tensor.shape, device=torch.cuda.current_device(), dtype=torch.int64
                     )
@@ -927,6 +1198,7 @@ class BridgeCommunicator:
                 )
 
                 for src_rank, tensor in zip(rank_info.recv_from_ranks, tensors_to_send):
+                    send_grad_shapes.append(tuple(tensor.shape))
                     grad_shape_tensor = torch.tensor(
                         tensor.shape, device=torch.cuda.current_device(), dtype=torch.int64
                     )
@@ -938,9 +1210,40 @@ class BridgeCommunicator:
 
         # Execute all operations in a single batch
         if ops:
-            reqs = torch.distributed.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
+            meta = self._timeline_meta(
+                bridge_role=rank_info.role.value,
+                num_ops=len(ops),
+                send_next=bool(tensor_to_send_next is not None),
+                recv_next=bool(recv_next),
+                recv_prev=bool(recv_prev),
+                send_prev=bool(tensor_to_send_prev is not None),
+                send_next_ranks=(
+                    rank_info.send_to_ranks
+                    if rank_info.role == CommRole.SENDER and tensor_to_send_next is not None
+                    else []
+                ),
+                recv_next_ranks=(
+                    rank_info.send_to_ranks
+                    if rank_info.role == CommRole.SENDER and recv_next
+                    else []
+                ),
+                recv_prev_ranks=(
+                    rank_info.recv_from_ranks
+                    if rank_info.role == CommRole.RECEIVER and recv_prev
+                    else []
+                ),
+                send_prev_ranks=(
+                    rank_info.recv_from_ranks
+                    if rank_info.role == CommRole.RECEIVER and tensor_to_send_prev is not None
+                    else []
+                ),
+                **self._shapes_timeline_meta(send_forward_shapes, "send_forward"),
+                **self._shapes_timeline_meta(send_grad_shapes, "send_grad"),
+            )
+            with timeline_event("bridge.shape_exchange", **meta):
+                reqs = torch.distributed.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
 
         # Extract shapes from received tensors
         for forward_shape_tensor in recv_forward_shape_tensors:

@@ -25,6 +25,8 @@ class PipelineTimelineRecorder:
     metadata: dict[str, Any] = field(default_factory=dict)
     cuda_events: bool = False
     nvtx: bool = False
+    iteration_start: Optional[int] = None
+    iteration_end: Optional[int] = None
     iteration: Optional[int] = None
     _records: list[dict[str, Any]] = field(default_factory=list)
     _context_stack: list[dict[str, Any]] = field(default_factory=list)
@@ -73,6 +75,7 @@ class PipelineTimelineRecorder:
                 "world_size": self.world_size,
                 "role": self.role,
                 "start_time_ns": start_time_ns,
+                "start_perf_ns": start_perf_ns,
                 "duration_us": (end_perf_ns - start_perf_ns) / 1000.0,
                 "ok": ok,
             }
@@ -109,6 +112,18 @@ class PipelineTimelineRecorder:
             self._file.close()
             self._file = None
 
+    def is_active(self) -> bool:
+        """Return whether the current iteration should be recorded."""
+        if self.iteration_start is None and self.iteration_end is None:
+            return True
+        if self.iteration is None:
+            return False
+        if self.iteration_start is not None and self.iteration < self.iteration_start:
+            return False
+        if self.iteration_end is not None and self.iteration > self.iteration_end:
+            return False
+        return True
+
     def _format_nvtx(self, event: str, metadata: dict[str, Any]) -> str:
         microbatch = metadata.get("microbatch")
         if microbatch is None:
@@ -129,6 +144,8 @@ def configure_pipeline_timeline(
     metadata: Optional[dict[str, Any]] = None,
     cuda_events: bool = False,
     nvtx: bool = False,
+    iteration_start: Optional[int] = None,
+    iteration_end: Optional[int] = None,
 ) -> None:
     """Configure the process-local pipeline timeline recorder."""
     global _RECORDER
@@ -144,6 +161,8 @@ def configure_pipeline_timeline(
         metadata=metadata or {},
         cuda_events=cuda_events,
         nvtx=nvtx,
+        iteration_start=iteration_start,
+        iteration_end=iteration_end,
     )
 
 
@@ -169,9 +188,22 @@ def close_pipeline_timeline() -> None:
 
 def timeline_event(event: str, cuda: bool = False, **metadata):
     """Return a no-op or recording context manager for one timeline event."""
-    if _RECORDER is None:
+    if _RECORDER is None or not _RECORDER.is_active():
         return contextlib.nullcontext()
     return _RECORDER.record(event, cuda=cuda, **metadata)
+
+
+def is_pipeline_timeline_active() -> bool:
+    """Return whether the current rank/iteration is writing pipeline timeline events."""
+    return _RECORDER is not None and _RECORDER.is_active()
+
+
+def timeline_instant(event: str, **metadata) -> None:
+    """Write a zero-work timeline event with metadata for the current rank/iteration."""
+    if _RECORDER is None or not _RECORDER.is_active():
+        return
+    with _RECORDER.record(event, **metadata):
+        pass
 
 
 def _jsonable(value):
