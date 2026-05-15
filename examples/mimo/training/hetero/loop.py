@@ -113,10 +113,13 @@ def build_pipeline_communicator(
     model: MimoModel, topology: HeteroTopology
 ) -> MultiModulePipelineCommunicator:
     """Build the MIMO pipeline communicator used by the train schedule."""
+    module_output_ndim = {}
+    if topology.encoder_grid is not None:
+        module_output_ndim[topology.encoder_name] = 2
     return MultiModulePipelineCommunicator(
         topology.module_to_grid_map,
         topology.module_dependency_map,
         model.config,
         dim_mapping={"s": 0, "h": 2, "b": 1},
-        module_output_ndim={topology.encoder_name: 2},
+        module_output_ndim=module_output_ndim,
     )

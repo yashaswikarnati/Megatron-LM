@@ -21,8 +21,10 @@ def build_energon_iterator(args, topology):
 
     encoder_grid = topology.encoder_grid
     llm_grid = topology.llm_grid
-    encoder_needs_data = is_rank_in_grid(encoder_grid) and is_pp_first_stage(
-        encoder_grid.get_pg("pp")
+    encoder_needs_data = (
+        encoder_grid is not None
+        and is_rank_in_grid(encoder_grid)
+        and is_pp_first_stage(encoder_grid.get_pg("pp"))
     )
     llm_needs_data = is_rank_in_grid(llm_grid) and (
         is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp"))

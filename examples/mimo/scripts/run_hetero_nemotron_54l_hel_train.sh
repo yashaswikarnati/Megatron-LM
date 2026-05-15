@@ -56,12 +56,18 @@ LLM_PP="${LLM_PP:-1}"
 LLM_DP="${LLM_DP:-64}"
 LLM_EP="${LLM_EP:-16}"
 LLM_EXPT_TP="${LLM_EXPT_TP:-1}"
+LLM_ONLY="${LLM_ONLY:-0}"
 ENABLE_EXPERIMENTAL="${ENABLE_EXPERIMENTAL:-1}"
 MOE_ROUTER_FORCE_LOAD_BALANCING="${MOE_ROUTER_FORCE_LOAD_BALANCING:-0}"
 
 ENCODER_SIZE=$((ENCODER_TP * ENCODER_CP * ENCODER_PP * ENCODER_DP))
 LLM_SIZE=$((LLM_TP * LLM_CP * LLM_PP * LLM_DP))
-LLM_OFFSET="${LLM_OFFSET:-${ENCODER_SIZE}}"
+if [[ "${LLM_ONLY}" == "1" || "${LLM_ONLY}" == "true" ]]; then
+  ENCODER_SIZE=0
+  LLM_OFFSET="${LLM_OFFSET:-0}"
+else
+  LLM_OFFSET="${LLM_OFFSET:-${ENCODER_SIZE}}"
+fi
 EXPECTED_WORLD_SIZE=$((ENCODER_SIZE + LLM_SIZE))
 LLM_EXPT_DP="${LLM_EXPT_DP:-$((LLM_SIZE / (LLM_EXPT_TP * LLM_EP * LLM_PP)))}"
 
@@ -193,6 +199,7 @@ if [[ "${RANK_ID}" -eq 0 ]]; then
   echo "=== Hetero MIMO Nemotron6-MoE VLM 54L HEL training ==="
   echo "model_provider=${MODEL_PROVIDER}"
   echo "stage=${TRAINING_STAGE} train_iters=${TRAIN_ITERS} mbs=${MICRO_BATCH_SIZE} microbatches=${NUM_MICROBATCHES} gbs=${GLOBAL_BATCH_SIZE}"
+  echo "llm_only=${LLM_ONLY}"
   echo "layout=encoder(tp=${ENCODER_TP},cp=${ENCODER_CP},pp=${ENCODER_PP},dp=${ENCODER_DP},ep=${ENCODER_EP}) llm(tp=${LLM_TP},cp=${LLM_CP},pp=${LLM_PP},dp=${LLM_DP},ep=${LLM_EP},etp=${LLM_EXPT_TP},edp=${LLM_EXPT_DP}) world=${EXPECTED_WORLD_SIZE}"
   echo "enable_experimental=${ENABLE_EXPERIMENTAL}"
   echo "moe_router_force_load_balancing=${MOE_ROUTER_FORCE_LOAD_BALANCING}"
@@ -217,6 +224,9 @@ if [[ "${ENABLE_EXPERIMENTAL}" == "1" || "${ENABLE_EXPERIMENTAL}" == "true" ]]; 
 fi
 if [[ "${MOE_ROUTER_FORCE_LOAD_BALANCING}" == "1" || "${MOE_ROUTER_FORCE_LOAD_BALANCING}" == "true" ]]; then
   MODEL_ARGS+=(--moe-router-force-load-balancing)
+fi
+if [[ "${LLM_ONLY}" == "1" || "${LLM_ONLY}" == "true" ]]; then
+  MODEL_ARGS+=(--llm-only)
 fi
 
 CMD=(

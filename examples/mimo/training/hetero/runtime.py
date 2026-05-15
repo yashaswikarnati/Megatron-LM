@@ -29,7 +29,9 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
     language_pg = topology.language_pg
     vision_pg = topology.vision_pg
     rank_in_language_grid = is_rank_in_grid(topology.llm_grid)
-    rank_in_encoder_grid = is_rank_in_grid(topology.encoder_grid)
+    rank_in_encoder_grid = topology.encoder_grid is not None and is_rank_in_grid(
+        topology.encoder_grid
+    )
     debug_rank(
         "building model specs "
         f"rank_in_encoder={rank_in_encoder_grid} rank_in_language={rank_in_language_grid}"
@@ -39,18 +41,23 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
     if rank_in_language_grid:
         configure_module_rng(args, language_pg, role_seed_offset=20_000)
     elif rank_in_encoder_grid:
+        assert vision_pg is not None
         configure_module_rng(args, vision_pg, role_seed_offset=10_000)
+
+    modality_submodules_spec = {}
+    special_token_ids = {}
+    if topology.encoder_grid is not None:
+        modality_submodules_spec[topology.encoder_name] = vision_submodules_spec(
+            args, vision_pg if rank_in_encoder_grid else None, topology.encoder_grid
+        )
+        special_token_ids[topology.encoder_name] = args.image_token_id
 
     mimo_config = MimoModelConfig(
         language_model_spec=language_model_spec(
             args, language_pg if rank_in_language_grid else None, topology.llm_grid
         ),
-        modality_submodules_spec={
-            topology.encoder_name: vision_submodules_spec(
-                args, vision_pg if rank_in_encoder_grid else None, topology.encoder_grid
-            )
-        },
-        special_token_ids={topology.encoder_name: args.image_token_id},
+        modality_submodules_spec=modality_submodules_spec,
+        special_token_ids=special_token_ids,
         module_to_grid_map=topology.module_to_grid_map,
     )
 
@@ -96,7 +103,11 @@ def wrap_active_modules_with_ddp(
         )
         debug_rank("language model DDP ready")
 
-    if topology.encoder_name in mimo_model.modality_submodules:
+    if (
+        topology.encoder_grid is not None
+        and topology.encoder_name in mimo_model.modality_submodules
+    ):
+        assert topology.vision_pg is not None
         submodule = mimo_model.modality_submodules[topology.encoder_name]
         if submodule is None:
             return

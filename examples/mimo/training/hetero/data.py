@@ -31,7 +31,11 @@ def validate_data_iterator(
     args: argparse.Namespace, data_iterator, topology: HeteroTopology
 ) -> None:
     """Run data-provider checks that must happen outside the pipeline schedule."""
-    if args.dataset_provider == "energon_multimodal" and args.validate_energon_data_alignment:
+    if (
+        args.dataset_provider == "energon_multimodal"
+        and args.validate_energon_data_alignment
+        and topology.encoder_grid is not None
+    ):
         from examples.mimo.data.hetero_energon import validate_energon_data_alignment
 
         validate_energon_data_alignment(data_iterator, topology)
@@ -42,12 +46,25 @@ def select_mock_data_iterator(
 ) -> Optional[MockVLMIterator]:
     """Create the per-role mock-data iterator needed by local ranks."""
     llm_mbs = args.micro_batch_size
+    encoder_grid = topology.encoder_grid
+    llm_grid = topology.llm_grid
+    if encoder_grid is None:
+        llm_needs_data = is_rank_in_grid(llm_grid) and (
+            is_pp_first_stage(llm_grid.get_pg("pp")) or is_pp_last_stage(llm_grid.get_pg("pp"))
+        )
+        if llm_needs_data:
+            return MockVLMIterator(
+                args,
+                llm_mbs,
+                topology.encoder_name,
+                get_mock_data_seed(args, llm_grid, module_seed_offset=100_000),
+            )
+        return None
+
     if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
         raise ValueError("micro_batch_size * llm_dp must be divisible by encoder_dp")
     encoder_mbs = args.micro_batch_size * args.llm_dp // args.encoder_dp
 
-    encoder_grid = topology.encoder_grid
-    llm_grid = topology.llm_grid
     encoder_needs_data = is_rank_in_grid(encoder_grid) and is_pp_first_stage(
         encoder_grid.get_pg("pp")
     )

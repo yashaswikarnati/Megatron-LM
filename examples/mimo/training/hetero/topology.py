@@ -28,10 +28,10 @@ LanguageEmbeddingGroups = dict[tuple[int, ...], Optional[dist.ProcessGroup]]
 class HeteroTopology:
     """Process groups and rank topology for one hetero MIMO run."""
 
-    encoder_grid: HyperCommGrid
+    encoder_grid: Optional[HyperCommGrid]
     llm_grid: HyperCommGrid
     language_pg: ProcessGroupCollection
-    vision_pg: ProcessGroupCollection
+    vision_pg: Optional[ProcessGroupCollection]
     schedule_pg_collection: MultiModuleProcessGroupCollection
     language_embedding_groups: LanguageEmbeddingGroups
     encoder_size: int
@@ -41,17 +41,22 @@ class HeteroTopology:
     @property
     def module_to_grid_map(self) -> dict[str, HyperCommGrid]:
         """Return the MIMO module-to-grid mapping consumed by schedules and models."""
+        if self.encoder_grid is None:
+            return {MIMO_LANGUAGE_MODULE_KEY: self.llm_grid}
         return {self.encoder_name: self.encoder_grid, MIMO_LANGUAGE_MODULE_KEY: self.llm_grid}
 
     @property
     def module_dependency_map(self) -> dict[str, list[str]]:
         """Return the static encoder-to-language MIMO dependency graph."""
+        if self.encoder_grid is None:
+            return {MIMO_LANGUAGE_MODULE_KEY: []}
         return {self.encoder_name: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []}
 
     def destroy(self) -> None:
         """Destroy all process groups owned by this topology."""
         destroy_embedding_groups(self.language_embedding_groups)
-        self.encoder_grid.destroy()
+        if self.encoder_grid is not None:
+            self.encoder_grid.destroy()
         self.llm_grid.destroy()
         BridgeCommunicator.destroy_broadcast_pgs()
 
@@ -62,17 +67,18 @@ def create_topology(args: argparse.Namespace, encoder_size: int, llm_size: int) 
     llm_grid = None
     language_embedding_groups: Optional[LanguageEmbeddingGroups] = None
     try:
-        debug_rank("creating encoder grid")
-        encoder_grid = create_hypercomm_grid(
-            offset=args.encoder_offset,
-            tp=args.encoder_tp,
-            cp=args.encoder_cp,
-            pp=args.encoder_pp,
-            dp=args.encoder_dp,
-            ep=args.encoder_ep,
-            expt_tp=args.encoder_expt_tp,
-            expt_dp=args.encoder_expt_dp,
-        )
+        if not args.llm_only:
+            debug_rank("creating encoder grid")
+            encoder_grid = create_hypercomm_grid(
+                offset=args.encoder_offset,
+                tp=args.encoder_tp,
+                cp=args.encoder_cp,
+                pp=args.encoder_pp,
+                dp=args.encoder_dp,
+                ep=args.encoder_ep,
+                expt_tp=args.encoder_expt_tp,
+                expt_dp=args.encoder_expt_dp,
+            )
         debug_rank("creating language grid")
         llm_grid = create_hypercomm_grid(
             offset=args.llm_offset,
@@ -91,7 +97,11 @@ def create_topology(args: argparse.Namespace, encoder_size: int, llm_size: int) 
         language_pg = populate_language_embedding_groups(
             get_pg_collection(llm_grid), language_embedding_groups
         )
-        vision_pg = clear_embedding_groups(get_pg_collection(encoder_grid))
+        vision_pg = (
+            None
+            if encoder_grid is None
+            else clear_embedding_groups(get_pg_collection(encoder_grid))
+        )
         schedule_pg_collection = build_schedule_pg_collection(
             ENCODER_MODULE_NAME, encoder_grid, llm_grid, vision_pg, language_pg
         )
@@ -265,15 +275,16 @@ def clear_embedding_groups(pg_collection: ProcessGroupCollection) -> ProcessGrou
 
 def build_schedule_pg_collection(
     encoder_name: str,
-    encoder_grid: HyperCommGrid,
+    encoder_grid: Optional[HyperCommGrid],
     llm_grid: HyperCommGrid,
-    vision_pg: ProcessGroupCollection,
+    vision_pg: Optional[ProcessGroupCollection],
     language_pg: ProcessGroupCollection,
 ) -> MultiModuleProcessGroupCollection:
     """Build the schedule-facing process group collection for this rank."""
     module_pgs = {}
     language_model_module_name = None
-    if is_rank_in_grid(encoder_grid):
+    if encoder_grid is not None and is_rank_in_grid(encoder_grid):
+        assert vision_pg is not None
         module_pgs[encoder_name] = vision_pg
     if is_rank_in_grid(llm_grid):
         module_pgs[MIMO_LANGUAGE_MODULE_KEY] = language_pg

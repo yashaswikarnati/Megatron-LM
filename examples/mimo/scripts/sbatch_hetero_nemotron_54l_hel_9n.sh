@@ -131,6 +131,7 @@ export ENCODER_CP="${ENCODER_CP:-1}"
 export ENCODER_PP="${ENCODER_PP:-1}"
 export ENCODER_DP="${ENCODER_DP:-8}"
 export ENCODER_EP="${ENCODER_EP:-1}"
+export LLM_ONLY="${LLM_ONLY:-0}"
 export LLM_TP="${LLM_TP:-4}"
 export LLM_CP="${LLM_CP:-1}"
 export LLM_PP="${LLM_PP:-1}"
@@ -147,10 +148,15 @@ export CHECK_HEL_PATHS="${CHECK_HEL_PATHS:-1}"
 export ENABLE_EXPERIMENTAL="${ENABLE_EXPERIMENTAL:-1}"
 export MOE_ROUTER_FORCE_LOAD_BALANCING="${MOE_ROUTER_FORCE_LOAD_BALANCING:-1}"
 
-WORLD_SIZE=$((ENCODER_TP * ENCODER_CP * ENCODER_PP * ENCODER_DP + LLM_TP * LLM_CP * LLM_PP * LLM_DP))
-if [[ "${WORLD_SIZE}" -ne 72 ]]; then
-  echo "ERROR: This 9-node sbatch expects 72 ranks, but layout computed WORLD_SIZE=${WORLD_SIZE}" >&2
-  exit 1
+if [[ "${LLM_ONLY}" == "1" || "${LLM_ONLY}" == "true" ]]; then
+  export LLM_OFFSET="${LLM_OFFSET:-0}"
+  WORLD_SIZE=$((LLM_TP * LLM_CP * LLM_PP * LLM_DP))
+else
+  WORLD_SIZE=$((ENCODER_TP * ENCODER_CP * ENCODER_PP * ENCODER_DP + LLM_TP * LLM_CP * LLM_PP * LLM_DP))
+  if [[ "${WORLD_SIZE}" -ne 72 ]]; then
+    echo "ERROR: This 9-node sbatch expects 72 ranks, but layout computed WORLD_SIZE=${WORLD_SIZE}" >&2
+    exit 1
+  fi
 fi
 if [[ -n "${SLURM_NTASKS:-}" && "${SLURM_NTASKS}" -ne "${WORLD_SIZE}" ]]; then
   echo "ERROR: SLURM_NTASKS=${SLURM_NTASKS}, expected ${WORLD_SIZE}" >&2
@@ -185,6 +191,7 @@ echo "container_image=${CONTAINER_IMAGE}"
 echo "env_root=${ENV_ROOT}"
 echo "world_size=${WORLD_SIZE}"
 echo "gbs=${GLOBAL_BATCH_SIZE} microbatches=${NUM_MICROBATCHES} train_iters=${TRAIN_ITERS}"
+echo "llm_only=${LLM_ONLY}"
 echo "layout=encoder(tp=${ENCODER_TP},dp=${ENCODER_DP}) llm(tp=${LLM_TP},dp=${LLM_DP},ep=${LLM_EP},etp=${LLM_EXPT_TP})"
 echo "timeline=${ENABLE_TIMELINE:-1} timeline_dir=${TIMELINE_DIR}"
 echo "================================================"

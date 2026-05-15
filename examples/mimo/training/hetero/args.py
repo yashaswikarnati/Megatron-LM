@@ -42,6 +42,14 @@ def parse_args() -> argparse.Namespace:
     grid.add_argument("--llm-ep", type=int, default=2)
     grid.add_argument("--llm-expt-tp", type=int, default=1)
     grid.add_argument("--llm-expt-dp", type=int, default=None)
+    grid.add_argument(
+        "--llm-only",
+        action="store_true",
+        help=(
+            "Run only the MIMO language module on the LLM grid. This keeps the MIMO "
+            "training/data path but does not create encoder ranks or bridge communicators."
+        ),
+    )
 
     add_model_provider_args(parser)
 
@@ -226,16 +234,30 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
         validate_energon_data_args(args)
     if args.num_moe_experts > 0 and args.num_moe_experts % args.llm_ep != 0:
         raise ValueError("--num-moe-experts must be divisible by --llm-ep")
-    if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
-        raise ValueError("--micro-batch-size * --llm-dp must be divisible by --encoder-dp")
-
     if args.save_interval is not None and args.save_interval < 1:
         raise ValueError("--save-interval must be >= 1 when set")
     if args.save_interval is not None and args.save is None:
         raise ValueError("--save-interval requires --save")
 
-    encoder_size = args.encoder_tp * args.encoder_cp * args.encoder_pp * args.encoder_dp
     llm_size = args.llm_tp * args.llm_cp * args.llm_pp * args.llm_dp
+    if args.llm_only:
+        if args.llm_offset != 0:
+            raise ValueError(
+                "--llm-only requires --llm-offset 0 so language ranks cover WORLD_SIZE"
+            )
+        llm_ranks = set(range(args.llm_offset, args.llm_offset + llm_size))
+        all_ranks = set(range(world_size))
+        if llm_ranks != all_ranks:
+            raise ValueError(
+                "--llm-only requires the language grid to cover every torchrun rank exactly "
+                f"once; covered={sorted(llm_ranks)}, world={sorted(all_ranks)}"
+            )
+        return 0, llm_size
+
+    if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
+        raise ValueError("--micro-batch-size * --llm-dp must be divisible by --encoder-dp")
+
+    encoder_size = args.encoder_tp * args.encoder_cp * args.encoder_pp * args.encoder_dp
     encoder_ranks = set(range(args.encoder_offset, args.encoder_offset + encoder_size))
     llm_ranks = set(range(args.llm_offset, args.llm_offset + llm_size))
     all_ranks = set(range(world_size))
@@ -262,8 +284,12 @@ def validate_energon_data_args(args: argparse.Namespace) -> None:
         raise ValueError("--tokenizer-model is required for --dataset-provider energon_multimodal")
     if args.model_provider not in (NEMOTRON_20L_MODEL_PROVIDER, NEMOTRON_54L_MODEL_PROVIDER):
         raise ValueError("energon_multimodal is currently wired for Nemotron MoE VLM providers")
-    if args.encoder_pp != 1 or args.llm_pp != 1:
-        raise ValueError("energon_multimodal currently supports encoder and LLM PP size 1")
+    if args.llm_pp != 1:
+        raise ValueError("energon_multimodal currently supports LLM PP size 1")
+    if args.llm_only:
+        return
+    if args.encoder_pp != 1:
+        raise ValueError("energon_multimodal currently supports encoder PP size 1")
     if args.encoder_dp > args.llm_dp:
         raise ValueError(
             "energon_multimodal currently supports fan-out only: --encoder-dp must be "

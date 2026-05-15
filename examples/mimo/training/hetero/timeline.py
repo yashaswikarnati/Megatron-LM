@@ -73,8 +73,10 @@ def select_timeline_ranks(
     return {int(item) for item in scope.split(",") if item.strip()}
 
 
-def ranks_for_dp_replica(grid: HyperCommGrid, dp_replica: int) -> set[int]:
+def ranks_for_dp_replica(grid: Optional[HyperCommGrid], dp_replica: int) -> set[int]:
     """Return all ranks that belong to one dense DP replica of a grid."""
+    if grid is None:
+        return set()
     ranks = set()
     for rank in range(grid.rank_offset, grid.rank_offset + grid.size):
         coords = grid_coords(grid, rank)
@@ -88,6 +90,8 @@ def rank_role_and_coords(
 ) -> tuple[str, dict[str, int | str]]:
     """Return role and dense-grid coordinates for timeline metadata."""
     for role, grid in (("encoder", topology.encoder_grid), ("llm", topology.llm_grid)):
+        if grid is None:
+            continue
         if grid.rank_offset <= rank < grid.rank_offset + grid.size:
             coords = grid_coords(grid, rank)
             role_coords = {f"{role}_{key}": value for key, value in coords.items()}
