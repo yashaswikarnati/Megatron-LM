@@ -56,10 +56,25 @@ def _randomize_params(model, seed):
             p.random_()
 
 
-def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seed):
+def _create_model_and_optimizer(
+    encoder_grid,
+    llm_grid,
+    hidden_size,
+    num_layers,
+    vocab_size,
+    seed,
+    use_distributed_optimizer=False,
+):
     """Create MIMO model with DDP + optimizer, do a fake step to populate optimizer state.
 
     Caller must call create_all_embedding_groups() before this function.
+
+    With ``use_distributed_optimizer=False`` (default) the inner optimizer is
+    Float16Optimizer, which exercises the MIMO-specific param_groups/grad_scaler
+    extraction in sharded_state_dict. With ``use_distributed_optimizer=True`` the
+    inner is a ChainedOptimizer of DistributedOptimizers, exercising the
+    ``mimo.{name}.`` prefix walk and the ``_extract_param_state_sharding_type``
+    helper that wraps DistributedOptimizer's per-module sharding-type string.
     """
     torch.manual_seed(seed)
 
@@ -74,22 +89,27 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
     )
     _randomize_params(mimo_model, seed)
 
-    # Use Float16Optimizer (not DistributedOptimizer) to exercise the MIMO-specific
-    # param_groups/grad_scaler extraction in sharded_state_dict. DistributedOptimizer
-    # handles its own checkpointing internally and our code is transparent to it.
     opt_config = OptimizerConfig(
         optimizer='adam',
         lr=1e-4,
         weight_decay=0.01,
         clip_grad=1.0,
         bf16=True,
-        use_distributed_optimizer=False,
+        use_distributed_optimizer=use_distributed_optimizer,
     )
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
 
-    # Fake backward + step to populate optimizer state (Adam m/v)
+    # Fake backward + step to populate optimizer state (Adam m/v).
+    # DistributedOptimizer reads grads from each DDP wrapper's main_grad buffer
+    # rather than from param.grad, so populate the buffer directly.
     for param in mimo_model.parameters():
-        param.grad = torch.randn_like(param)
+        if not param.requires_grad:
+            continue
+        grad = torch.randn_like(param)
+        if hasattr(param, "main_grad") and param.main_grad is not None:
+            param.main_grad.copy_(grad.to(param.main_grad.dtype))
+        else:
+            param.grad = grad
     optimizer.step()
 
     return mimo_model, optimizer
@@ -107,6 +127,7 @@ def run_checkpoint_test(
     hidden_size=256,
     num_layers=2,
     vocab_size=1000,
+    use_distributed_optimizer=False,
 ):
     """Save model + optimizer checkpoint, load into fresh instances, verify match."""
     # Clear NVTE env vars that the conftest set_env fixture sets to '0'.
@@ -123,7 +144,13 @@ def run_checkpoint_test(
 
     # --- Create model A + optimizer, snapshot state ---
     model_a, optimizer_a = _create_model_and_optimizer(
-        encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seed=1
+        encoder_grid,
+        llm_grid,
+        hidden_size,
+        num_layers,
+        vocab_size,
+        seed=1,
+        use_distributed_optimizer=use_distributed_optimizer,
     )
     params_a = {name: p.clone() for name, p in model_a.named_parameters()}
 
@@ -147,7 +174,13 @@ def run_checkpoint_test(
 
         # --- Create model B + optimizer with different weights (reuse same grids) ---
         model_b, optimizer_b = _create_model_and_optimizer(
-            encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seed=2
+            encoder_grid,
+            llm_grid,
+            hidden_size,
+            num_layers,
+            vocab_size,
+            seed=2,
+            use_distributed_optimizer=use_distributed_optimizer,
         )
 
         # Load model
@@ -270,4 +303,29 @@ class TestMimoCheckpoint:
             llm_offset=4,
             hidden_size=256,
             num_layers=2,
+        )
+
+    def test_encoder_tp2_llm_tp2_pp3_distributed_optimizer(self):
+        """Same shape as test_encoder_tp2_llm_tp2_pp3 but with DistributedOptimizer.
+
+        Exercises the `mimo.{name}.` ShardedObject-key prefix walk that prevents
+        the two branches' optimizers from colliding, and the new
+        `_extract_param_state_sharding_type` helper that re-routes
+        DistributedOptimizer's top-level sharding-type string through a per-module
+        ShardedObject (so non-rank-0 owners don't lose it on reload).
+        """
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        run_checkpoint_test(
+            encoder_tp=2,
+            encoder_pp=1,
+            encoder_dp=1,
+            encoder_offset=0,
+            llm_tp=2,
+            llm_pp=3,
+            llm_dp=1,
+            llm_offset=2,
+            hidden_size=256,
+            num_layers=3,
+            use_distributed_optimizer=True,
         )

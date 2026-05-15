@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -164,6 +165,7 @@ class MimoOptimizer(MegatronOptimizer):
             for sub_sd, inner_opt in _iter_optimizer_sub_dicts(module_sd, info.optimizer):
                 _restore_param_groups(sub_sd, inner_opt, name)
                 _restore_grad_scaler(sub_sd)
+                _restore_param_state_sharding_type(sub_sd)
 
             info.optimizer.load_state_dict(module_sd)
 
@@ -186,6 +188,12 @@ class MimoOptimizer(MegatronOptimizer):
                     suffix = f'.{idx}' if idx > 0 else ''
                     _extract_param_groups(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
+                    _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
+
+                # Namespace every internal ShardedBase key with the submodule name
+                # so two module optimizers (e.g. 'language' + 'images') don't collide
+                # on identical inner keys like 'chained_0.optimizer.distributed.*'.
+                add_prefix_for_sharding(module_sd, f'mimo.{name}.')
 
                 sharded_state[name] = module_sd
             else:
@@ -274,11 +282,40 @@ def _restore_grad_scaler(sub_sd):
             break
 
 
+def _extract_param_state_sharding_type(sub_sd, module_name, suffix, replica_id):
+    """Save: extract DistributedOptimizer.param_state_sharding_type into a ShardedObject.
+
+    This top-level key is a configuration string set by `DistributedOptimizer.sharded_state_dict`
+    and re-read by `DistributedOptimizer.load_state_dict`. Without wrapping it as a sharded
+    object the value lands on rank 0's common.pt only, so non-rank-0 module owners
+    (e.g. the language optimizer in a non-colocated layout) lose it on reload.
+    """
+    if 'param_state_sharding_type' in sub_sd:
+        value = sub_sd.pop('param_state_sharding_type')
+        sub_sd[f'_mimo_param_state_sharding_type{suffix}'] = ShardedObject(
+            f'optimizer.mimo.{module_name}{suffix}.param_state_sharding_type',
+            value,
+            (1,),
+            (0,),
+            replica_id=replica_id,
+        )
+
+
+def _restore_param_state_sharding_type(sub_sd):
+    """Load: restore param_state_sharding_type from its ShardedObject key."""
+    for k in list(sub_sd.keys()):
+        if k.startswith('_mimo_param_state_sharding_type'):
+            sub_sd['param_state_sharding_type'] = sub_sd.pop(k)
+            break
+
+
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Includes pp_rank so only one PP stage writes the metadata,
-    and dp_rank so only dp_rank=0 writes (others are replicas).
+    Includes pp_rank, tp_rank, and dp_rank so that within a given PP stage only the
+    rank with (tp=0, dp=0) is the primary writer and the others are recognized as
+    replicas. Without `tp_rank` the framework sees two ranks claiming the same
+    primary shard and aborts with 'Duplicate ShardedObject keys'.
     """
     assert pg_collection is not None, "pg_collection required for checkpoint replica_id"
     assert (
@@ -287,7 +324,9 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     assert (
         hasattr(pg_collection, 'dp') and pg_collection.dp is not None
     ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (0, pg_collection.pp.rank(), pg_collection.dp.rank())
+    tp = getattr(pg_collection, 'tp', None)
+    tp_rank = tp.rank() if tp is not None else 0
+    return (pg_collection.pp.rank(), tp_rank, pg_collection.dp.rank())
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:

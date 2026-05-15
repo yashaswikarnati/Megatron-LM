@@ -135,6 +135,72 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--seed", type=int, default=12345)
     train.add_argument("--log-interval", type=int, default=1)
 
+    ckpt = parser.add_argument_group("checkpointing")
+    ckpt.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="Directory to save distributed checkpoints into. Each save creates iter_NNNNNNN/.",
+    )
+    ckpt.add_argument(
+        "--load",
+        type=str,
+        default=None,
+        help=(
+            "Directory to resume from. If the directory has no completed checkpoint, "
+            "training starts from iteration 0."
+        ),
+    )
+    ckpt.add_argument(
+        "--save-interval",
+        type=int,
+        default=None,
+        help=(
+            "Iteration interval between checkpoint saves. When unset, --save still "
+            "produces exactly one checkpoint at --train-iters (the final iter). Set to "
+            "an integer >=1 for periodic saves; the final iter is also always saved."
+        ),
+    )
+    ckpt.add_argument("--no-save-optim", action="store_true", help="Skip optimizer state on save.")
+    ckpt.add_argument(
+        "--no-load-optim",
+        action="store_true",
+        help="Skip optimizer state on load (fresh optimizer at the loaded iteration).",
+    )
+    ckpt.add_argument(
+        "--no-load-scheduler", action="store_true", help="Skip LR/WD scheduler state on load."
+    )
+    ckpt.add_argument(
+        "--no-save-rng", action="store_true", help="Skip Python/NumPy/Torch/CUDA RNG state on save."
+    )
+    ckpt.add_argument(
+        "--no-load-rng",
+        action="store_true",
+        help="Skip Python/NumPy/Torch/CUDA RNG state on load (start with fresh RNG).",
+    )
+    ckpt.add_argument(
+        "--finetune",
+        action="store_true",
+        help=(
+            "Treat the load directory as a pretrained checkpoint: restart from iteration 0 and "
+            "skip optimizer + scheduler state regardless of the other flags."
+        ),
+    )
+    ckpt.add_argument(
+        "--dist-ckpt-optim-fully-reshardable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the 'fully_reshardable' DistributedOptimizer sharding type so a saved "
+            "checkpoint can be reloaded under a different TP/EP layout. Defaults to False "
+            "('dp_reshardable', DP-only reshardable, lower save-time memory). Enable when "
+            "you intend to change --llm-tp / --llm-ep on resume. WARNING: this gathers "
+            "the full per-DP optimizer state on DP rank 0 during save; on <80 GB GPUs "
+            "(or when running near peak memory) the gather will OOM. Prefer leaving this "
+            "False unless you actually need cross-TP/EP resharding."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -163,6 +229,11 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
         raise ValueError("--micro-batch-size * --llm-dp must be divisible by --encoder-dp")
 
+    if args.save_interval is not None and args.save_interval < 1:
+        raise ValueError("--save-interval must be >= 1 when set")
+    if args.save_interval is not None and args.save is None:
+        raise ValueError("--save-interval requires --save")
+
     encoder_size = args.encoder_tp * args.encoder_cp * args.encoder_pp * args.encoder_dp
     llm_size = args.llm_tp * args.llm_cp * args.llm_pp * args.llm_dp
     encoder_ranks = set(range(args.encoder_offset, args.encoder_offset + encoder_size))
@@ -190,9 +261,7 @@ def validate_energon_data_args(args: argparse.Namespace) -> None:
     if not args.tokenizer_model:
         raise ValueError("--tokenizer-model is required for --dataset-provider energon_multimodal")
     if args.model_provider not in (NEMOTRON_20L_MODEL_PROVIDER, NEMOTRON_54L_MODEL_PROVIDER):
-        raise ValueError(
-            "energon_multimodal is currently wired for Nemotron MoE VLM providers"
-        )
+        raise ValueError("energon_multimodal is currently wired for Nemotron MoE VLM providers")
     if args.encoder_pp != 1 or args.llm_pp != 1:
         raise ValueError("energon_multimodal currently supports encoder and LLM PP size 1")
     if args.encoder_dp > args.llm_dp:

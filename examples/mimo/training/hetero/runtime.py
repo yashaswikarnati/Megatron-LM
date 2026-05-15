@@ -67,7 +67,49 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
     debug_rank("MimoModel moved to target dtype/device")
 
     wrap_active_modules_with_ddp(args, mimo_model, topology)
+    _propagate_tp_groups_for_checkpoint(mimo_model, topology)
     return mimo_model
+
+
+def _propagate_tp_groups_for_checkpoint(mimo_model: MimoModel, topology: HeteroTopology) -> None:
+    """Set self.tp_group on every active submodule so dist-ckpt save/load works.
+
+    `MegatronModule.sharded_state_dict` falls back to
+    `parallel_state.get_tensor_model_parallel_group()` when `self.tp_group` is missing,
+    which is unset in the hetero loop. A few descendants don't set tp_group themselves
+    (e.g. `ExtendedRMSNorm` in `megatron/core/ssm/mamba_mixer.py:93`, RADIO encoder
+    internal submodules), so we walk each active branch once after construction and
+    stamp the correct group.
+
+    This MUST run after every constructor that sets tp_group has executed — i.e.
+    after `wrap_active_modules_with_ddp` returns. A future refactor that lazily sets
+    tp_group inside forward will silently shadow this value (since
+    `_stamp_tp_group` uses `hasattr` to skip already-set attributes); if you see
+    spurious "unexpected tp_group" behavior, that's the likely culprit.
+    """
+    rank_in_language_grid = is_rank_in_grid(topology.llm_grid)
+    rank_in_encoder_grid = is_rank_in_grid(topology.encoder_grid)
+
+    if rank_in_language_grid and mimo_model.language_model is not None:
+        _stamp_tp_group(mimo_model.language_model, topology.language_pg.tp)
+
+    if rank_in_encoder_grid and topology.encoder_name in mimo_model.modality_submodules:
+        submodule = mimo_model.modality_submodules[topology.encoder_name]
+        if submodule is not None:
+            _stamp_tp_group(submodule, topology.vision_pg.tp)
+
+
+def _stamp_tp_group(module: torch.nn.Module, tp_group) -> None:
+    """Stamp `tp_group` on every descendant that doesn't already carry one.
+
+    Mirrors the `if not hasattr(self, 'tp_group')` fallback that
+    `MegatronModule.sharded_state_dict` and similar paths perform. Modules that
+    explicitly set `tp_group` (to a real group or None) are left alone.
+    """
+    inner = module.module if isinstance(module, DistributedDataParallel) else module
+    for sub in inner.modules():
+        if not hasattr(sub, "tp_group"):
+            sub.tp_group = tp_group
 
 
 def wrap_active_modules_with_ddp(
@@ -140,11 +182,7 @@ def configure_module_rng(
     seed = args.seed + role_seed_offset + (100 * pp_rank)
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(
-        seed,
-        tp_rank=tp_rank,
-        ep_rank=ep_rank,
-        etp_rank=expt_tp_rank,
-        force_reset_rng=True,
+        seed, tp_rank=tp_rank, ep_rank=ep_rank, etp_rank=expt_tp_rank, force_reset_rng=True
     )
 
 
