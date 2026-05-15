@@ -74,18 +74,33 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
 def _propagate_tp_groups_for_checkpoint(mimo_model: MimoModel, topology: HeteroTopology) -> None:
     """Set self.tp_group on every active submodule so dist-ckpt save/load works.
 
-    `MegatronModule.sharded_state_dict` falls back to
-    `parallel_state.get_tensor_model_parallel_group()` when `self.tp_group` is missing,
-    which is unset in the hetero loop. A few descendants don't set tp_group themselves
-    (e.g. `ExtendedRMSNorm` in `megatron/core/ssm/mamba_mixer.py:93`, RADIO encoder
-    internal submodules), so we walk each active branch once after construction and
-    stamp the correct group.
+    `MegatronModule.sharded_state_dict` (`megatron/core/transformer/module.py:85`)
+    falls back to `parallel_state.get_tensor_model_parallel_group()` when
+    `self.tp_group` is missing. parallel_state is intentionally not initialized
+    in the hetero loop (we use HyperCommGrid), so any descendant that doesn't
+    set `self.tp_group` in its __init__ raises ``AssertionError: tensor model
+    parallel group is not initialized`` on the first save attempt.
 
-    This MUST run after every constructor that sets tp_group has executed — i.e.
-    after `wrap_active_modules_with_ddp` returns. A future refactor that lazily sets
-    tp_group inside forward will silently shadow this value (since
-    `_stamp_tp_group` uses `hasattr` to skip already-set attributes); if you see
-    spurious "unexpected tp_group" behavior, that's the likely culprit.
+    Confirmed escapees (verified by disabling this walker and running the 20L
+    mock — the LLM branch fails identically on `MambaLayer` / `ExtendedRMSNorm`):
+
+    - RADIO encoder internals — many small leaf modules in HF radio_model
+      reached via `nemotron_moe_vlm.RadioEncoder.sharded_state_dict`
+    - `megatron/core/ssm/mamba_layer.py:MambaLayer.__init__` — takes
+      pg_collection, plumbs it to the mixer but does not store self.tp_group
+    - `megatron/core/ssm/mamba_mixer.py:93` `ExtendedRMSNorm` — never plumbed
+      pg_collection at all
+
+    Fixing each at the source would require patches across core (Mamba) and
+    a partial walk of RADIO's HF wrapper. This walker is the smaller
+    intervention: one place, guarded by ``hasattr``, applied per branch with
+    the correct pg.
+
+    MUST run after `wrap_active_modules_with_ddp`. A future refactor that
+    lazily sets tp_group inside forward would silently shadow this value
+    (since `_stamp_tp_group` uses `hasattr` to skip already-set attributes);
+    if you see spurious "unexpected tp_group" behavior, that's the likely
+    culprit.
     """
     rank_in_language_grid = is_rank_in_grid(topology.llm_grid)
     rank_in_encoder_grid = is_rank_in_grid(topology.encoder_grid)
