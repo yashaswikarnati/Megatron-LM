@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -51,6 +51,12 @@ class MimoOptimizer(MegatronOptimizer):
         ]
         self.is_stub_optimizer = len(self._active_optimizers) == 0
         self.optimizer = None  # Base class compat
+        # Stashed by `sharded_state_dict` so `load_state_dict` can recover
+        # non-sharded scalars (notably `param_state_sharding_type`) that
+        # dist_checkpointing's common-state path drops on ranks whose active
+        # module isn't present on rank 0. Matches the pattern in
+        # https://github.com/NVIDIA/Megatron-LM/pull/4801.
+        self._last_sharded_metadata: Dict[str, Any] = {}
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -155,6 +161,12 @@ class MimoOptimizer(MegatronOptimizer):
         as ShardedObjects by sharded_state_dict(), then delegates to each
         per-module optimizer's load_state_dict.
         """
+        # `param_state_sharding_type` isn't saved to the checkpoint — it's a
+        # load-time interpretation hint that the caller supplies via the
+        # metadata kwarg on the most recent sharded_state_dict call. Recover it
+        # here for ranks whose active module wasn't on rank 0 at save time and
+        # therefore lost it via the common-state path.
+        recovered_sharding_type = self._last_sharded_metadata.get('distrib_optim_sharding_type')
         for name, info in self.module_infos.items():
             if not (info.is_active and info.optimizer):
                 continue
@@ -165,7 +177,12 @@ class MimoOptimizer(MegatronOptimizer):
             for sub_sd, inner_opt in _iter_optimizer_sub_dicts(module_sd, info.optimizer):
                 _restore_param_groups(sub_sd, inner_opt, name)
                 _restore_grad_scaler(sub_sd)
-                _restore_param_state_sharding_type(sub_sd)
+                if (
+                    recovered_sharding_type is not None
+                    and 'param_state' in sub_sd
+                    and 'param_state_sharding_type' not in sub_sd
+                ):
+                    sub_sd['param_state_sharding_type'] = recovered_sharding_type
 
             info.optimizer.load_state_dict(module_sd)
 
@@ -174,6 +191,9 @@ class MimoOptimizer(MegatronOptimizer):
         through distributed save as ShardedObjects (common.pt is rank-0 only,
         which misses LLM optimizer state in non-colocated mode).
         """
+        # Stash the metadata so `load_state_dict` can recover sharding-type
+        # hints that don't round-trip through common-state.
+        self._last_sharded_metadata = dict(kwargs.get('metadata', {}) or {})
         sharded_state = {}
         for name, info in self.module_infos.items():
             if info.is_active and info.optimizer:
@@ -188,7 +208,6 @@ class MimoOptimizer(MegatronOptimizer):
                     suffix = f'.{idx}' if idx > 0 else ''
                     _extract_param_groups(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
-                    _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
 
                 # Namespace every internal ShardedBase key with the submodule name
                 # so two module optimizers (e.g. 'language' + 'images') don't collide
@@ -271,7 +290,14 @@ def _restore_param_groups(sub_sd, inner_optimizer, module_name):
         )
     for loaded_g, current_g in zip(loaded_pg, current_pg):
         loaded_g['params'] = current_g['params']
-    sub_sd['optimizer']['param_groups'] = loaded_pg
+    # `sub_sd['optimizer']` may be absent on load: when the per-module state_dict
+    # produced by `DistributedOptimizer.state_dict()` only contains
+    # `param_groups` under the 'optimizer' key, `_extract_param_groups` deletes
+    # `param_groups` at save time, and the resulting empty dict can be dropped
+    # by dist_checkpointing's common-state round-trip on ranks whose active
+    # module wasn't on rank 0. `setdefault` lets the restored `param_groups`
+    # land in the right place regardless. Pattern from NVIDIA/Megatron-LM#4801.
+    sub_sd.setdefault('optimizer', {})['param_groups'] = loaded_pg
 
 
 def _restore_grad_scaler(sub_sd):
@@ -282,51 +308,26 @@ def _restore_grad_scaler(sub_sd):
             break
 
 
-def _extract_param_state_sharding_type(sub_sd, module_name, suffix, replica_id):
-    """Save: extract DistributedOptimizer.param_state_sharding_type into a ShardedObject.
-
-    This top-level key is a configuration string set by `DistributedOptimizer.sharded_state_dict`
-    and re-read by `DistributedOptimizer.load_state_dict`. Without wrapping it as a sharded
-    object the value lands on rank 0's common.pt only, so non-rank-0 module owners
-    (e.g. the language optimizer in a non-colocated layout) lose it on reload.
-    """
-    if 'param_state_sharding_type' in sub_sd:
-        value = sub_sd.pop('param_state_sharding_type')
-        sub_sd[f'_mimo_param_state_sharding_type{suffix}'] = ShardedObject(
-            f'optimizer.mimo.{module_name}{suffix}.param_state_sharding_type',
-            value,
-            (1,),
-            (0,),
-            replica_id=replica_id,
-        )
-
-
-def _restore_param_state_sharding_type(sub_sd):
-    """Load: restore param_state_sharding_type from its ShardedObject key."""
-    for k in list(sub_sd.keys()):
-        if k.startswith('_mimo_param_state_sharding_type'):
-            sub_sd['param_state_sharding_type'] = sub_sd.pop(k)
-            break
-
-
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Includes pp_rank, tp_rank, and dp_rank so that within a given PP stage only the
-    rank with (tp=0, dp=0) is the primary writer and the others are recognized as
-    replicas. Without `tp_rank` the framework sees two ranks claiming the same
-    primary shard and aborts with 'Duplicate ShardedObject keys'.
+    Returns ``(tp_rank, pp_rank, dp_rank)`` so only ``(0, 0, 0)`` within each
+    module's parallelism group is the main replica; all other ranks in the same
+    module are non-main replicas of the same object. Order matches
+    `make_sharded_object_for_checkpoint` in
+    `megatron/core/transformer/utils.py:168-172` and NVIDIA/Megatron-LM#4801.
     """
     assert pg_collection is not None, "pg_collection required for checkpoint replica_id"
+    assert (
+        hasattr(pg_collection, 'tp') and pg_collection.tp is not None
+    ), "pg_collection.tp must be set for checkpoint deduplication"
     assert (
         hasattr(pg_collection, 'pp') and pg_collection.pp is not None
     ), "pg_collection.pp must be set for checkpoint deduplication"
     assert (
         hasattr(pg_collection, 'dp') and pg_collection.dp is not None
     ), "pg_collection.dp must be set for checkpoint deduplication"
-    tp = getattr(pg_collection, 'tp', None)
-    tp_rank = tp.rank() if tp is not None else 0
-    return (pg_collection.pp.rank(), tp_rank, pg_collection.dp.rank())
+    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
