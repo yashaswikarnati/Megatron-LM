@@ -67,64 +67,7 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
     debug_rank("MimoModel moved to target dtype/device")
 
     wrap_active_modules_with_ddp(args, mimo_model, topology)
-    _propagate_tp_groups_for_checkpoint(mimo_model, topology)
     return mimo_model
-
-
-def _propagate_tp_groups_for_checkpoint(mimo_model: MimoModel, topology: HeteroTopology) -> None:
-    """Set self.tp_group on every active submodule so dist-ckpt save/load works.
-
-    `MegatronModule.sharded_state_dict` (`megatron/core/transformer/module.py:85`)
-    falls back to `parallel_state.get_tensor_model_parallel_group()` when
-    `self.tp_group` is missing. parallel_state is intentionally not initialized
-    in the hetero loop (we use HyperCommGrid), so any descendant that doesn't
-    set `self.tp_group` in its __init__ raises ``AssertionError: tensor model
-    parallel group is not initialized`` on the first save attempt.
-
-    Confirmed escapees (verified by disabling this walker and running the 20L
-    mock — the LLM branch fails identically on `MambaLayer` / `ExtendedRMSNorm`):
-
-    - RADIO encoder internals — many small leaf modules in HF radio_model
-      reached via `nemotron_moe_vlm.RadioEncoder.sharded_state_dict`
-    - `megatron/core/ssm/mamba_layer.py:MambaLayer.__init__` — takes
-      pg_collection, plumbs it to the mixer but does not store self.tp_group
-    - `megatron/core/ssm/mamba_mixer.py:93` `ExtendedRMSNorm` — never plumbed
-      pg_collection at all
-
-    Fixing each at the source would require patches across core (Mamba) and
-    a partial walk of RADIO's HF wrapper. This walker is the smaller
-    intervention: one place, guarded by ``hasattr``, applied per branch with
-    the correct pg.
-
-    MUST run after `wrap_active_modules_with_ddp`. A future refactor that
-    lazily sets tp_group inside forward would silently shadow this value
-    (since `_stamp_tp_group` uses `hasattr` to skip already-set attributes);
-    if you see spurious "unexpected tp_group" behavior, that's the likely
-    culprit.
-    """
-    rank_in_language_grid = is_rank_in_grid(topology.llm_grid)
-    rank_in_encoder_grid = is_rank_in_grid(topology.encoder_grid)
-
-    if rank_in_language_grid and mimo_model.language_model is not None:
-        _stamp_tp_group(mimo_model.language_model, topology.language_pg.tp)
-
-    if rank_in_encoder_grid and topology.encoder_name in mimo_model.modality_submodules:
-        submodule = mimo_model.modality_submodules[topology.encoder_name]
-        if submodule is not None:
-            _stamp_tp_group(submodule, topology.vision_pg.tp)
-
-
-def _stamp_tp_group(module: torch.nn.Module, tp_group) -> None:
-    """Stamp `tp_group` on every descendant that doesn't already carry one.
-
-    Mirrors the `if not hasattr(self, 'tp_group')` fallback that
-    `MegatronModule.sharded_state_dict` and similar paths perform. Modules that
-    explicitly set `tp_group` (to a real group or None) are left alone.
-    """
-    inner = module.module if isinstance(module, DistributedDataParallel) else module
-    for sub in inner.modules():
-        if not hasattr(sub, "tp_group"):
-            sub.tp_group = tp_group
 
 
 def wrap_active_modules_with_ddp(

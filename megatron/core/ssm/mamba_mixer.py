@@ -95,6 +95,17 @@ class ExtendedRMSNorm(RMSNormGated):
     RMSNormGated with sharded state dict.
     """
 
+    def __init__(self, *args, tp_group=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Store tp_group eagerly so MegatronModule.sharded_state_dict and the
+        # method below don't have to fall back to
+        # parallel_state.get_tensor_model_parallel_group() — that fallback is
+        # unavailable in heterogeneous layouts that don't initialize
+        # parallel_state. Callers that don't pass tp_group keep the old lazy
+        # fallback behavior via `hasattr` in `sharded_state_dict`.
+        if tp_group is not None:
+            self.tp_group = tp_group
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
         if not hasattr(self, 'tp_group'):
@@ -373,6 +384,7 @@ class MambaMixer(MegatronModule):
                 norm_before_gate=self.norm_before_gate,
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
+                tp_group=self.pg_collection.tp,
             )
             setattr(self.norm.weight, "tensor_model_parallel", True)
             setattr(self.norm.weight, "partition_dim", 0)
