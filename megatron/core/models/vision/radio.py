@@ -127,6 +127,11 @@ class RADIOViTModel(VisionModule):
 
         # Using non-TE version so we can force gather_output
         tp_group = getattr(pg_collection, "tp", None) if pg_collection is not None else None
+        # Store tp_group on self so MegatronModule.sharded_state_dict doesn't
+        # fall back to parallel_state.get_tensor_model_parallel_group(), which
+        # isn't initialized in heterogeneous-parallelism layouts that pass
+        # pg_collection explicitly.
+        self.tp_group = tp_group
         self.embedder = ColumnParallelLinear(
             input_size=3 * self.patch_dim * self.patch_dim,
             output_size=self.visual_hidden_size,

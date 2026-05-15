@@ -80,6 +80,10 @@ class MambaLayer(GraphableMegatronModule):
         self.submodules_config = submodules
         self.layer_number = layer_number
         self.hidden_dropout = config.hidden_dropout
+        # Store tp_group so MegatronModule.sharded_state_dict doesn't fall back
+        # to parallel_state.get_tensor_model_parallel_group(); the hetero
+        # MIMO loop never initializes parallel_state.
+        self.tp_group = pg_collection.tp
         self.mixer = build_module(
             submodules.mixer,
             self.config,

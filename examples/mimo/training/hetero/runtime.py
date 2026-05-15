@@ -140,11 +140,7 @@ def configure_module_rng(
     seed = args.seed + role_seed_offset + (100 * pp_rank)
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(
-        seed,
-        tp_rank=tp_rank,
-        ep_rank=ep_rank,
-        etp_rank=expt_tp_rank,
-        force_reset_rng=True,
+        seed, tp_rank=tp_rank, ep_rank=ep_rank, etp_rank=expt_tp_rank, force_reset_rng=True
     )
 
 
