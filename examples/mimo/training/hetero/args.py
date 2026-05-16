@@ -265,6 +265,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ckpt.add_argument(
+        "--no-load-strict",
+        dest="load_strict",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable strict checkpoint validation. By default the load path uses "
+            "StrictHandling.RAISE_ALL so missing or unexpected keys raise immediately, "
+            "confirming every parameter the model expects came from the checkpoint. "
+            "Pass --no-load-strict to fall back to ASSUME_OK_UNEXPECTED for schema drift."
+        ),
+    )
+    ckpt.add_argument(
         "--load-vision-from",
         type=str,
         default=None,
@@ -272,21 +284,6 @@ def parse_args() -> argparse.Namespace:
             "Path to a Megatron-Bridge DCP containing `model.vision_model.*` keys. "
             "Loaded only on encoder ranks, only on first run (when --load resolves no "
             "checkpoint). Matches Sanjeev's --load-vision-from semantics from pre-vlm-05."
-        ),
-    )
-    ckpt.add_argument(
-        "--allow-missing-vision-projection-checkpoint",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Tolerate missing projector keys when loading the vision DCP.",
-    )
-    ckpt.add_argument(
-        "--radio-force-eval-mode",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help=(
-            "Force RADIO encoder into eval() during training. None = derive from "
-            "--freeze-vit. Sanjeev's run dumps this as True; cosmetic for args-dump parity."
         ),
     )
     ckpt.add_argument(

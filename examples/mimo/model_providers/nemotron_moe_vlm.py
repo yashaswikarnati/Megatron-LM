@@ -596,11 +596,7 @@ def vision_submodules_spec(
                 "class_token_len": args.class_token_len,
                 "drop_class_token": True,
                 "apply_pixel_shuffle": True,
-                "force_eval_mode": (
-                    args.radio_force_eval_mode
-                    if getattr(args, "radio_force_eval_mode", None) is not None
-                    else args.freeze_vit
-                ),
+                "force_eval_mode": args.freeze_vit,
             },
         )
         vision_projection_spec = ModuleSpec(
