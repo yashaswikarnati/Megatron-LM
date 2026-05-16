@@ -85,6 +85,16 @@ fi
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * LLM_DP))}"
 LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-10}"
 LR_DECAY_ITERS="${LR_DECAY_ITERS:-${TRAIN_ITERS}}"
+LR="${LR:-2e-4}"
+MIN_LR="${MIN_LR:-2e-6}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
+LR_DECAY_STYLE="${LR_DECAY_STYLE:-cosine}"
+# Sample-based scheduler knobs (set to enable Sanjeev-style WSD). Empty = unused.
+LR_WARMUP_SAMPLES="${LR_WARMUP_SAMPLES:-}"
+LR_DECAY_SAMPLES="${LR_DECAY_SAMPLES:-}"
+LR_WSD_DECAY_SAMPLES="${LR_WSD_DECAY_SAMPLES:-}"
+LR_WSD_DECAY_STYLE="${LR_WSD_DECAY_STYLE:-}"
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-}"
 PACKING_BUFFER_SIZE="${PACKING_BUFFER_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 SHUFFLE_BUFFER_SIZE="${SHUFFLE_BUFFER_SIZE:-100}"
@@ -258,12 +268,12 @@ CMD=(
   --micro-batch-size "${MICRO_BATCH_SIZE}"
   --global-batch-size "${GLOBAL_BATCH_SIZE}"
   --num-microbatches "${NUM_MICROBATCHES}"
-  --lr 2e-4
-  --min-lr 2e-6
-  --lr-decay-style cosine
+  --lr "${LR}"
+  --min-lr "${MIN_LR}"
+  --lr-decay-style "${LR_DECAY_STYLE}"
   --lr-warmup-iters "${LR_WARMUP_ITERS}"
   --lr-decay-iters "${LR_DECAY_ITERS}"
-  --weight-decay 0.05
+  --weight-decay "${WEIGHT_DECAY}"
   --adam-beta1 0.9
   --adam-beta2 0.95
   --clip-grad 1.0
@@ -271,8 +281,23 @@ CMD=(
   --ddp-bucket-size 0
   --log-interval "${LOG_INTERVAL}"
   --train-iters "${TRAIN_ITERS}"
-  "$@"
 )
+if [[ -n "${LR_WARMUP_SAMPLES}" ]]; then
+  CMD+=(--lr-warmup-samples "${LR_WARMUP_SAMPLES}")
+fi
+if [[ -n "${LR_DECAY_SAMPLES}" ]]; then
+  CMD+=(--lr-decay-samples "${LR_DECAY_SAMPLES}")
+fi
+if [[ -n "${LR_WSD_DECAY_SAMPLES}" ]]; then
+  CMD+=(--lr-wsd-decay-samples "${LR_WSD_DECAY_SAMPLES}")
+fi
+if [[ -n "${LR_WSD_DECAY_STYLE}" ]]; then
+  CMD+=(--lr-wsd-decay-style "${LR_WSD_DECAY_STYLE}")
+fi
+if [[ -n "${TRAIN_SAMPLES}" ]]; then
+  CMD+=(--train-samples "${TRAIN_SAMPLES}")
+fi
+CMD+=("$@")
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf '%q ' "${CMD[@]}"

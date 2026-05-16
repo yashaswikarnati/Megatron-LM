@@ -115,11 +115,54 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--global-batch-size", type=int, default=None)
     train.add_argument("--num-microbatches", type=int, default=2)
     train.add_argument("--train-iters", type=int, default=2)
+    train.add_argument(
+        "--train-samples",
+        type=int,
+        default=None,
+        help=(
+            "Total training budget in consumed samples. When set, --train-iters is "
+            "re-derived as ceil(train_samples / global_batch_size). Matches Sanjeev's "
+            "samples-based recipe."
+        ),
+    )
     train.add_argument("--lr", type=float, default=1.0e-4)
     train.add_argument("--min-lr", type=float, default=None)
-    train.add_argument("--lr-decay-style", type=str, default="constant")
+    train.add_argument(
+        "--lr-decay-style",
+        type=str,
+        default="constant",
+        choices=["constant", "linear", "cosine", "inverse-square-root", "WSD"],
+    )
     train.add_argument("--lr-warmup-iters", type=int, default=0)
     train.add_argument("--lr-decay-iters", type=int, default=None)
+    train.add_argument(
+        "--lr-warmup-samples",
+        type=int,
+        default=None,
+        help="LR warmup duration in consumed samples. Overrides --lr-warmup-iters when set.",
+    )
+    train.add_argument(
+        "--lr-decay-samples",
+        type=int,
+        default=None,
+        help="LR decay duration in consumed samples. Overrides --lr-decay-iters when set.",
+    )
+    train.add_argument(
+        "--lr-wsd-decay-samples",
+        type=int,
+        default=None,
+        help=(
+            "Length of the WSD decay tail in consumed samples. Required when "
+            "--lr-decay-style=WSD."
+        ),
+    )
+    train.add_argument(
+        "--lr-wsd-decay-style",
+        type=str,
+        default=None,
+        choices=["linear", "cosine", "exponential", "minus_sqrt"],
+        help="Decay-style applied during the WSD tail.",
+    )
     train.add_argument("--weight-decay", type=float, default=0.01)
     train.add_argument("--adam-beta1", type=float, default=0.9)
     train.add_argument("--adam-beta2", type=float, default=0.999)
@@ -135,10 +178,37 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     train.add_argument(
+        "--overlap-param-gather",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable distributed-optimizer param all-gather overlap with forward compute. "
+            "Requires --use-distributed-optimizer (already on for the hetero loop)."
+        ),
+    )
+    train.add_argument(
         "--ddp-bucket-size",
         type=int,
         default=10000,
-        help="DDP bucket size. Use 0 for a single unbounded bucket.",
+        help="DDP bucket size in parameters. Use 0 for a single unbounded bucket.",
+    )
+    train.add_argument(
+        "--ddp-num-buckets",
+        type=int,
+        default=None,
+        help=(
+            "If set, DDP bucket_size is derived from num_parameters // ddp_num_buckets "
+            "(mutually exclusive with --ddp-bucket-size > 0)."
+        ),
+    )
+    train.add_argument(
+        "--ddp-pad-buckets-for-high-nccl-busbw",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Pad DDP bucket sizes to a multiple of 2^16 so NCCL collectives have high "
+            "bus bandwidth at large DP counts."
+        ),
     )
     train.add_argument("--seed", type=int, default=12345)
     train.add_argument("--log-interval", type=int, default=1)
@@ -238,6 +308,28 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
         raise ValueError("--save-interval must be >= 1 when set")
     if args.save_interval is not None and args.save is None:
         raise ValueError("--save-interval requires --save")
+
+    # Sample-based scheduler resolution: when --train-samples is set, derive
+    # --train-iters from it using the (now-known) global batch size. The
+    # OptimizerParamScheduler tracks "steps" in units of consumed samples, so
+    # the sample-based knobs flow through unchanged downstream.
+    if args.train_samples is not None:
+        derived_gbs = args.micro_batch_size * args.num_microbatches * args.llm_dp
+        gbs = args.global_batch_size if args.global_batch_size is not None else derived_gbs
+        if gbs <= 0:
+            raise ValueError(
+                "--train-samples requires a positive derived/explicit --global-batch-size"
+            )
+        import math as _math
+
+        derived_iters = _math.ceil(args.train_samples / gbs)
+        args.train_iters = derived_iters
+
+    if args.lr_decay_style == "WSD":
+        if args.lr_wsd_decay_samples is None:
+            raise ValueError("--lr-decay-style=WSD requires --lr-wsd-decay-samples")
+        if args.lr_wsd_decay_style is None:
+            raise ValueError("--lr-decay-style=WSD requires --lr-wsd-decay-style")
 
     llm_size = args.llm_tp * args.llm_cp * args.llm_pp * args.llm_dp
     if args.llm_only:

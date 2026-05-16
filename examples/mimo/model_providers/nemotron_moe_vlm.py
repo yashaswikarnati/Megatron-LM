@@ -112,6 +112,28 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
     provider.add_argument("--disable-vision-class-token", action="store_true")
     provider.add_argument("--use-tiling", action="store_true")
     provider.add_argument("--use-thumbnail", action="store_true")
+    provider.add_argument(
+        "--dynamic-resolution",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Patchify each image at its native aspect ratio with a token budget instead of "
+            "fixed-tile resize. Enabled by default for Nemotron6-MoE VLM providers (matches "
+            "Sanjeev's pre-vlm-05 recipe). Pass --no-dynamic-resolution to disable."
+        ),
+    )
+    provider.add_argument(
+        "--dynamic-resolution-min-patches",
+        type=int,
+        default=4,
+        help="Lower bound on per-image patch count under dynamic resolution.",
+    )
+    provider.add_argument(
+        "--dynamic-resolution-max-patches",
+        type=int,
+        default=0,
+        help="Upper bound on per-image patch count under dynamic resolution; 0 = uncapped.",
+    )
     provider.add_argument("--freeze-lm", action="store_true")
     provider.add_argument("--freeze-vit", action="store_true")
     provider.add_argument("--freeze-projection", action="store_true")
@@ -148,8 +170,18 @@ def apply_model_provider_defaults(args: argparse.Namespace) -> None:
     args.image_seq_length = NEMOTRON_20L_IMAGE_SEQ_PER_TILE * args.num_image_tiles
     args.pixel_shuffle = True
     args.disable_vision_class_token = True
-    args.use_tiling = True
-    args.use_thumbnail = True
+    if args.dynamic_resolution is None:
+        args.dynamic_resolution = True
+    if args.dynamic_resolution:
+        # Dynamic-resolution strategy reads `use_thumbnail` inside
+        # `DynamicResolutionImageTilingStrategy` and emits an extra thumbnail
+        # tile when True. `use_tiling` is inert in this branch (the fixed-tile
+        # path is unreachable), but pin it False for args-dump parity.
+        args.use_tiling = False
+        args.use_thumbnail = False
+    else:
+        args.use_tiling = True
+        args.use_thumbnail = True
 
 
 def apply_training_stage(args: argparse.Namespace) -> None:
@@ -356,7 +388,7 @@ def nemotron_language_config(
         bias_activation_fusion=False,
         masked_softmax_fusion=True,
         persist_layer_norm=True,
-        bias_dropout_fusion=False,
+        bias_dropout_fusion=True,
         recompute_granularity="selective",
         recompute_modules=["core_attn"],
         moe_ffn_hidden_size=1856,
@@ -370,7 +402,7 @@ def nemotron_language_config(
         moe_router_load_balancing_type="seq_aux_loss",
         moe_router_force_load_balancing=args.moe_router_force_load_balancing,
         moe_router_fusion=True,
-        moe_aux_loss_coeff=1.0e-9,
+        moe_aux_loss_coeff=1.0e-4,
         moe_shared_expert_intermediate_size=3712,
         moe_shared_expert_overlap=True,
         moe_token_dispatcher_type="alltoall",
@@ -379,6 +411,9 @@ def nemotron_language_config(
         is_hybrid_model=True,
         mamba_num_heads=64,
         mamba_head_dim=64,
+        mamba_num_groups=8,
+        mamba_state_dim=128,
+        linear_conv_kernel_dim=4,
     )
     config.position_embedding_type = "none"
     config.seq_length = 8192
@@ -481,6 +516,7 @@ def language_model_spec(
                 "post_process": pp_rank == pp_size - 1,
                 "hybrid_layer_pattern": args.hybrid_layer_pattern,
                 "position_embedding_type": "none",
+                "share_embeddings_and_output_weights": False,
                 "scatter_embedding_sequence_parallel": False,
                 "pg_collection": pg_collection,
             },

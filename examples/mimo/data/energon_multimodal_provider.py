@@ -271,6 +271,10 @@ def build_multimodal_encoder(
         use_image_break_token=getattr(args, "image_break_token", None) is not None,
         use_area_weighted_aspect_ratio=getattr(args, "use_area_weighted_aspect_ratio", False),
         dynamic_resolution=getattr(args, "dynamic_resolution", False),
+        dynamic_resolution_min_patches=getattr(args, "dynamic_resolution_min_patches", 4),
+        dynamic_resolution_max_patches=getattr(args, "dynamic_resolution_max_patches", 0),
+        dynamic_resolution_min_side=getattr(args, "dynamic_resolution_min_side", None),
+        dynamic_resolution_max_side=getattr(args, "dynamic_resolution_max_side", None),
     )
     packing_config = PackingConfig(
         seq_length=target_seq_length, pad_id=pad_id, image_token_id=image_token_id

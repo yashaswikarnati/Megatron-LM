@@ -46,16 +46,31 @@ def get_global_batch_size(args: argparse.Namespace) -> int:
 
 
 def build_optimizer_param_scheduler(args: argparse.Namespace, optimizer) -> OptimizerParamScheduler:
-    """Build the MCore optimizer parameter scheduler using Megatron train-iters semantics."""
+    """Build the MCore optimizer parameter scheduler.
+
+    The scheduler tracks "steps" in units of consumed samples (incremented by the
+    global batch size per call). Sample-based knobs take precedence when set;
+    iter-based knobs are converted via iter * global_batch_size for back-compat.
+    """
     global_batch_size = get_global_batch_size(args)
-    lr_decay_iters = args.lr_decay_iters if args.lr_decay_iters is not None else args.train_iters
+    if args.lr_warmup_samples is not None:
+        lr_warmup_steps = args.lr_warmup_samples
+    else:
+        lr_warmup_steps = args.lr_warmup_iters * global_batch_size
+    if args.lr_decay_samples is not None:
+        lr_decay_steps = args.lr_decay_samples
+    else:
+        lr_decay_iters = (
+            args.lr_decay_iters if args.lr_decay_iters is not None else args.train_iters
+        )
+        lr_decay_steps = lr_decay_iters * global_batch_size
     return OptimizerParamScheduler(
         optimizer,
         init_lr=0.0,
         max_lr=args.lr,
         min_lr=args.min_lr if args.min_lr is not None else 0.0,
-        lr_warmup_steps=args.lr_warmup_iters * global_batch_size,
-        lr_decay_steps=lr_decay_iters * global_batch_size,
+        lr_warmup_steps=lr_warmup_steps,
+        lr_decay_steps=lr_decay_steps,
         lr_decay_style=args.lr_decay_style,
         start_wd=args.weight_decay,
         end_wd=args.weight_decay,
@@ -63,4 +78,6 @@ def build_optimizer_param_scheduler(args: argparse.Namespace, optimizer) -> Opti
         wd_incr_style="constant",
         use_checkpoint_opt_param_scheduler=False,
         override_opt_param_scheduler=True,
+        wsd_decay_steps=args.lr_wsd_decay_samples,
+        lr_wsd_decay_style=args.lr_wsd_decay_style,
     )

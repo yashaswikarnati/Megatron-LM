@@ -77,23 +77,50 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
     return mimo_model
 
 
+def _resolve_bucket_size(
+    args: argparse.Namespace, module: Optional[torch.nn.Module]
+) -> Optional[int]:
+    """Resolve DDP bucket_size for a module.
+
+    Precedence:
+    1. --ddp-num-buckets (set): bucket_size = num_params // num_buckets.
+    2. --ddp-bucket-size > 0: use that value.
+    3. Else None (mcore auto-default = max(40M, 1M * dp_size)).
+    """
+    num_buckets = getattr(args, "ddp_num_buckets", None)
+    if num_buckets is not None:
+        if num_buckets <= 0:
+            raise ValueError("--ddp-num-buckets must be > 0 when set")
+        if args.ddp_bucket_size and args.ddp_bucket_size > 0:
+            raise ValueError(
+                "--ddp-num-buckets and --ddp-bucket-size are mutually exclusive"
+            )
+        if module is None:
+            return None
+        num_params = sum(p.numel() for p in module.parameters())
+        if num_params <= 0:
+            return None
+        return max(1, num_params // num_buckets)
+    if args.ddp_bucket_size and args.ddp_bucket_size > 0:
+        return args.ddp_bucket_size
+    return None
+
+
 def wrap_active_modules_with_ddp(
     args: argparse.Namespace, mimo_model: MimoModel, topology: HeteroTopology
 ) -> None:
     """Freeze and DDP-wrap active local MIMO modules."""
-    language_ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=args.overlap_grad_reduce,
-        bucket_size=args.ddp_bucket_size if args.ddp_bucket_size > 0 else None,
-        use_distributed_optimizer=True,
-    )
-    vision_ddp_config = DistributedDataParallelConfig(
-        overlap_grad_reduce=False,
-        bucket_size=args.ddp_bucket_size if args.ddp_bucket_size > 0 else None,
-        use_distributed_optimizer=True,
-    )
+    pad_buckets = getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False)
     if mimo_model.language_model is not None:
         if args.freeze_lm:
             set_module_requires_grad(mimo_model.language_model, False)
+        language_ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=args.overlap_grad_reduce,
+            overlap_param_gather=getattr(args, "overlap_param_gather", False),
+            bucket_size=_resolve_bucket_size(args, mimo_model.language_model),
+            pad_buckets_for_high_nccl_busbw=pad_buckets,
+            use_distributed_optimizer=True,
+        )
         debug_rank("wrapping language model in DDP")
         mimo_model.language_model = DistributedDataParallel(
             config=mimo_model.language_model.config,
@@ -118,6 +145,16 @@ def wrap_active_modules_with_ddp(
         if args.freeze_projection:
             for projection in iter_vision_projection_modules(submodule):
                 set_module_requires_grad(projection, False)
+        # Vision DDP keeps all overlap off: actual-data batches may be text-only,
+        # so some encoder DP ranks see zero grads/params per step; overlap'd
+        # collectives are not safe under that partial participation.
+        vision_ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=False,
+            overlap_param_gather=False,
+            bucket_size=_resolve_bucket_size(args, submodule),
+            pad_buckets_for_high_nccl_busbw=pad_buckets,
+            use_distributed_optimizer=True,
+        )
         debug_rank("wrapping vision submodule in DDP")
         mimo_model.modality_submodules[topology.encoder_name] = DistributedDataParallel(
             config=encoder_module.config,
