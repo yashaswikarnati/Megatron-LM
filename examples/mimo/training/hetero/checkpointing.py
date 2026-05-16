@@ -445,28 +445,33 @@ def load_vision_from_checkpoint(
     else:
         tp_rank, tp_size = 0, 1
 
-    radio_targets: Dict[str, torch.Tensor] = dict(radio_model.named_parameters())
-    radio_targets.update(dict(radio_model.named_buffers()))
-
-    loaded_keys = set()
-    unexpected = []
+    # Build a regular state_dict keyed by radio_model parameter names, TP-sliced
+    # for this rank's view, then run it through the canonical load_state_dict
+    # path so PyTorch handles any module hooks (DDP buckets, TE extra_state, …)
+    # rather than us mutating `param.data` directly.
+    cleaned: Dict[str, torch.Tensor] = {}
+    unexpected: list[str] = []
+    radio_state = radio_model.state_dict()
     for ckpt_key, tensor in load_sd.items():
         rel_key = ckpt_key[len(_VISION_DCP_PREFIX) :]
         if "extra_state" in rel_key:
             continue
-        param = radio_targets.get(rel_key)
-        if param is None:
+        target = radio_state.get(rel_key)
+        if target is None:
             unexpected.append(rel_key)
             continue
-        param.data.copy_(_tp_slice(tensor, param.shape, tp_rank, tp_size).to(dtype=param.dtype))
-        loaded_keys.add(rel_key)
+        cleaned[rel_key] = _tp_slice(tensor, target.shape, tp_rank, tp_size).to(
+            dtype=target.dtype
+        )
 
-    missing = [k for k in radio_targets if k not in loaded_keys and "extra_state" not in k]
-    if missing or unexpected:
+    incompatible = radio_model.load_state_dict(cleaned, strict=False)
+    missing = [k for k in incompatible.missing_keys if "extra_state" not in k]
+    extra = [k for k in incompatible.unexpected_keys if "extra_state" not in k] + unexpected
+    if missing or extra:
         raise RuntimeError(
             f"[load-vision-from] strict mismatch under '{_VISION_DCP_PREFIX}'. "
             f"Missing (model expects but ckpt lacks): {missing}. "
-            f"Unexpected (ckpt has but model lacks): {unexpected}."
+            f"Unexpected (ckpt has but model lacks): {extra}."
         )
 
-    print_rank_0(f"[load-vision-from] ViT loaded ({len(loaded_keys)} tensors, strict)")
+    print_rank_0(f"[load-vision-from] ViT loaded ({len(cleaned)} tensors, strict)")
