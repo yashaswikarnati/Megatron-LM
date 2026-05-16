@@ -10,7 +10,11 @@ from typing import Optional
 import torch
 
 from examples.mimo.training.hetero.args import prepare_args
-from examples.mimo.training.hetero.checkpointing import load_checkpoint, save_checkpoint
+from examples.mimo.training.hetero.checkpointing import (
+    load_checkpoint,
+    load_vision_from_checkpoint,
+    save_checkpoint,
+)
 from examples.mimo.training.hetero.data import select_data_iterator, validate_data_iterator
 from examples.mimo.training.hetero.distributed import print_rank_0
 from examples.mimo.training.hetero.grad_sync import configure_grad_sync
@@ -63,6 +67,10 @@ def run_train_loop(args: argparse.Namespace) -> None:
         debug_rank("training setup ready")
 
         start_iteration = load_checkpoint(model, optimizer, opt_param_scheduler, args, topology)
+        if start_iteration == 0 and args.load_vision_from is not None:
+            # First-run encoder warm-start. `--load` is authoritative when it resolves
+            # a checkpoint; only consult `--load-vision-from` when no resume happened.
+            load_vision_from_checkpoint(model, args, topology)
         if start_iteration >= args.train_iters:
             print_rank_0(
                 f"Resume iteration ({start_iteration}) >= --train-iters ({args.train_iters}); "

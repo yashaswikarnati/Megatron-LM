@@ -265,6 +265,31 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ckpt.add_argument(
+        "--load-vision-from",
+        type=str,
+        default=None,
+        help=(
+            "Path to a Megatron-Bridge DCP containing `model.vision_model.*` keys. "
+            "Loaded only on encoder ranks, only on first run (when --load resolves no "
+            "checkpoint). Matches Sanjeev's --load-vision-from semantics from pre-vlm-05."
+        ),
+    )
+    ckpt.add_argument(
+        "--allow-missing-vision-projection-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Tolerate missing projector keys when loading the vision DCP.",
+    )
+    ckpt.add_argument(
+        "--radio-force-eval-mode",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Force RADIO encoder into eval() during training. None = derive from "
+            "--freeze-vit. Sanjeev's run dumps this as True; cosmetic for args-dump parity."
+        ),
+    )
+    ckpt.add_argument(
         "--dist-ckpt-optim-fully-reshardable",
         action=argparse.BooleanOptionalAction,
         default=False,

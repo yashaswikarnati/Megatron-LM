@@ -217,7 +217,7 @@ TRAIN_LAUNCH_ARGS=(
   --seed 1234                     # Sanjeev's value
   --save "${CHECKPOINT_SAVE_PATH}"
   --save-interval "${SAVE_INTERVAL}"
-  # --load-vision-from "${VISION_CKPT}"   # TODO: enable once PR_load_vision_from lands
+  --load-vision-from "${VISION_CKPT}"
 )
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"

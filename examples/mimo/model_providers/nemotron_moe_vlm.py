@@ -10,6 +10,13 @@ from typing import Optional
 
 import torch
 
+from examples.mimo.utils.hetero import (
+    debug_rank,
+    get_grid_dim_size,
+    get_group_rank_or,
+    get_group_size_or,
+    is_process_group_member,
+)
 from megatron.core.activations import fast_gelu, squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -27,14 +34,6 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
-
-from examples.mimo.utils.hetero import (
-    debug_rank,
-    get_grid_dim_size,
-    get_group_rank_or,
-    get_group_size_or,
-    is_process_group_member,
-)
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -597,7 +596,11 @@ def vision_submodules_spec(
                 "class_token_len": args.class_token_len,
                 "drop_class_token": True,
                 "apply_pixel_shuffle": True,
-                "force_eval_mode": args.freeze_vit,
+                "force_eval_mode": (
+                    args.radio_force_eval_mode
+                    if getattr(args, "radio_force_eval_mode", None) is not None
+                    else args.freeze_vit
+                ),
             },
         )
         vision_projection_spec = ModuleSpec(

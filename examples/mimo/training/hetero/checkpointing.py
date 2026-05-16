@@ -41,6 +41,7 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
 _TRACKER_FILE = "latest_checkpointed_iteration.txt"
 _CHECKPOINT_VERSION = 3.0
+_VISION_DCP_PREFIX = "model.vision_model."
 
 
 def _iter_directory(root: str, iteration: int) -> str:
@@ -332,3 +333,160 @@ def load_checkpoint(
     resume_iter = 0 if is_finetune else int(loaded.get("iteration", iteration))
     print_rank_0(f"resuming hetero training at iteration {resume_iter}")
     return resume_iter
+
+
+def _tp_slice(tensor: torch.Tensor, param_shape, tp_rank: int, tp_size: int) -> torch.Tensor:
+    """Slice a full (TP=1) tensor to this rank's TP shard.
+
+    Mirrors the helper in Sanjeev's `_load_vision_from_checkpoint`:
+    handles column-parallel (first-dim split) and row-parallel (second-dim split).
+    Returns the tensor unchanged when it already matches the param shape.
+    """
+    if tp_size == 1 or tuple(tensor.shape) == tuple(param_shape):
+        return tensor
+    if tensor.shape[0] != param_shape[0]:
+        start = tp_rank * param_shape[0]
+        return tensor[start : start + param_shape[0], ...]
+    if len(tensor.shape) > 1 and tensor.shape[1] != param_shape[1]:
+        start = tp_rank * param_shape[1]
+        return tensor[:, start : start + param_shape[1]]
+    return tensor
+
+
+def _resolve_vision_dcp_dir(ckpt_dir: str) -> str:
+    """Resolve a flat-DCP or `iter_NNNNNNN/` directory under `ckpt_dir`."""
+    tracker = os.path.join(ckpt_dir, _TRACKER_FILE)
+    if os.path.isfile(tracker):
+        with open(tracker) as f:
+            iteration = int(f.read().strip())
+        return _iter_directory(ckpt_dir, iteration)
+    return ckpt_dir
+
+
+def _vision_submodule(model: MimoModel, encoder_name: str):
+    """Return the modality-submodules container for the encoder branch, or None.
+
+    Returns None when this rank is not part of the encoder branch (e.g. LLM-only
+    ranks where the modality submodule was never instantiated).
+    """
+    submodules = getattr(model, "modality_submodules", None)
+    if submodules is None or encoder_name not in submodules:
+        return None
+    return submodules[encoder_name]
+
+
+def _radio_target_modules(vision_submodule, radio_encoder_key: str):
+    """Return (radio_model, projector_or_None) for the RADIO encoder branch.
+
+    `vision_submodule` is the `VisionModalitySubmodules` instance (or a DDP-wrapped
+    variant). The RADIO encoder lives at `.encoders[radio_encoder_key].radio_model`
+    and the (optional) projector at `.input_projections[0]`.
+    """
+    inner = getattr(vision_submodule, "module", vision_submodule)  # unwrap DDP
+    encoders = getattr(inner, "encoders", None)
+    if encoders is None or radio_encoder_key not in encoders:
+        return None, None
+    radio_wrapper = encoders[radio_encoder_key]
+    radio_model = getattr(radio_wrapper, "radio_model", None)
+    projector = None
+    projections = getattr(inner, "input_projections", None)
+    if projections is not None and len(projections) > 0:
+        projector = projections[0]
+    return radio_model, projector
+
+
+def load_vision_from_checkpoint(
+    model: MimoModel,
+    args: argparse.Namespace,
+    topology: HeteroTopology,
+) -> None:
+    """Load RADIO encoder (and best-effort projector) weights from a Bridge DCP.
+
+    Active only on encoder-grid ranks. Reads keys with prefix
+    `model.vision_model.` from `args.load_vision_from`, TP-slices each tensor
+    against the per-rank parameter shape, and copies into
+    `vision_submodule.encoders[<radio_key>].radio_model.<rel>`. Tensors that
+    also match `vision_submodule.input_projections[0].<rel>` are copied into
+    the projector; when `--allow-missing-vision-projection-checkpoint` is set,
+    projector keys absent from the DCP are skipped silently.
+
+    No-op on LLM-only ranks and on ranks whose vision pg is not a real member.
+    """
+    if not args.load_vision_from:
+        return
+
+    # Encoder-only: bail on LLM-only ranks and on ranks outside the encoder grid.
+    if topology.encoder_grid is None or not is_rank_in_grid(topology.encoder_grid):
+        return
+
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    encoder_name = topology.encoder_name
+    radio_encoder_key = getattr(args, "vision_encoder_key", "radio_encoder")
+    vision_submodule = _vision_submodule(model, encoder_name)
+    if vision_submodule is None:
+        return
+    radio_model, projector = _radio_target_modules(vision_submodule, radio_encoder_key)
+    if radio_model is None:
+        return
+
+    # Resolve `iter_NNNNNNN/` if a tracker exists; else treat the path as a flat DCP.
+    iter_dir = _resolve_vision_dcp_dir(args.load_vision_from)
+    print_rank_0(f"[load-vision-from] Loading ViT via DCP from {iter_dir}")
+
+    reader = FileSystemReader(iter_dir)
+    ckpt_metadata = reader.read_metadata().state_dict_metadata
+
+    load_sd: Dict[str, torch.Tensor] = {
+        k: torch.empty(meta.size, dtype=meta.properties.dtype)
+        for k, meta in ckpt_metadata.items()
+        if k.startswith(_VISION_DCP_PREFIX) and isinstance(meta, TensorStorageMetadata)
+    }
+    if not load_sd:
+        print_rank_0(
+            f"[load-vision-from] WARNING: no '{_VISION_DCP_PREFIX}*' keys in "
+            f"{iter_dir} — encoder runs with random init"
+        )
+        return
+
+    dcp.load(load_sd, storage_reader=reader)
+
+    # TP slicing: read rank/size from the encoder pg_collection (vision_pg).
+    tp_pg = getattr(topology.vision_pg, "tp", None) if topology.vision_pg is not None else None
+    if is_process_group_member(tp_pg):
+        tp_rank, tp_size = tp_pg.rank(), tp_pg.size()
+    else:
+        tp_rank, tp_size = 0, 1
+
+    radio_targets = dict(radio_model.named_parameters())
+    radio_targets.update(dict(radio_model.named_buffers()))
+
+    projector_targets: Dict[str, torch.Tensor] = {}
+    if projector is not None:
+        projector_targets = dict(projector.named_parameters())
+        projector_targets.update(dict(projector.named_buffers()))
+
+    loaded = skipped = 0
+    allow_missing_proj = bool(args.allow_missing_vision_projection_checkpoint)
+    for ckpt_key, tensor in load_sd.items():
+        rel_key = ckpt_key[len(_VISION_DCP_PREFIX) :]
+        param = radio_targets.get(rel_key)
+        if param is None and projector is not None:
+            param = projector_targets.get(rel_key)
+            if param is None and allow_missing_proj:
+                # projector-like key not present in our projector module; skip silently.
+                skipped += 1
+                continue
+        if param is None:
+            skipped += 1
+            continue
+        tensor = _tp_slice(tensor, param.shape, tp_rank, tp_size)
+        param.data.copy_(tensor.to(dtype=param.dtype))
+        loaded += 1
+
+    print_rank_0(
+        f"[load-vision-from] ViT loaded ({loaded}/{len(load_sd)} tensors"
+        f"{f', {skipped} skipped' if skipped else ''})"
+    )
