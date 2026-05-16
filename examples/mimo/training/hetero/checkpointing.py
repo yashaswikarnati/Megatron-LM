@@ -367,25 +367,52 @@ def _radio_model(model: MimoModel, encoder_name: str, radio_encoder_key: str):
     return getattr(encoders[radio_encoder_key], "radio_model", None)
 
 
+def _tp_slice(tensor: torch.Tensor, param_shape, tp_rank: int, tp_size: int) -> torch.Tensor:
+    """Slice a full (TP=1) tensor down to this rank's TP shard.
+
+    Handles column-parallel (split on dim 0) and row-parallel (split on dim 1).
+    Returns the tensor unchanged when it already matches the param shape.
+    """
+    if tp_size == 1 or tuple(tensor.shape) == tuple(param_shape):
+        return tensor
+    if tensor.shape[0] != param_shape[0]:
+        start = tp_rank * param_shape[0]
+        return tensor[start : start + param_shape[0], ...]
+    if len(tensor.shape) > 1 and tensor.shape[1] != param_shape[1]:
+        start = tp_rank * param_shape[1]
+        return tensor[:, start : start + param_shape[1]]
+    return tensor
+
+
 def load_vision_from_checkpoint(
     model: MimoModel,
     args: argparse.Namespace,
     topology: HeteroTopology,
 ) -> None:
-    """Load RADIO encoder weights from a Bridge DCP into the MIMO vision branch.
+    """Load RADIO encoder weights from a torch-DCP Bridge checkpoint.
 
-    Mirrors `examples/mimo/utils/model_helpers.load_submodule_ckpt`: requests the
-    RADIO encoder's `sharded_state_dict` so each ShardedTensor carries the right
-    TP-sharding metadata, then delegates per-rank slicing to
-    `dist_checkpointing.load`. Strict-validates that every parameter the model
-    expects was found in the checkpoint (extra_state buffers excluded).
+    The Bridge format (e.g. ``post-c-radio-omni``) is the
+    ``torch.distributed.checkpoint`` layout (``.metadata`` + ``__N_M.distcp``),
+    NOT Megatron's ``dist_checkpointing`` layout — so we cannot use
+    ``radio_model.sharded_state_dict`` + ``dist_checkpointing.load``.
 
-    No-op on LLM-only ranks and on ranks outside the encoder grid.
+    Strict guarantee: every RADIO parameter the model expects must come from
+    the checkpoint. Any unmatched key (missing or extra) raises. The old
+    silent ``skipped`` counter is gone.
+
+    Only encoder ranks call ``dcp.load`` — vision weights belong only to the
+    encoder branch. LLM-only ranks early-return. The init_process_group
+    timeout is bumped to 1 hour so LLM ranks do not drop their c10d store
+    while encoder ranks do lustre I/O.
     """
     if not args.load_vision_from:
         return
     if topology.encoder_grid is None or not is_rank_in_grid(topology.encoder_grid):
         return
+
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 
     radio_encoder_key = getattr(args, "vision_encoder_key", "radio_encoder")
     radio_model = _radio_model(model, topology.encoder_name, radio_encoder_key)
@@ -393,28 +420,53 @@ def load_vision_from_checkpoint(
         return
 
     iter_dir = _resolve_vision_dcp_dir(args.load_vision_from)
-    print_rank_0(f"[load-vision-from] loading ViT via dist-checkpointing from {iter_dir}")
+    print_rank_0(f"[load-vision-from] loading ViT via torch DCP from {iter_dir}")
 
-    sharded_sd = radio_model.sharded_state_dict(prefix=_VISION_DCP_PREFIX)
-    for k in list(sharded_sd):
-        if "extra_state" in k:
-            del sharded_sd[k]
-
-    loaded = dist_checkpointing.load(
-        sharded_state_dict={"state_dict": sharded_sd},
-        checkpoint_dir=iter_dir,
-        strict=StrictHandling.LOG_UNEXPECTED,
-    )
-    cleaned = {k.removeprefix(_VISION_DCP_PREFIX): v for k, v in loaded["state_dict"].items()}
-
-    incompatible = radio_model.load_state_dict(cleaned, strict=False)
-    unexpected = [k for k in incompatible.unexpected_keys if "extra_state" not in k]
-    missing = [k for k in incompatible.missing_keys if "extra_state" not in k]
-    if unexpected or missing:
+    reader = FileSystemReader(iter_dir)
+    ckpt_meta = reader.read_metadata().state_dict_metadata
+    load_sd: Dict[str, torch.Tensor] = {
+        k: torch.empty(meta.size, dtype=meta.properties.dtype)
+        for k, meta in ckpt_meta.items()
+        if k.startswith(_VISION_DCP_PREFIX) and isinstance(meta, TensorStorageMetadata)
+    }
+    if not load_sd:
         raise RuntimeError(
-            f"[load-vision-from] strict mismatch under '{_VISION_DCP_PREFIX}'. "
-            f"Missing: {missing}. Unexpected: {unexpected}."
+            f"[load-vision-from] no '{_VISION_DCP_PREFIX}*' keys in {iter_dir}"
         )
 
-    n_loaded = sum(1 for k in cleaned if "extra_state" not in k)
-    print_rank_0(f"[load-vision-from] ViT loaded ({n_loaded} tensors, strict)")
+    # Encoder-grid collective: only the 4 encoder ranks participate. LLM ranks
+    # short-circuited above; their c10d store stays alive thanks to the 1-hour
+    # init_process_group timeout in distributed.initialize_distributed().
+    dcp.load(load_sd, storage_reader=reader, process_group=topology.vision_pg.tp_dp_cp)
+
+    tp_pg = getattr(topology.vision_pg, "tp", None) if topology.vision_pg is not None else None
+    if is_process_group_member(tp_pg):
+        tp_rank, tp_size = tp_pg.rank(), tp_pg.size()
+    else:
+        tp_rank, tp_size = 0, 1
+
+    radio_targets: Dict[str, torch.Tensor] = dict(radio_model.named_parameters())
+    radio_targets.update(dict(radio_model.named_buffers()))
+
+    loaded_keys = set()
+    unexpected = []
+    for ckpt_key, tensor in load_sd.items():
+        rel_key = ckpt_key[len(_VISION_DCP_PREFIX) :]
+        if "extra_state" in rel_key:
+            continue
+        param = radio_targets.get(rel_key)
+        if param is None:
+            unexpected.append(rel_key)
+            continue
+        param.data.copy_(_tp_slice(tensor, param.shape, tp_rank, tp_size).to(dtype=param.dtype))
+        loaded_keys.add(rel_key)
+
+    missing = [k for k in radio_targets if k not in loaded_keys and "extra_state" not in k]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"[load-vision-from] strict mismatch under '{_VISION_DCP_PREFIX}'. "
+            f"Missing (model expects but ckpt lacks): {missing}. "
+            f"Unexpected (ckpt has but model lacks): {unexpected}."
+        )
+
+    print_rank_0(f"[load-vision-from] ViT loaded ({len(loaded_keys)} tensors, strict)")
