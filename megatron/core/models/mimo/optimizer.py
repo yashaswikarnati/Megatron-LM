@@ -347,6 +347,31 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
+def _module_has_trainable_parameters(module) -> bool:
+    """Return whether this rank owns any trainable parameters for a module."""
+    return module is not None and any(param.requires_grad for param in module.parameters())
+
+
+def _module_has_any_trainable_parameters(module, pg_collection: ProcessGroupCollection) -> bool:
+    """Return whether any rank in the module optimizer group has trainable parameters.
+
+    Without this cross-rank check, `get_mimo_optimizer` would call
+    `get_megatron_optimizer` on a module whose params are all frozen on every
+    rank (e.g. the language model under stage1 = ``--freeze-vit --freeze-lm``),
+    producing a placeholder optimizer that breaks downstream setup. Pattern
+    from NVIDIA/Megatron-LM#4790.
+    """
+    local_has_params = torch.tensor(
+        [int(_module_has_trainable_parameters(module))],
+        device=torch.cuda.current_device(),
+        dtype=torch.int,
+    )
+    torch.distributed.all_reduce(
+        local_has_params, op=torch.distributed.ReduceOp.MAX, group=pg_collection.intra_dist_opt
+    )
+    return bool(local_has_params.item())
+
+
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
 
@@ -390,7 +415,16 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
             else:
                 module = mimo_model.modality_submodules[module_name]
 
-            if module is not None:
+            # Skip the optimizer build when no rank in this module's
+            # intra-dist-opt group has any trainable parameters (e.g. the
+            # language model under stage1 = `--freeze-vit --freeze-lm`).
+            # Leaving `optimizer = None` lets `MimoOptimizer.is_stub_optimizer`
+            # handle the branch correctly, instead of constructing a
+            # placeholder DistributedOptimizer that breaks downstream setup.
+            module_has_trainable_params = _module_has_any_trainable_parameters(
+                module, pg_collection
+            )
+            if module is not None and module_has_trainable_params:
                 assert (
                     not hasattr(module, 'ddp_config')
                     or module.ddp_config is None
