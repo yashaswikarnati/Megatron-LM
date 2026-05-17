@@ -35,12 +35,16 @@ from examples.mimo.utils.hetero import is_process_group_member
 from megatron.core import dist_checkpointing, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.utils import _clean_metadata_for_serialization
+from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import MimoOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
 _TRACKER_FILE = "latest_checkpointed_iteration.txt"
 _CHECKPOINT_VERSION = 3.0
+# Sanjeev's pre-vlm-05 Bridge DCP wraps the whole VLM under a top-level `model.`
+# attribute, so the RADIO encoder's tensors are keyed `model.vision_model.<radio>`.
+_VISION_DCP_PREFIX = "model.vision_model."
 
 
 def _iter_directory(root: str, iteration: int) -> str:
@@ -312,7 +316,8 @@ def load_checkpoint(
         is_loading=True,
     )
 
-    loaded = dist_checkpointing.load(sharded_state_dict, source_dir)
+    strict = StrictHandling.RAISE_ALL if args.load_strict else StrictHandling.ASSUME_OK_UNEXPECTED
+    loaded = dist_checkpointing.load(sharded_state_dict, source_dir, strict=strict)
 
     model.load_state_dict(loaded["model"], strict=True)
 
@@ -332,3 +337,141 @@ def load_checkpoint(
     resume_iter = 0 if is_finetune else int(loaded.get("iteration", iteration))
     print_rank_0(f"resuming hetero training at iteration {resume_iter}")
     return resume_iter
+
+
+def _resolve_vision_dcp_dir(ckpt_dir: str) -> str:
+    """Resolve a flat-DCP or `iter_NNNNNNN/` directory under `ckpt_dir`."""
+    tracker = os.path.join(ckpt_dir, _TRACKER_FILE)
+    if os.path.isfile(tracker):
+        with open(tracker) as f:
+            iteration = int(f.read().strip())
+        return _iter_directory(ckpt_dir, iteration)
+    return ckpt_dir
+
+
+def _radio_model(model: MimoModel, encoder_name: str, radio_encoder_key: str):
+    """Return the inner RADIOViTModel for the encoder branch, or None.
+
+    Returns None on ranks outside the encoder branch (e.g. LLM-only ranks where
+    the modality submodule was never instantiated) and on encoder ranks whose
+    submodule does not contain the expected radio encoder key.
+    """
+    submodules = getattr(model, "modality_submodules", None)
+    if submodules is None or encoder_name not in submodules:
+        return None
+    vision_submodule = submodules[encoder_name]
+    inner = getattr(vision_submodule, "module", vision_submodule)  # unwrap DDP
+    encoders = getattr(inner, "encoders", None)
+    if encoders is None or radio_encoder_key not in encoders:
+        return None
+    return getattr(encoders[radio_encoder_key], "radio_model", None)
+
+
+def _tp_slice(tensor: torch.Tensor, param_shape, tp_rank: int, tp_size: int) -> torch.Tensor:
+    """Slice a full (TP=1) tensor down to this rank's TP shard.
+
+    Handles column-parallel (split on dim 0) and row-parallel (split on dim 1).
+    Returns the tensor unchanged when it already matches the param shape.
+    """
+    if tp_size == 1 or tuple(tensor.shape) == tuple(param_shape):
+        return tensor
+    if tensor.shape[0] != param_shape[0]:
+        start = tp_rank * param_shape[0]
+        return tensor[start : start + param_shape[0], ...]
+    if len(tensor.shape) > 1 and tensor.shape[1] != param_shape[1]:
+        start = tp_rank * param_shape[1]
+        return tensor[:, start : start + param_shape[1]]
+    return tensor
+
+
+def load_vision_from_checkpoint(
+    model: MimoModel,
+    args: argparse.Namespace,
+    topology: HeteroTopology,
+) -> None:
+    """Load RADIO encoder weights from a torch-DCP Bridge checkpoint.
+
+    The Bridge format (e.g. ``post-c-radio-omni``) is the
+    ``torch.distributed.checkpoint`` layout (``.metadata`` + ``__N_M.distcp``),
+    NOT Megatron's ``dist_checkpointing`` layout — so we cannot use
+    ``radio_model.sharded_state_dict`` + ``dist_checkpointing.load``.
+
+    Strict guarantee: every RADIO parameter the model expects must come from
+    the checkpoint. Any unmatched key (missing or extra) raises. The old
+    silent ``skipped`` counter is gone.
+
+    Only encoder ranks call ``dcp.load`` — vision weights belong only to the
+    encoder branch. LLM-only ranks early-return. The init_process_group
+    timeout is bumped to 1 hour so LLM ranks do not drop their c10d store
+    while encoder ranks do lustre I/O.
+    """
+    if not args.load_vision_from:
+        return
+    if topology.encoder_grid is None or not is_rank_in_grid(topology.encoder_grid):
+        return
+
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    radio_encoder_key = getattr(args, "vision_encoder_key", "radio_encoder")
+    radio_model = _radio_model(model, topology.encoder_name, radio_encoder_key)
+    if radio_model is None:
+        return
+
+    iter_dir = _resolve_vision_dcp_dir(args.load_vision_from)
+    print_rank_0(f"[load-vision-from] loading ViT via torch DCP from {iter_dir}")
+
+    reader = FileSystemReader(iter_dir)
+    ckpt_meta = reader.read_metadata().state_dict_metadata
+    load_sd: Dict[str, torch.Tensor] = {
+        k: torch.empty(meta.size, dtype=meta.properties.dtype)
+        for k, meta in ckpt_meta.items()
+        if k.startswith(_VISION_DCP_PREFIX) and isinstance(meta, TensorStorageMetadata)
+    }
+    if not load_sd:
+        raise RuntimeError(
+            f"[load-vision-from] no '{_VISION_DCP_PREFIX}*' keys in {iter_dir}"
+        )
+
+    # Encoder-grid collective: only the 4 encoder ranks participate. LLM ranks
+    # short-circuited above; their c10d store stays alive thanks to the 1-hour
+    # init_process_group timeout in distributed.initialize_distributed().
+    dcp.load(load_sd, storage_reader=reader, process_group=topology.vision_pg.tp_dp_cp)
+
+    tp_pg = getattr(topology.vision_pg, "tp", None) if topology.vision_pg is not None else None
+    if is_process_group_member(tp_pg):
+        tp_rank, tp_size = tp_pg.rank(), tp_pg.size()
+    else:
+        tp_rank, tp_size = 0, 1
+
+    # Build a regular state_dict keyed by radio_model parameter names, TP-sliced
+    # for this rank's view, then run it through the canonical load_state_dict
+    # path so PyTorch handles any module hooks (DDP buckets, TE extra_state, …)
+    # rather than us mutating `param.data` directly.
+    cleaned: Dict[str, torch.Tensor] = {}
+    unexpected: list[str] = []
+    radio_state = radio_model.state_dict()
+    for ckpt_key, tensor in load_sd.items():
+        rel_key = ckpt_key[len(_VISION_DCP_PREFIX) :]
+        if "extra_state" in rel_key:
+            continue
+        target = radio_state.get(rel_key)
+        if target is None:
+            unexpected.append(rel_key)
+            continue
+        cleaned[rel_key] = _tp_slice(tensor, target.shape, tp_rank, tp_size).to(
+            dtype=target.dtype
+        )
+
+    incompatible = radio_model.load_state_dict(cleaned, strict=False)
+    missing = [k for k in incompatible.missing_keys if "extra_state" not in k]
+    extra = [k for k in incompatible.unexpected_keys if "extra_state" not in k] + unexpected
+    if missing or extra:
+        raise RuntimeError(
+            f"[load-vision-from] strict mismatch under '{_VISION_DCP_PREFIX}'. "
+            f"Missing (model expects but ckpt lacks): {missing}. "
+            f"Unexpected (ckpt has but model lacks): {extra}."
+        )
+
+    print_rank_0(f"[load-vision-from] ViT loaded ({len(cleaned)} tensors, strict)")

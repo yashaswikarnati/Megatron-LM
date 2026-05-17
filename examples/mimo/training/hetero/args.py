@@ -265,6 +265,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ckpt.add_argument(
+        "--no-load-strict",
+        dest="load_strict",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable strict checkpoint validation. By default the load path uses "
+            "StrictHandling.RAISE_ALL so missing or unexpected keys raise immediately, "
+            "confirming every parameter the model expects came from the checkpoint. "
+            "Pass --no-load-strict to fall back to ASSUME_OK_UNEXPECTED for schema drift."
+        ),
+    )
+    ckpt.add_argument(
+        "--load-vision-from",
+        type=str,
+        default=None,
+        help=(
+            "Path to a Megatron-Bridge DCP containing `model.vision_model.*` keys. "
+            "Loaded only on encoder ranks, only on first run (when --load resolves no "
+            "checkpoint). Matches Sanjeev's --load-vision-from semantics from pre-vlm-05."
+        ),
+    )
+    ckpt.add_argument(
         "--dist-ckpt-optim-fully-reshardable",
         action=argparse.BooleanOptionalAction,
         default=False,

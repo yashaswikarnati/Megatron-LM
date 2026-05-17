@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Iterator, Optional
 
 import torch
@@ -75,6 +76,31 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
 
     wrap_active_modules_with_ddp(args, mimo_model, topology)
     return mimo_model
+
+
+def _full_checkpoint_exists(load_root: Optional[str]) -> bool:
+    """Whether a full hetero checkpoint exists at ``load_root``.
+
+    Mirrors `examples.mimo.training.hetero.checkpointing._read_tracker` but
+    returns a bool. Used to gate the vision warm-start: when ``--load``
+    resolves a real checkpoint, the main `load_checkpoint` path will restore
+    encoder weights from it, so the vision DCP warm-start must skip.
+    """
+    if not load_root:
+        return False
+    tracker = os.path.join(load_root, "latest_checkpointed_iteration.txt")
+    local_iter = -1
+    if os.path.isfile(tracker):
+        try:
+            with open(tracker) as f:
+                local_iter = int(f.read().strip())
+        except (ValueError, OSError):
+            local_iter = -1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        iters = torch.tensor([local_iter], dtype=torch.long, device="cuda")
+        torch.distributed.all_reduce(iters, op=torch.distributed.ReduceOp.MAX)
+        return int(iters[0].item()) >= 0
+    return local_iter >= 0
 
 
 def _resolve_bucket_size(
