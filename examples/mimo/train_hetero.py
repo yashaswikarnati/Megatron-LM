@@ -2,6 +2,7 @@
 
 """Standalone heterogeneous MIMO training entrypoint."""
 
+import faulthandler
 import os
 import sys
 
@@ -24,6 +25,12 @@ from examples.mimo.training.hetero.loop import run_train_loop
 
 def main() -> None:
     """Program entrypoint."""
+    # Dump every rank's python stack every 120 s. Hands-off diagnostic for
+    # hetero MIMO hangs — output goes to each rank's stderr so cog/slurm log
+    # capture works without code changes.
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(120, repeat=True)
+
     args = parse_args()
     if args.enable_experimental:
         set_experimental_flag(True)
