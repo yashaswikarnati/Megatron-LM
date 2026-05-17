@@ -12,7 +12,6 @@ import torch
 from examples.mimo.training.hetero.args import prepare_args
 from examples.mimo.training.hetero.checkpointing import (
     load_checkpoint,
-    load_vision_from_checkpoint,
     save_checkpoint,
 )
 from examples.mimo.training.hetero.data import select_data_iterator, validate_data_iterator
@@ -66,11 +65,10 @@ def run_train_loop(args: argparse.Namespace) -> None:
         logger = HeteroTrainingLogger(args=args, topology=topology)
         debug_rank("training setup ready")
 
+        # Vision DCP warm-start (`--load-vision-from`) happens inside
+        # build_mimo_runtime, before DDP wrap, so the distributed optimizer's
+        # fp32 main-param mirror is built from the loaded bf16 weights.
         start_iteration = load_checkpoint(model, optimizer, opt_param_scheduler, args, topology)
-        if start_iteration == 0 and args.load_vision_from is not None:
-            # First-run encoder warm-start. `--load` is authoritative when it resolves
-            # a checkpoint; only consult `--load-vision-from` when no resume happened.
-            load_vision_from_checkpoint(model, args, topology)
         if start_iteration >= args.train_iters:
             print_rank_0(
                 f"Resume iteration ({start_iteration}) >= --train-iters ({args.train_iters}); "

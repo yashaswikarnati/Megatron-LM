@@ -22,7 +22,13 @@ def initialize_distributed() -> None:
     if not dist.is_initialized():
         # 1-hour collective timeout: lustre Bridge-DCP reads on encoder ranks can
         # leave LLM ranks idle for several minutes; default 600 s is too short.
-        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=1))
+        # device_id is explicit: pytorch's auto-guess from global rank can cause
+        # hangs in heterogeneous topologies (encoder/LLM offset != 0).
+        dist.init_process_group(
+            backend="nccl",
+            timeout=datetime.timedelta(hours=1),
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
     assert_megatron_parallel_state_uninitialized()
     try:
         parallel_state.get_global_memory_buffer()

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import Iterator, Optional
 
 import torch
@@ -74,7 +75,48 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
     debug_rank("MimoModel moved to target dtype/device")
 
     wrap_active_modules_with_ddp(args, mimo_model, topology)
+
+    # Vision-from-checkpoint warm-start runs AFTER the DDP wrap (so we can
+    # update the contiguous param buffer in place) but BEFORE the optimizer
+    # is built (so the distributed optimizer's fp32 main-param mirror is
+    # constructed from the loaded bf16 weights). Loading post-optimizer
+    # leaves the fp32 mirror at random init while the bf16 model view holds
+    # the loaded weights — the stale fp32 mirror would silently overwrite
+    # our load on the first optimizer step and produced iter-1 collective
+    # hangs on nb-hel.
+    if args.load_vision_from and not _full_checkpoint_exists(args.load):
+        from examples.mimo.training.hetero.checkpointing import (
+            load_vision_from_checkpoint,
+        )
+
+        load_vision_from_checkpoint(mimo_model, args, topology)
+
     return mimo_model
+
+
+def _full_checkpoint_exists(load_root: Optional[str]) -> bool:
+    """Whether a full hetero checkpoint exists at ``load_root``.
+
+    Mirrors `examples.mimo.training.hetero.checkpointing._read_tracker` but
+    returns a bool. Used to gate the vision warm-start: when ``--load``
+    resolves a real checkpoint, the main `load_checkpoint` path will restore
+    encoder weights from it, so the vision DCP warm-start must skip.
+    """
+    if not load_root:
+        return False
+    tracker = os.path.join(load_root, "latest_checkpointed_iteration.txt")
+    local_iter = -1
+    if os.path.isfile(tracker):
+        try:
+            with open(tracker) as f:
+                local_iter = int(f.read().strip())
+        except (ValueError, OSError):
+            local_iter = -1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        iters = torch.tensor([local_iter], dtype=torch.long, device="cuda")
+        torch.distributed.all_reduce(iters, op=torch.distributed.ReduceOp.MAX)
+        return int(iters[0].item()) >= 0
+    return local_iter >= 0
 
 
 def _resolve_bucket_size(
