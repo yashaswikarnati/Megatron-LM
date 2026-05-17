@@ -75,22 +75,6 @@ def build_mimo_runtime(args: argparse.Namespace, topology: HeteroTopology) -> Mi
     debug_rank("MimoModel moved to target dtype/device")
 
     wrap_active_modules_with_ddp(args, mimo_model, topology)
-
-    # Vision-from-checkpoint warm-start runs AFTER the DDP wrap (so we can
-    # update the contiguous param buffer in place) but BEFORE the optimizer
-    # is built (so the distributed optimizer's fp32 main-param mirror is
-    # constructed from the loaded bf16 weights). Loading post-optimizer
-    # leaves the fp32 mirror at random init while the bf16 model view holds
-    # the loaded weights — the stale fp32 mirror would silently overwrite
-    # our load on the first optimizer step and produced iter-1 collective
-    # hangs on nb-hel.
-    if args.load_vision_from and not _full_checkpoint_exists(args.load):
-        from examples.mimo.training.hetero.checkpointing import (
-            load_vision_from_checkpoint,
-        )
-
-        load_vision_from_checkpoint(mimo_model, args, topology)
-
     return mimo_model
 
 

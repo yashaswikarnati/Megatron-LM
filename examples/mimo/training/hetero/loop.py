@@ -12,6 +12,7 @@ import torch
 from examples.mimo.training.hetero.args import prepare_args
 from examples.mimo.training.hetero.checkpointing import (
     load_checkpoint,
+    load_vision_from_checkpoint,
     save_checkpoint,
 )
 from examples.mimo.training.hetero.data import select_data_iterator, validate_data_iterator
@@ -65,10 +66,17 @@ def run_train_loop(args: argparse.Namespace) -> None:
         logger = HeteroTrainingLogger(args=args, topology=topology)
         debug_rank("training setup ready")
 
-        # Vision DCP warm-start (`--load-vision-from`) happens inside
-        # build_mimo_runtime, before DDP wrap, so the distributed optimizer's
-        # fp32 main-param mirror is built from the loaded bf16 weights.
         start_iteration = load_checkpoint(model, optimizer, opt_param_scheduler, args, topology)
+        if start_iteration == 0 and args.load_vision_from is not None:
+            # Vision-only warm-start when `--load` did NOT resolve a full ckpt.
+            # The load mutates radio encoder params in place (post-DDP-wrap,
+            # post-optimizer build). We then call optimizer.reload_model_params()
+            # to refresh the distributed optimizer's fp32 main-param mirror from
+            # the just-loaded bf16 model — same pattern megatron uses after
+            # in-place param mutation in upcycling (training.py:1826).
+            load_vision_from_checkpoint(model, args, topology)
+            if optimizer is not None and not optimizer.is_stub_optimizer:
+                optimizer.reload_model_params()
         if start_iteration >= args.train_iters:
             print_rank_0(
                 f"Resume iteration ({start_iteration}) >= --train-iters ({args.train_iters}); "
