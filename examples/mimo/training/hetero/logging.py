@@ -36,6 +36,15 @@ class HeteroTrainingLogger:
     loss_total: float = 0.0
     loss_count: int = 0
     interval_start: float = field(default_factory=time.time)
+    _tb_writer: Optional[object] = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Only the language logging rank owns the writer; other ranks no-op.
+        tb_dir = getattr(self.args, "tensorboard_dir", None)
+        if tb_dir and is_language_log_rank(self.topology):
+            from torch.utils.tensorboard import SummaryWriter
+
+            self._tb_writer = SummaryWriter(log_dir=tb_dir)
 
     def record_step(self, result: TrainStepResult) -> Optional[float]:
         """Update interval state from one train step and return this iteration's loss."""
@@ -88,6 +97,33 @@ class HeteroTrainingLogger:
             log_string += " number of nan iterations: {:3d} |".format(self.nan_iterations)
             sys.stdout.write(f"{log_string}\n")
             sys.stdout.flush()
+        if self._tb_writer is not None:
+            batch_size = get_global_batch_size(self.args)
+            samples = self.consumed_train_samples
+            if loss_value is not None:
+                self._tb_writer.add_scalar("lm loss", loss_value, iteration)
+                self._tb_writer.add_scalar("lm loss vs samples", loss_value, samples)
+            if learning_rate is not None:
+                self._tb_writer.add_scalar("learning-rate", learning_rate, iteration)
+                self._tb_writer.add_scalar(
+                    "learning-rate vs samples", learning_rate, samples
+                )
+            self._tb_writer.add_scalar("batch-size", batch_size, iteration)
+            self._tb_writer.add_scalar("batch-size vs samples", batch_size, samples)
+            self._tb_writer.add_scalar("loss-scale", loss_scale, iteration)
+            if result.grad_norm is not None:
+                self._tb_writer.add_scalar("grad-norm", result.grad_norm, iteration)
+                self._tb_writer.add_scalar(
+                    "grad-norm vs samples", result.grad_norm, samples
+                )
+            if result.num_zeros_in_grad is not None:
+                self._tb_writer.add_scalar(
+                    "num-zeros", result.num_zeros_in_grad, iteration
+                )
+            self._tb_writer.add_scalar(
+                "iteration-time-ms", elapsed_ms, iteration
+            )
+            self._tb_writer.flush()
         self.reset_interval()
 
     def reset_interval(self) -> None:
