@@ -30,6 +30,7 @@ def _supported_kwargs(fn, kwargs):
 
 import torch
 
+from megatron.energon import WorkerConfig
 from megatron.energon.task_encoder.multimodal import (
     MultiModalPackingEncoder,
     PackingConfig,
@@ -86,6 +87,12 @@ class TokenizerAdapter:
 class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
     """Remap Energon multimodal packed samples to MIMO batch inputs."""
 
+    # Key under which the producing Energon worker's ``global_worker_id`` is
+    # stamped on each output batch when ``attach_provenance`` is enabled.
+    # Hetero MIMO uses this to route samples back to their LLM data lane when
+    # a single encoder-side Energon iterator multiplexes several lanes.
+    PROVENANCE_KEY = "__encoder_provenance__"
+
     def __init__(
         self,
         vision_config: VisionConfig,
@@ -94,11 +101,13 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
         encoder_name: str = "radio_encoder",
         encoder_input_key: str = "x",
         target_seq_length: Optional[int] = None,
+        attach_provenance: bool = False,
     ) -> None:
         super().__init__(vision_config, packing_config, tokenizer)
         self.encoder_name = encoder_name
         self.encoder_input_key = encoder_input_key
         self._target_seq_length = target_seq_length
+        self._attach_provenance = attach_provenance
         self._embeddings_per_tile = get_num_image_embeddings(
             img_h=vision_config.img_h,
             img_w=vision_config.img_w,
@@ -216,6 +225,14 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
                 raise RuntimeError(f"Packing requires micro_batch_size=1, got {batch_size}")
             result["packing_kwargs"] = _build_packing_kwargs(samples[0], max_len)
 
+        if self._attach_provenance:
+            active = WorkerConfig.active_worker_config
+            if active is None:
+                raise RuntimeError(
+                    "attach_provenance=True requires an active Energon worker context"
+                )
+            result[self.PROVENANCE_KEY] = active.global_worker_id()
+
         return result
 
 
@@ -269,7 +286,11 @@ def _build_packing_kwargs(sample: PackedSample, max_len: int) -> dict[str, torch
 
 
 def build_multimodal_encoder(
-    args, tokenizer, encoder_name: str = "radio_encoder", encoder_input_key: str = "x"
+    args,
+    tokenizer,
+    encoder_name: str = "radio_encoder",
+    encoder_input_key: str = "x",
+    attach_provenance: bool = False,
 ) -> MimoMultiModalPackingEncoder:
     """Build the MIMO Energon encoder from train args."""
     target_seq_length = _resolve_target_seq_length(args)
@@ -312,6 +333,7 @@ def build_multimodal_encoder(
         encoder_name=encoder_name,
         encoder_input_key=encoder_input_key,
         target_seq_length=target_seq_length,
+        attach_provenance=attach_provenance,
     )
 
 
