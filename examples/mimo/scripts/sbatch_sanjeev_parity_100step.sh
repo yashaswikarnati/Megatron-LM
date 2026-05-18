@@ -20,7 +20,7 @@
 set -euo pipefail
 
 SCRATCH_ROOT=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch
-SANJEEV_REPO="${SCRATCH_ROOT}/sanjeev-repos/megatron-lm"
+SANJEEV_REPO="${SANJEEV_REPO:-${SCRATCH_ROOT}/sanjeev-repos/megatron-lm-clean}"
 CONTAINER_IMAGE="${SANJEEV_CONTAINER_IMAGE:-${SCRATCH_ROOT}/images/m_lm_energon_0506.sqsh}"
 TOKENIZER_MODEL="${SCRATCH_ROOT}/tokenizers/sanjeevnv-multimodal-pretraining-26f81d5db838eb6dee2ff8692db83a2fbc76f3ff"
 
