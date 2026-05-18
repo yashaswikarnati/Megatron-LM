@@ -1,19 +1,16 @@
 #!/bin/bash
-# 150-step train-loss parity run — hetero MIMO side.
-# 3 nodes (1n encoder DP=8 + 2n LLM TP=2 DP=8 EP=16), GBS=8.
-# Paired with sbatch_sanjeev_parity_100step.sh.
-#
-# Uses --load-nemotron-checkpoint to route ckpt-load through
-# examples/mimo/utils/model_helpers.py:load_nemotron_vlm_ckpt_hetero and
-# start training at iter 0 with fresh optimizer + RNG.
+# 5k-step train-loss parity run -- hetero MIMO side, GBS=192.
+# 9 nodes (1n encoder DP=8 + 8n LLM TP=2 DP=32 EP=16). GBS=192 via grad
+# accumulation: MBS=1, LLM_DP=32, NUM_MICROBATCHES=6.
+# Paired with sbatch_sanjeev_parity_5k.sh.
 
 #SBATCH -A nemotron_n4_pre
 #SBATCH -p batch
-#SBATCH -N 3
+#SBATCH -N 9
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
-#SBATCH --time=02:00:00
-#SBATCH -J mimo-parity-100step
+#SBATCH --time=04:00:00
+#SBATCH -J mimo-parity-5k
 #SBATCH --exclusive
 #SBATCH --output=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.out
 #SBATCH --error=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.err
@@ -28,9 +25,6 @@ else
 fi
 
 SCRATCH_ROOT=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch
-# Default to the energon-baked container so the energon swap below finds
-# /usr/local/lib/python3.12/dist-packages/megatron. Skip uv for the same
-# reason. Override via HETERO_CONTAINER_IMAGE / HETERO_SKIP_UV if needed.
 CONTAINER_IMAGE="${HETERO_CONTAINER_IMAGE:-${SCRATCH_ROOT}/images/m_lm_energon_0506.sqsh}"
 export HETERO_SKIP_UV="${HETERO_SKIP_UV:-1}"
 ENV_ROOT="${SCRATCH_ROOT}/envs/megatron_lm/01f0da7539da4b39"
@@ -39,24 +33,23 @@ VISION_CKPT="${SCRATCH_ROOT}/encoders/post-c-radio-omni"
 
 NEMOTRON_CKPT="${NEMOTRON_CKPT:-/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/sasatheesh/workspace/output/3b_nano_vlm_sota_mtp2_90t10v_post_c_radio_omni_96n_tp2_ep16_selective_300b_20260511/checkpoints/iter_0001000}"
 
-RUN_NAME="mimo-parity-100step"
+RUN_NAME="mimo-parity-5k"
 RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
-# ---- topology: TP=2 EP=16 LLM + TP=1 DP=8 encoder lane ----------------------
-ENCODER_TP=1; ENCODER_CP=1; ENCODER_PP=1; ENCODER_DP=8; ENCODER_EP=1
-LLM_TP=2;     LLM_CP=1;     LLM_PP=1;     LLM_DP=8;    LLM_EP=16;   LLM_EXPT_TP=1
+# ---- topology: 1n encoder (DP=8) + 8n LLM (TP=2 DP=32 EP=16) ----------------
+ENCODER_TP=1; ENCODER_CP=1; ENCODER_PP=1; ENCODER_DP=8;  ENCODER_EP=1
+LLM_TP=2;     LLM_CP=1;     LLM_PP=1;     LLM_DP=32;    LLM_EP=16;   LLM_EXPT_TP=1
 LLM_ONLY=0
 
-# ---- batch / schedule pinned for the parity diff ----------------------------
+# ---- batch / schedule -------------------------------------------------------
 MICRO_BATCH_SIZE=1
-GLOBAL_BATCH_SIZE=8
-NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 1
-TRAIN_ITERS=150
+GLOBAL_BATCH_SIZE=192
+NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 6
+TRAIN_ITERS=5000
 LOG_INTERVAL=1
 SAVE_INTERVAL=99999999          # don't save during the parity run
 
-# WSD schedule (matches the comparison recipe). LR_WARMUP_SAMPLES=0 so both
-# sides hit full LR from iter 1 and there's no warmup-ramp difference.
+# Flat LR: warmup=0 and a huge decay window keep LR constant for the full 5k.
 LR=1.2e-3
 MIN_LR=1.2e-5
 WEIGHT_DECAY=0.1
@@ -72,14 +65,14 @@ MODEL_PROVIDER=nemotron-moe-vlm-54l
 ENABLE_EXPERIMENTAL=1
 MOE_ROUTER_FORCE_LOAD_BALANCING=0
 NUM_WORKERS=2
-PACKING_BUFFER_SIZE=4   # smaller pool: less likelihood of multi-image packs exceeding seq_length after MIMO expansion (see energon_multimodal_provider.py:150 defensive check)
+PACKING_BUFFER_SIZE=4
 SHUFFLE_BUFFER_SIZE=100
 MAX_SAMPLES_PER_SEQUENCE=100
 CHECK_HEL_PATHS=1
 
 WORLD_SIZE=$(( ENCODER_TP * ENCODER_CP * ENCODER_PP * ENCODER_DP \
              + LLM_TP * LLM_CP * LLM_PP * LLM_DP ))
-[[ "${WORLD_SIZE}" -eq 24 ]] || { echo "ERROR: derived world_size=${WORLD_SIZE} (expected 24)" >&2; exit 1; }
+[[ "${WORLD_SIZE}" -eq 72 ]] || { echo "ERROR: derived world_size=${WORLD_SIZE} (expected 72)" >&2; exit 1; }
 
 mkdir -p "${RUN_DIR}/logs/app" "${RUN_DIR}/logs/torchrun" "${RUN_DIR}/checkpoints" \
          "${RUN_DIR}/tensorboard" "${RUN_DIR}/data_cache" "${RUN_DIR}/tmp"
@@ -90,12 +83,6 @@ export TORCHRUN_LOG_DIR="${RUN_DIR}/logs/torchrun"
 export CHECKPOINT_SAVE_PATH="${RUN_DIR}/checkpoints" CHECKPOINT_LOAD_PATH="${NEMOTRON_CKPT}"
 export CHECKPOINT_DIR="${RUN_DIR}/checkpoints" TENSORBOARD_PATH="${RUN_DIR}/tensorboard" TB_DIR="${RUN_DIR}/tensorboard"
 export DATA_CACHE_DIR="${RUN_DIR}/data_cache"
-# DataLoader workers use TMPDIR for AF_UNIX IPC sockets; the path must be
-# below the 108-char Unix-socket limit. RUN_DIR under our lustre scratch
-# is already ~93 chars and python's multiprocessing appends more, blowing
-# the limit. Use /tmp (node-local, short, exists by default on every
-# node — /dev/shm would also work but only if pre-created on every
-# node, which the sbatch head-node mkdir doesn't do).
 export TMPDIR="/tmp"
 
 export HOME="${SCRATCH_ROOT}/runtime/megatron_lm/home"
@@ -142,19 +129,19 @@ TRAIN_LAUNCH_ARGS=(
   --save-interval "${SAVE_INTERVAL}"
   --no-load-optim --no-load-rng
   --load-nemotron-checkpoint "${NEMOTRON_CKPT}"
-  --no-dynamic-resolution   # parity step 1: fixed-res images on both sides
+  --no-dynamic-resolution
   --tensorboard-dir "${RUN_DIR}/tensorboard"
 )
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
 
-echo "=== hetero parity 100-step ==="
+echo "=== hetero parity 5k ==="
 echo "repo=${REPO_ROOT} run_dir=${RUN_DIR}"
 echo "world_size=${WORLD_SIZE} gbs=${GLOBAL_BATCH_SIZE} microbatches=${NUM_MICROBATCHES} train_iters=${TRAIN_ITERS}"
 echo "layout: encoder(dp=${ENCODER_DP}) llm(tp=${LLM_TP},dp=${LLM_DP},ep=${LLM_EP})"
 echo "ckpt=${NEMOTRON_CKPT}"
-echo "============================="
+echo "========================"
 
 srun --kill-on-bad-exit=1 \
   --ntasks="${WORLD_SIZE}" \
@@ -164,7 +151,6 @@ srun --kill-on-bad-exit=1 \
   --container-mounts="${CONTAINER_MOUNTS}" \
   --container-workdir="${REPO_ROOT}" \
   bash -lc 'set -euo pipefail; cd "${REPO_ROOT}";
-    # Optionally swap the container-baked energon for an editable clone.
     if [ -n "${USE_HETERO_ENERGON_OVERRIDE:-}" ]; then
       ESRC="${HETERO_ENERGON_SRC:-/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/megatron-energon-editable/src/megatron/energon}"
       EDST="/usr/local/lib/python3.12/dist-packages/megatron/energon"
