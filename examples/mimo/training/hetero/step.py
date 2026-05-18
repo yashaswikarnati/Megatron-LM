@@ -13,7 +13,11 @@ import torch
 import torch.distributed as dist
 
 import megatron.core.pipeline_parallel.schedules as schedule
-from examples.mimo.training.hetero.grad_sync import zero_active_grad_buffers
+from examples.mimo.training.hetero.grad_sync import (
+    mark_modality_participation,
+    reset_modality_participation,
+    zero_active_grad_buffers,
+)
 from examples.mimo.training.hetero.optimizer import get_global_batch_size
 from examples.mimo.training.hetero.topology import HeteroTopology
 from examples.mimo.utils.hetero import debug_rank
@@ -68,6 +72,7 @@ def forward_step(data_iterator, model):
         batch = next(data_iterator) if data_iterator is not None else {"input_ids": None}
     with timeline_event("data.to_cuda", cuda=True):
         batch = move_batch_to_cuda(batch)
+    mark_modality_participation(model, batch)
     debug_rank("forward_step batch prepared")
     debug_rank("forward_step model call start")
     output_tensor, loss_mask = model(**batch)
@@ -99,6 +104,7 @@ def train_step(
 ) -> TrainStepResult:
     """Run one Megatron-shaped hetero training step."""
     zero_active_grad_buffers(model)
+    reset_modality_participation(model)
     optimizer.zero_grad()
 
     debug_rank("starting forward/backward schedule")

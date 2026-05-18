@@ -165,20 +165,14 @@ def _build_single_lane_iterator(args, tp_group, lane: int, role: str, random_see
         shuffle_buffer_size=args.shuffle_buffer_size,
         max_samples_per_sequence=args.max_samples_per_sequence,
     )
-    # Use get_savable_loader (not get_loader): the SavableDatasetWrapper sets
-    # worker_id_offset and per-worker init that affects step-0 sample order.
-    try:
-        from megatron.energon.cache.no_cache import NoCachePool
+    from megatron.energon.cache.no_cache import NoCachePool
 
-        loader = get_savable_loader(
-            dataset,
-            cache_pool=NoCachePool(),
-            watchdog_timeout_seconds=5 * 60,
-            watchdog_initial_timeout_seconds=5 * 60,
-        )
-    except (ImportError, TypeError):
-        # Older energon may not have NoCachePool / watchdog kwargs.
-        loader = get_savable_loader(dataset)
+    loader = get_savable_loader(
+        dataset,
+        cache_pool=NoCachePool(),
+        watchdog_timeout_seconds=5 * 60,
+        watchdog_initial_timeout_seconds=5 * 60,
+    )
     return EnergonIterator(
         loader,
         tp_group=tp_group,

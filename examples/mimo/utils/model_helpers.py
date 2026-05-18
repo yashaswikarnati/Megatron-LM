@@ -1,13 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Helpers to load non-MIMO Nemotron VLM checkpoints into our hetero MIMO model.
+"""Helpers to load non-MIMO Nemotron VLM checkpoints into hetero MIMO models.
 
-Ported and adapted from `feat/nemotron-moe-vlm-mimo:examples/mimo/utils/model_helpers.py`
-for the hetero MIMO topology where vision and language live on disjoint rank
-grids. The POC version targeted a homogeneous (single-grid) MIMO with submodule
-key ``"images"``; ours uses ``topology.encoder_name`` (= ``"radio_encoder"`` for
-Nemotron) and only LM keys exist on LLM ranks (and only vision keys on encoder
-ranks).
+Vision and language live on disjoint rank grids in hetero, so encoder ranks
+load only ``vision_model.*`` / ``vision_projection.*`` and LLM ranks load
+only ``language_model.*``.
 """
 
 from __future__ import annotations
@@ -17,6 +14,7 @@ from typing import Any
 
 import torch
 
+from examples.mimo.utils.hetero import is_process_group_member
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.validation import StrictHandling
 
@@ -77,20 +75,9 @@ def _load_submodule_from_ckpt(
     ckpt_prefix: str,
     dp_cp_group=None,
 ) -> tuple[int, int]:
-    """Load a single submodule from ``ckpt_dir`` using a checkpoint-side prefix.
-
-    Asks the submodule for its own ``sharded_state_dict(prefix=ckpt_prefix)``
-    so per-rank shard metadata (TP / EP / DP) is built correctly. mcore
-    distributes the load across ranks; each rank reads only its own shards.
-
-    ``dp_cp_group`` is the data-parallel-with-context-parallel process group
-    for this rank's grid. Required because our hetero loop does not
-    initialize ``megatron.core.parallel_state``; if omitted, mcore falls
-    back to a parallel_state lookup and raises
-    "data parallel group with context parallel combined is not initialized".
-
-    Returns ``(n_loaded, n_total)`` parameter-tensor counts for reporting.
-    """
+    """Load one submodule from ``ckpt_dir`` under ``ckpt_prefix``. Returns
+    ``(n_loaded, n_total)`` parameter-tensor counts. ``dp_cp_group`` must be
+    passed when ``parallel_state`` isn't initialized."""
     metadata = {"dp_cp_group": dp_cp_group} if dp_cp_group is not None else None
     sharded_sd = module.sharded_state_dict(prefix=ckpt_prefix, metadata=metadata)
 
@@ -146,36 +133,10 @@ def load_nemotron_vlm_ckpt_hetero(
     encoder_dp_cp_group=None,
     skip_projection: bool = False,
 ) -> None:
-    """Load a non-MIMO Nemotron VLM checkpoint into a hetero MIMO model.
-
-    The checkpoint uses flat prefixes (``vision_model.*``,
-    ``vision_projection.*``, ``language_model.*``). Each hetero rank holds
-    only one of the two grids (encoder or LLM), so each rank loads only the
-    submodules it owns:
-
-    - encoder ranks: ``vision_model.*`` (and optionally ``vision_projection.*``)
-      into ``modality_submodules[encoder_name].encoders[radio_encoder_key].radio_model``
-      (and ``modality_submodules[encoder_name].input_projections[0]``).
-    - LLM ranks: ``language_model.*`` into ``mimo_model.language_model``.
-
-    Args:
-        mimo_model: The hetero ``MimoModel`` instance on this rank.
-        ckpt_dir: Either the parent ``checkpoints/`` directory (containing
-            ``latest_checkpointed_iteration.txt``) or a specific
-            ``iter_NNNNNNN`` directory.
-        encoder_name: Outer key under ``mimo_model.modality_submodules``
-            (e.g., ``"radio_encoder"`` from ``topology.encoder_name``).
-        radio_encoder_key: Inner key under
-            ``modality_submodules[encoder_name].encoders`` (e.g.,
-            ``"radio_encoder"`` from ``NEMOTRON_VISION_ENCODER_KEY``).
-        has_encoder: True iff this rank is in the encoder grid (i.e. it
-            should load the vision portions).
-        has_language: True iff this rank is in the LLM grid (i.e. it
-            should load the language portion).
-        skip_projection: When True, the vision projection is left at random
-            init even when ``has_encoder=True`` (use for adapter-only
-            training).
-    """
+    """Load a flat ``vision_model.* / vision_projection.* / language_model.*``
+    ckpt into a hetero MIMO model. Each rank loads only the submodules its
+    grid owns: encoder ranks load vision_model + vision_projection; LLM
+    ranks load language_model."""
     ckpt_dir = _resolve_ckpt_dir(ckpt_dir)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     if rank == 0:
@@ -330,3 +291,46 @@ def load_nemotron_vlm_ckpt_hetero(
                 f" ({n_loaded}/{n_total} param tensors)",
                 flush=True,
             )
+
+
+def load_and_refresh_nemotron_checkpoint(model, optimizer, topology, args) -> None:
+    """Load a Nemotron-format ckpt into a hetero MIMO model and resync the
+    optimizer's FP32 main params. DistributedOptimizer is built before this
+    custom load runs, so its shards otherwise hold the model-provider init
+    weights; ``reload_model_params`` syncs them to the loaded weights."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import NEMOTRON_VISION_ENCODER_KEY
+
+    if args.load:
+        raise ValueError(
+            "--load and --load-nemotron-checkpoint are mutually exclusive; pick one"
+        )
+
+    rank_in_llm = topology.language_pg is not None and is_process_group_member(
+        getattr(topology.language_pg, "dp_cp", None)
+    )
+    rank_in_enc = topology.vision_pg is not None and is_process_group_member(
+        getattr(topology.vision_pg, "dp_cp", None)
+    )
+    has_encoder = (
+        rank_in_enc
+        and topology.encoder_name in getattr(model, "modality_submodules", {})
+        and model.modality_submodules[topology.encoder_name] is not None
+    )
+    has_language = rank_in_llm and getattr(model, "language_model", None) is not None
+
+    load_nemotron_vlm_ckpt_hetero(
+        model,
+        args.load_nemotron_checkpoint,
+        encoder_name=topology.encoder_name,
+        radio_encoder_key=NEMOTRON_VISION_ENCODER_KEY,
+        has_encoder=has_encoder,
+        has_language=has_language,
+        language_dp_cp_group=(
+            getattr(topology.language_pg, "dp_cp", None) if has_language else None
+        ),
+        encoder_dp_cp_group=(
+            getattr(topology.vision_pg, "dp_cp", None) if has_encoder else None
+        ),
+        skip_projection=False,
+    )
+    optimizer.reload_model_params()

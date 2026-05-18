@@ -280,12 +280,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Path to a Nemotron-format VLM dist-ckpt directory (iter_NNNNNNN/, "
-            "with flat model.vision_model.* / model.vision_projection.* / "
-            "model.language_model.* keys). When set, weights are loaded via "
-            "``load_nemotron_vlm_ckpt_hetero`` (same converter as the inference "
-            "driver), training starts at iter 0, and ``--no-load-optim "
-            "--no-load-rng`` are forced. Mutually exclusive with ``--load``."
+            "Path to a flat Nemotron-format VLM dist-ckpt. Loads weights and "
+            "starts training at iter 0; mutually exclusive with --load."
         ),
     )
     ckpt.add_argument(
