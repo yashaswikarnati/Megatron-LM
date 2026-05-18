@@ -345,8 +345,12 @@ class RADIOViTModel(VisionModule):
                 ).to(pos_embed.dtype)
             else:
                 max_dim = max(input_dims)
+                # Use align_corners=False on bilinear pos-embedding interpolation
+                # to match upstream RADIO. align_corners=True drifts numerics
+                # and breaks parity for any ckpt trained against the standard
+                # RADIO implementation.
                 pos_embed = F.interpolate(
-                    pos_embed.float(), size=(max_dim, max_dim), align_corners=True, mode="bilinear"
+                    pos_embed.float(), size=(max_dim, max_dim), align_corners=False, mode="bilinear"
                 ).to(pos_embed.dtype)
 
                 pos_embed = window_select(pos_embed)
@@ -355,7 +359,7 @@ class RADIOViTModel(VisionModule):
 
         if pos_embed.shape[-2:] != input_dims:
             pos_embed = F.interpolate(
-                pos_embed.float(), size=input_dims, align_corners=True, mode="bilinear"
+                pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
             ).to(pos_embed.dtype)
 
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)

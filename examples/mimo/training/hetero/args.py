@@ -121,8 +121,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Total training budget in consumed samples. When set, --train-iters is "
-            "re-derived as ceil(train_samples / global_batch_size). Matches Sanjeev's "
-            "samples-based recipe."
+            "re-derived as ceil(train_samples / global_batch_size)."
         ),
     )
     train.add_argument("--lr", type=float, default=1.0e-4)
@@ -210,6 +209,18 @@ def parse_args() -> argparse.Namespace:
             "bus bandwidth at large DP counts."
         ),
     )
+    train.add_argument(
+        "--correct-encoder-grad-for-partial-participation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When some encoder DP ranks see text-only batches, scale vision "
+            "grads post-DP-reduce by encoder_dp_size / participation_count so "
+            "the vision encoder learns at full rate instead of being diluted. "
+            "Default on; pass --no-correct-encoder-grad-for-partial-participation "
+            "to disable."
+        ),
+    )
     train.add_argument("--seed", type=int, default=12345)
     train.add_argument("--log-interval", type=int, default=1)
 
@@ -262,6 +273,19 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Treat the load directory as a pretrained checkpoint: restart from iteration 0 and "
             "skip optimizer + scheduler state regardless of the other flags."
+        ),
+    )
+    ckpt.add_argument(
+        "--load-nemotron-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a Nemotron-format VLM dist-ckpt directory (iter_NNNNNNN/, "
+            "with flat model.vision_model.* / model.vision_projection.* / "
+            "model.language_model.* keys). When set, weights are loaded via "
+            "``load_nemotron_vlm_ckpt_hetero`` (same converter as the inference "
+            "driver), training starts at iter 0, and ``--no-load-optim "
+            "--no-load-rng`` are forced. Mutually exclusive with ``--load``."
         ),
     )
     ckpt.add_argument(
