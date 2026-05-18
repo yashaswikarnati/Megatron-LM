@@ -123,6 +123,7 @@ TRAIN_LAUNCH_ARGS=(
   --no-load-optim --no-load-rng
   --load-nemotron-checkpoint "${NEMOTRON_CKPT}"
   --dynamic-resolution
+  --tensorboard-dir "${RUN_DIR}/tensorboard"
 )
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"

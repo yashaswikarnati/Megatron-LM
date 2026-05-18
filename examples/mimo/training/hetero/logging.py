@@ -21,6 +21,8 @@ from examples.mimo.training.hetero.topology import HeteroTopology
 from examples.mimo.utils.hetero import is_process_group_member
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 
 
 @dataclass
@@ -36,6 +38,16 @@ class HeteroTrainingLogger:
     loss_total: float = 0.0
     loss_count: int = 0
     interval_start: float = field(default_factory=time.time)
+    _tb_writer: Optional[object] = field(default=None, init=False, repr=False)
+    _moe_total_loss_dict: dict = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Only the language logging rank owns the writer; other ranks no-op.
+        tb_dir = getattr(self.args, "tensorboard_dir", None)
+        if tb_dir and is_language_log_rank(self.topology):
+            from torch.utils.tensorboard import SummaryWriter
+
+            self._tb_writer = SummaryWriter(log_dir=tb_dir)
 
     def record_step(self, result: TrainStepResult) -> Optional[float]:
         """Update interval state from one train step and return this iteration's loss."""
@@ -88,6 +100,65 @@ class HeteroTrainingLogger:
             log_string += " number of nan iterations: {:3d} |".format(self.nan_iterations)
             sys.stdout.write(f"{log_string}\n")
             sys.stdout.flush()
+        # MoE aux-loss tracking (seq_load_balancing_loss etc.) — mirrors
+        # megatron.training.training.training_log:2196-2237. Reduces the
+        # per-microbatch tracker across the LLM lane and emits per-iter scalars.
+        # Runs on every LLM-lane rank because track_moe_metrics issues
+        # internal collectives across pg_collection — but only the language
+        # log rank's writer actually persists scalars.
+        if getattr(self.args, "num_experts", None) and is_process_group_member(
+            getattr(self.topology.language_pg, "dp_cp", None)
+        ):
+            track_names = []
+            lb_type = getattr(self.args, "moe_router_load_balancing_type", "")
+            if "aux_loss" in lb_type:
+                track_names.append("load_balancing_loss")
+            if "seq_aux_loss" in lb_type:
+                track_names.append("seq_load_balancing_loss")
+            if "global_aux_loss" in lb_type:
+                track_names.append("global_load_balancing_loss")
+            track_moe_metrics(
+                loss_scale=1.0 / max(1, get_num_microbatches()),
+                iteration=iteration,
+                writer=self._tb_writer,
+                wandb_writer=None,
+                total_loss_dict=self._moe_total_loss_dict,
+                per_layer_logging=False,
+                force_initialize=True,
+                track_names=track_names,
+                num_layers=getattr(self.args, "num_layers", 0),
+                moe_layer_freq=getattr(self.args, "moe_layer_freq", None),
+                mtp_num_layers=getattr(self.args, "mtp_num_layers", None),
+                pg_collection=self.topology.language_pg,
+            )
+
+        if self._tb_writer is not None:
+            batch_size = get_global_batch_size(self.args)
+            samples = self.consumed_train_samples
+            if loss_value is not None:
+                self._tb_writer.add_scalar("lm loss", loss_value, iteration)
+                self._tb_writer.add_scalar("lm loss vs samples", loss_value, samples)
+            if learning_rate is not None:
+                self._tb_writer.add_scalar("learning-rate", learning_rate, iteration)
+                self._tb_writer.add_scalar(
+                    "learning-rate vs samples", learning_rate, samples
+                )
+            self._tb_writer.add_scalar("batch-size", batch_size, iteration)
+            self._tb_writer.add_scalar("batch-size vs samples", batch_size, samples)
+            self._tb_writer.add_scalar("loss-scale", loss_scale, iteration)
+            if result.grad_norm is not None:
+                self._tb_writer.add_scalar("grad-norm", result.grad_norm, iteration)
+                self._tb_writer.add_scalar(
+                    "grad-norm vs samples", result.grad_norm, samples
+                )
+            if result.num_zeros_in_grad is not None:
+                self._tb_writer.add_scalar(
+                    "num-zeros", result.num_zeros_in_grad, iteration
+                )
+            self._tb_writer.add_scalar(
+                "iteration-time-ms", elapsed_ms, iteration
+            )
+            self._tb_writer.flush()
         self.reset_interval()
 
     def reset_interval(self) -> None:
