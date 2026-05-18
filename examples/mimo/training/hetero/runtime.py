@@ -120,6 +120,9 @@ def wrap_active_modules_with_ddp(
             bucket_size=_resolve_bucket_size(args, mimo_model.language_model),
             pad_buckets_for_high_nccl_busbw=pad_buckets,
             use_distributed_optimizer=True,
+            # Keep main_grad in fp32. Default False → bf16 main_grad → step-2
+            # weight drift after Adam.
+            grad_reduce_in_fp32=getattr(args, "accumulate_allreduce_grads_in_fp32", True),
         )
         debug_rank("wrapping language model in DDP")
         mimo_model.language_model = DistributedDataParallel(
@@ -154,6 +157,7 @@ def wrap_active_modules_with_ddp(
             bucket_size=_resolve_bucket_size(args, submodule),
             pad_buckets_for_high_nccl_busbw=pad_buckets,
             use_distributed_optimizer=True,
+            grad_reduce_in_fp32=getattr(args, "accumulate_allreduce_grads_in_fp32", True),
         )
         debug_rank("wrapping vision submodule in DDP")
         mimo_model.modality_submodules[topology.encoder_name] = DistributedDataParallel(

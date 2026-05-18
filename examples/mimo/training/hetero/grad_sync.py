@@ -17,10 +17,46 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 
 
-def configure_grad_sync(mimo_model: MimoModel, topology: HeteroTopology) -> None:
+def _iter_vision_grad_buffers(submodule):
+    """Yield the DDP wrapper's contiguous grad buffers (regular + expert)."""
+    for buffer in getattr(submodule, "buffers", []) or []:
+        yield buffer
+    for buffer in getattr(submodule, "expert_parallel_buffers", []) or []:
+        yield buffer
+
+
+def _compute_vision_participation(submodule, vision_dp_group) -> float:
+    """Count vision-DP ranks with non-zero local grad (i.e. that ran the
+    encoder on at least one image this step). MUST be called BEFORE the
+    DP-grad reduce so the local pre-reduce grad is still intact.
+    """
+    has_grad = torch.zeros(1, dtype=torch.float32, device="cuda")
+    for buffer in _iter_vision_grad_buffers(submodule):
+        nonzero = (buffer.grad_data != 0).any().to(dtype=torch.float32).view(1)
+        has_grad = torch.maximum(has_grad, nonzero)
+    dist.all_reduce(has_grad, op=dist.ReduceOp.SUM, group=vision_dp_group)
+    return float(has_grad.item())
+
+
+def _apply_vision_grad_correction(
+    submodule, vision_dp_size: int, participation_count: float
+) -> None:
+    """Scale vision grads by dp_size/K under partial participation. No-op
+    when K is 0 (no rank had images) or K == dp_size (all did).
+    """
+    if participation_count <= 0 or participation_count >= vision_dp_size:
+        return
+    correction = float(vision_dp_size) / float(participation_count)
+    submodule.scale_gradients(correction)
+
+
+def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -> None:
     """Configure grad-finalization callbacks consumed by the pipeline schedule."""
     language_pg = topology.language_pg
     vision_pg = topology.vision_pg
+    correct_encoder_grad = bool(
+        getattr(args, "correct_encoder_grad_for_partial_participation", False)
+    )
 
     def is_token_source_rank() -> bool:
         return (
@@ -57,15 +93,36 @@ def configure_grad_sync(mimo_model: MimoModel, topology: HeteroTopology) -> None
             )
             debug_rank("language grads finalized")
         for submodule in mimo_model.modality_submodules.values():
-            if submodule is not None:
-                debug_rank("finalizing vision grads")
-                finalize_model_grads(
-                    [submodule],
-                    num_tokens=None,
-                    pg_collection=vision_pg,
-                    force_all_reduce=force_all_reduce,
-                )
-                debug_rank("vision grads finalized")
+            if submodule is None:
+                continue
+            # Capture participation BEFORE the DP all-reduce so the
+            # pre-reduce local grad indicator is still intact.
+            participation = None
+            vision_dp_size = 1
+            if correct_encoder_grad and vision_pg is not None:
+                vision_dp_group = getattr(vision_pg, "dp", None)
+                if is_process_group_member(vision_dp_group):
+                    vision_dp_size = dist.get_world_size(vision_dp_group)
+                    if vision_dp_size > 1:
+                        participation = _compute_vision_participation(
+                            submodule, vision_dp_group
+                        )
+                        debug_rank(
+                            f"vision participation: {participation}/{vision_dp_size}"
+                        )
+
+            debug_rank("finalizing vision grads")
+            finalize_model_grads(
+                [submodule],
+                num_tokens=None,
+                pg_collection=vision_pg,
+                force_all_reduce=force_all_reduce,
+            )
+            debug_rank("vision grads finalized")
+
+            # Apply the participation correction AFTER the DP reduce.
+            if participation is not None:
+                _apply_vision_grad_correction(submodule, vision_dp_size, participation)
 
         if global_num_tokens_value > 0:
             scale = 1.0 / global_num_tokens_value

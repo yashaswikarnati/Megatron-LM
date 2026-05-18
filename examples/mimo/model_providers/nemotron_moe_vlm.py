@@ -10,6 +10,13 @@ from typing import Optional
 
 import torch
 
+from examples.mimo.utils.hetero import (
+    debug_rank,
+    get_grid_dim_size,
+    get_group_rank_or,
+    get_group_size_or,
+    is_process_group_member,
+)
 from megatron.core.activations import fast_gelu, squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -27,14 +34,6 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
-
-from examples.mimo.utils.hetero import (
-    debug_rank,
-    get_grid_dim_size,
-    get_group_rank_or,
-    get_group_size_or,
-    is_process_group_member,
-)
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -118,8 +117,8 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Patchify each image at its native aspect ratio with a token budget instead of "
-            "fixed-tile resize. Enabled by default for Nemotron6-MoE VLM providers (matches "
-            "Sanjeev's pre-vlm-05 recipe). Pass --no-dynamic-resolution to disable."
+            "fixed-tile resize. Enabled by default for Nemotron6-MoE VLM providers. "
+            "Pass --no-dynamic-resolution to disable."
         ),
     )
     provider.add_argument(
@@ -401,7 +400,7 @@ def nemotron_language_config(
         moe_router_dtype="fp32",
         moe_router_load_balancing_type="seq_aux_loss",
         moe_router_force_load_balancing=args.moe_router_force_load_balancing,
-        moe_router_fusion=True,
+        moe_router_fusion=False,
         moe_aux_loss_coeff=1.0e-4,
         moe_shared_expert_intermediate_size=3712,
         moe_shared_expert_overlap=True,
