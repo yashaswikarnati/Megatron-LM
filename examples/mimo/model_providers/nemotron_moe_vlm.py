@@ -458,6 +458,10 @@ def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) ->
     config.attention_softmax_in_fp32 = True
     config.attention_dropout = 0.0
     config.hidden_dropout = 0.0
+    # post_process=False on the RADIO TransformerBlock would skip the final
+    # layernorm under the default mtp_num_layers=None branch; force the
+    # last-layer-in-stage branch so it applies.
+    config.mtp_num_layers = 0
     return config
 
 
