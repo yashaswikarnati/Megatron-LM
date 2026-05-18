@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import argparse
+import random
 from typing import Optional
 
+import numpy as np
 import torch
 
 from examples.mimo.training.hetero.args import prepare_args
@@ -21,6 +23,7 @@ from examples.mimo.training.hetero.step import train_step
 from examples.mimo.training.hetero.timeline import configure_hetero_timeline
 from examples.mimo.training.hetero.topology import HeteroTopology, create_topology
 from examples.mimo.utils.hetero import debug_rank
+from examples.mimo.utils.model_helpers import load_and_refresh_nemotron_checkpoint
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.timeline import (
@@ -43,11 +46,17 @@ def run_train_loop(args: argparse.Namespace) -> None:
         if timeline_summary is not None:
             print_rank_0(timeline_summary)
 
+        # Match Megatron's _set_random_seed: seed python random and numpy
+        # too. energon's text_packing.random.shuffle uses the global random
+        # module, so dataset-construction RNG draws would diverge otherwise.
+        random.seed(args.seed)
+        np.random.seed(args.seed)
         torch.manual_seed(args.seed)
+
         debug_rank("building MIMO model")
         model = build_mimo_runtime(args, topology)
         debug_rank("configuring gradient sync")
-        configure_grad_sync(model, topology)
+        configure_grad_sync(args, model, topology)
 
         debug_rank("building MIMO optimizer")
         optimizer = build_optimizer(args, model)
@@ -62,7 +71,12 @@ def run_train_loop(args: argparse.Namespace) -> None:
         logger = HeteroTrainingLogger(args=args, topology=topology)
         debug_rank("training setup ready")
 
-        start_iteration = load_checkpoint(model, optimizer, opt_param_scheduler, args, topology)
+        nemotron_ckpt = getattr(args, "load_nemotron_checkpoint", None)
+        if nemotron_ckpt:
+            load_and_refresh_nemotron_checkpoint(model, optimizer, topology, args)
+            start_iteration = 0
+        else:
+            start_iteration = load_checkpoint(model, optimizer, opt_param_scheduler, args, topology)
         if start_iteration >= args.train_iters:
             print_rank_0(
                 f"Resume iteration ({start_iteration}) >= --train-iters ({args.train_iters}); "
