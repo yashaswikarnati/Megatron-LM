@@ -46,7 +46,7 @@ MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=192
 NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 6
 TRAIN_ITERS=5000
-LOG_INTERVAL=10
+LOG_INTERVAL=1
 SAVE_INTERVAL=99999999          # don't save during the parity run
 
 # Flat LR: warmup=0 and a huge decay window keep LR constant for the full 5k.
