@@ -103,12 +103,14 @@ def _build_encoder_iterator(args, grid):
             tp_group=tp_group,
             lane=llm_lanes[0],
             role="encoder",
-            random_seed=args.seed + llm_lanes[0],
+            # energon's WorkerConfig(rank=lane, world_size=llm_dp) already
+            # salts per-rank, so the seed here must be unsalted.
+            random_seed=args.seed,
         )
 
     lane_iterators = [
         _build_single_lane_iterator(
-            args, tp_group=None, lane=lane, role="encoder-component", random_seed=args.seed + lane
+            args, tp_group=None, lane=lane, role="encoder-component", random_seed=args.seed
         )
         for lane in llm_lanes
     ]
@@ -138,7 +140,7 @@ def _llm_lanes_for_encoder_rank(args, encoder_dp_rank: int) -> list[int]:
 def _build_single_lane_iterator(args, tp_group, lane: int, role: str, random_seed: int):
     """Build a deterministic loader for one LLM data lane."""
     from examples.mimo.data.energon_multimodal_provider import build_multimodal_encoder
-    from megatron.energon import WorkerConfig, get_loader, get_train_dataset
+    from megatron.energon import WorkerConfig, get_savable_loader, get_train_dataset
 
     tokenizer = _build_tokenizer(args)
     encoder = build_multimodal_encoder(
@@ -163,8 +165,22 @@ def _build_single_lane_iterator(args, tp_group, lane: int, role: str, random_see
         shuffle_buffer_size=args.shuffle_buffer_size,
         max_samples_per_sequence=args.max_samples_per_sequence,
     )
+    # Use get_savable_loader (not get_loader): the SavableDatasetWrapper sets
+    # worker_id_offset and per-worker init that affects step-0 sample order.
+    try:
+        from megatron.energon.cache.no_cache import NoCachePool
+
+        loader = get_savable_loader(
+            dataset,
+            cache_pool=NoCachePool(),
+            watchdog_timeout_seconds=5 * 60,
+            watchdog_initial_timeout_seconds=5 * 60,
+        )
+    except (ImportError, TypeError):
+        # Older energon may not have NoCachePool / watchdog kwargs.
+        loader = get_savable_loader(dataset)
     return EnergonIterator(
-        get_loader(dataset),
+        loader,
         tp_group=tp_group,
         source_rank=True,
         random_seed=random_seed,

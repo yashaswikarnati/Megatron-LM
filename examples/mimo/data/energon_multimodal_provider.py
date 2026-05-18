@@ -11,8 +11,22 @@ embedding and remaps the batch to MIMO's forward signature.
 
 from __future__ import annotations
 
+import inspect
 import warnings
 from typing import Optional
+
+
+def _supported_kwargs(fn, kwargs):
+    """Drop kwargs the target callable doesn't accept.
+
+    Lets the caller pass a superset of recipe args without erroring on fields
+    that the installed energon's VisionConfig doesn't recognize.
+    """
+    params = inspect.signature(fn).parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in params}
+
 
 import torch
 
@@ -58,6 +72,15 @@ class TokenizerAdapter:
     def convert_tokens_to_ids(self, tokens):
         """Convert tokens to ids with the wrapped Megatron tokenizer."""
         return self._tok.convert_tokens_to_ids(tokens)
+
+    @property
+    def chat_template(self):
+        """Forward HuggingFace chat_template so energon's tokenize_and_prepare can find it."""
+        return getattr(self._hf, "chat_template", None)
+
+    def apply_chat_template(self, *args, **kwargs):
+        """Forward to underlying HuggingFace tokenizer for energon's chat-template path."""
+        return self._hf.apply_chat_template(*args, **kwargs)
 
 
 class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
@@ -255,7 +278,7 @@ def build_multimodal_encoder(
         image_token_id = tokenizer.convert_tokens_to_ids(getattr(args, "image_token", "<image>"))
     pad_id = getattr(args, "pad_token_id", tokenizer.pad)
 
-    vision_config = VisionConfig(
+    vision_config_kwargs = dict(
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
@@ -276,6 +299,9 @@ def build_multimodal_encoder(
         dynamic_resolution_min_side=getattr(args, "dynamic_resolution_min_side", None),
         dynamic_resolution_max_side=getattr(args, "dynamic_resolution_max_side", None),
     )
+    # Drop kwargs the installed energon's VisionConfig doesn't accept (e.g.
+    # dynamic_resolution_max_side is only on newer forks).
+    vision_config = VisionConfig(**_supported_kwargs(VisionConfig, vision_config_kwargs))
     packing_config = PackingConfig(
         seq_length=target_seq_length, pad_id=pad_id, image_token_id=image_token_id
     )
