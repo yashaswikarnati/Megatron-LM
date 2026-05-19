@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections import deque
 from typing import Callable, Optional
 
 import torch
@@ -108,22 +109,204 @@ def _build_encoder_iterator(args, grid):
             random_seed=args.seed,
         )
 
-    lane_iterators = [
-        _build_single_lane_iterator(
-            args, tp_group=None, lane=lane, role="encoder-component", random_seed=args.seed
+    return _build_routed_encoder_iterator(
+        args, tp_group=tp_group, encoder_dp_rank=encoder_dp_rank, llm_lanes=llm_lanes
+    )
+
+
+def _route_samples_to_lanes(
+    loader_iter,
+    *,
+    lanes_per_encoder: int,
+    lane_offset: int,
+    num_workers_per_lane: int,
+    encoder_dp_rank: int,
+    pending_by_lane: list,
+    max_pulls_per_step: int,
+    provenance_key: str,
+) -> tuple[list, int]:
+    """Pull samples from a single multiplexed loader and route each one to its LLM lane.
+
+    Samples are routed by reading the producing worker's
+    ``WorkerConfig.global_worker_id()``, which the encoder batcher stamps under
+    ``provenance_key``. The mapping from worker id back to local lane is:
+
+        global_worker_id = encoder_dp_rank * num_workers_enc + local_worker_id
+        global_llm_lane  = global_worker_id // num_workers_per_lane
+        local_lane       = global_llm_lane - lane_offset
+
+    Surplus samples (a worker yields a second sample for a lane that's already
+    filled this step) are stashed in ``pending_by_lane`` and consumed on the
+    next encoder step. ``max_pulls_per_step`` bounds the loop so a stuck or
+    skewed worker pool fails loudly instead of silently stalling.
+
+    Returns ``(lane_batches, pulls)`` where ``lane_batches[lane]`` is the sample
+    routed to local lane ``lane``.
+    """
+    lane_batches: list = [None] * lanes_per_encoder
+    filled = 0
+    for lane in range(lanes_per_encoder):
+        if pending_by_lane[lane]:
+            lane_batches[lane] = pending_by_lane[lane].popleft()
+            filled += 1
+    pulls = 0
+    while filled < lanes_per_encoder:
+        if pulls >= max_pulls_per_step:
+            missing = [i for i, b in enumerate(lane_batches) if b is None]
+            raise RuntimeError(
+                f"encoder dataloader did not yield samples for local_lanes={missing} "
+                f"in {max_pulls_per_step} pulls (encoder_dp_rank={encoder_dp_rank}); "
+                "check Energon worker rotation contract"
+            )
+        sample = next(loader_iter)
+        pulls += 1
+        wid = sample.pop(provenance_key, None)
+        if wid is None:
+            raise RuntimeError(
+                f"encoder sample missing {provenance_key!r}; "
+                "ensure build_multimodal_encoder was called with attach_provenance=True"
+            )
+        global_llm_lane = wid // num_workers_per_lane
+        local_lane = global_llm_lane - lane_offset
+        if not (0 <= local_lane < lanes_per_encoder):
+            raise RuntimeError(
+                f"worker_id={wid} maps to global_llm_lane={global_llm_lane}, "
+                f"outside encoder rank {encoder_dp_rank} range "
+                f"[{lane_offset}, {lane_offset + lanes_per_encoder})"
+            )
+        if lane_batches[local_lane] is None:
+            lane_batches[local_lane] = sample
+            filled += 1
+        else:
+            pending_by_lane[local_lane].append(sample)
+    return lane_batches, pulls
+
+
+def _build_routed_encoder_iterator(args, tp_group, encoder_dp_rank, llm_lanes):
+    """Build one Energon iterator per encoder rank and route samples back to LLM lanes.
+
+    The previous implementation built ``lanes_per_encoder`` independent Energon
+    iterators per encoder rank — one per LLM data lane — which produces
+    ``lanes_per_encoder × num_workers`` shard-open events at construction.
+    This collapses that to a single Energon iterator with
+    ``num_workers = args.num_workers * lanes_per_encoder``; each emitted batch
+    is routed to its owning lane using the producing worker's
+    ``WorkerConfig.global_worker_id()`` that the encoder batcher stamps onto
+    every batch.
+
+    Bit-wise sample parity with the per-lane iterator path is preserved by
+    Energon's design: ``global_workers = world_size * num_workers`` is invariant
+    under this reshape and per-worker seeds depend only on ``global_worker_id``
+    and ``seed_offset`` (see ``megatron/energon/worker.py``), so each worker
+    here produces the same shards in the same order as the per-lane worker it
+    replaces.
+    """
+    from examples.mimo.data.energon_multimodal_provider import (
+        MimoMultiModalPackingEncoder,
+        build_multimodal_encoder,
+    )
+    from megatron.energon import WorkerConfig, get_savable_loader, get_train_dataset
+    from megatron.energon.cache.no_cache import NoCachePool
+
+    if args.num_workers < 1:
+        raise ValueError(
+            "routed encoder iterator requires args.num_workers >= 1 "
+            "(global_worker_id -> lane mapping divides by num_workers_per_lane); "
+            f"got {args.num_workers}"
         )
-        for lane in llm_lanes
-    ]
+    lanes_per_encoder = len(llm_lanes)
+    num_workers_per_lane = args.num_workers
+    num_workers_enc = num_workers_per_lane * lanes_per_encoder
+    lane_offset = llm_lanes[0]
+
+    tokenizer = _build_tokenizer(args)
+    encoder = build_multimodal_encoder(
+        args,
+        tokenizer,
+        encoder_name=getattr(args, "vision_encoder_key", "radio_encoder"),
+        encoder_input_key="x",
+        attach_provenance=True,
+    )
+    worker_config = WorkerConfig(
+        rank=encoder_dp_rank,
+        world_size=args.encoder_dp,
+        num_workers=num_workers_enc,
+        data_parallel_group=None,
+    )
+    debug_rank(
+        "building routed encoder dataloader "
+        f"encoder_dp_rank={encoder_dp_rank} encoder_dp={args.encoder_dp} "
+        f"num_workers_enc={num_workers_enc} lanes_per_encoder={lanes_per_encoder} "
+        f"lane_offset={lane_offset}"
+    )
+    dataset = get_train_dataset(
+        args.data_path,
+        batch_size=args.micro_batch_size,
+        task_encoder=encoder,
+        worker_config=worker_config,
+        packing_buffer_size=args.packing_buffer_size,
+        shuffle_buffer_size=args.shuffle_buffer_size,
+        max_samples_per_sequence=args.max_samples_per_sequence,
+    )
+    loader = get_savable_loader(
+        dataset,
+        cache_pool=NoCachePool(),
+        watchdog_timeout_seconds=5 * 60,
+        watchdog_initial_timeout_seconds=5 * 60,
+    )
+
+    loader_iter_holder: list = [iter(loader)]
+    # Dense integer keys (0..lanes_per_encoder-1) → use a list so the hot-path
+    # routing in ``_route_samples_to_lanes`` does O(1) array indexing rather
+    # than dict probing.
+    pending_by_lane: list[deque] = [deque() for _ in range(lanes_per_encoder)]
+    # Energon's SavableDataLoader rotates through every worker in one round,
+    # so a step worst case needs ``num_workers_enc`` pulls to fill every lane
+    # (one batch per worker, including the surplus to lanes that filled
+    # early). The 4× factor adds slack for transient rotation skew; we cap
+    # below by 2*num_workers_enc so configurations with high
+    # ``num_workers_per_lane`` aren't bounded too tightly. A genuine stall
+    # surfaces as a loud failure in ``_route_samples_to_lanes``.
+    max_pulls_per_step = max(4 * lanes_per_encoder, 2 * num_workers_enc)
+    provenance_key = MimoMultiModalPackingEncoder.PROVENANCE_KEY
 
     def next_encoder_batch():
-        batches = [next(iterator) for iterator in lane_iterators]
-        signatures = [EnergonIterator._batch_signature(batch) for batch in batches]
-        return _combine_encoder_batches(batches), signatures
+        try:
+            lane_batches, _pulls = _route_samples_to_lanes(
+                loader_iter_holder[0],
+                lanes_per_encoder=lanes_per_encoder,
+                lane_offset=lane_offset,
+                num_workers_per_lane=num_workers_per_lane,
+                encoder_dp_rank=encoder_dp_rank,
+                pending_by_lane=pending_by_lane,
+                max_pulls_per_step=max_pulls_per_step,
+                provenance_key=provenance_key,
+            )
+        except StopIteration:
+            # One-shot per epoch on savable-loader exhaustion. Any partial
+            # ``lane_batches`` accumulated before the exception is dropped —
+            # those samples count against the worker's seed sequence and are
+            # never delivered. Acceptable because webdataset is streamed as
+            # a pseudo-infinite source; this branch is rarely hit in practice.
+            loader_iter_holder[0] = iter(loader)
+            lane_batches, _pulls = _route_samples_to_lanes(
+                loader_iter_holder[0],
+                lanes_per_encoder=lanes_per_encoder,
+                lane_offset=lane_offset,
+                num_workers_per_lane=num_workers_per_lane,
+                encoder_dp_rank=encoder_dp_rank,
+                pending_by_lane=pending_by_lane,
+                max_pulls_per_step=max_pulls_per_step,
+                provenance_key=provenance_key,
+            )
+        signatures = [EnergonIterator._batch_signature(batch) for batch in lane_batches]
+        return _combine_encoder_batches(lane_batches), signatures
 
     return EnergonIterator(
         None,
         tp_group=tp_group,
         source_rank=True,
+        random_seed=args.seed,
         local_batch_fn=next_encoder_batch,
         alignment_role="encoder",
         llm_lanes=llm_lanes,
