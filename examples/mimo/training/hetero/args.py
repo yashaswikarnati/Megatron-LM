@@ -223,6 +223,15 @@ def parse_args() -> argparse.Namespace:
     )
     train.add_argument("--seed", type=int, default=12345)
     train.add_argument("--log-interval", type=int, default=1)
+    train.add_argument(
+        "--tensorboard-dir",
+        type=str,
+        default=None,
+        help="Directory for tensorboard scalar logs. When set, the language "
+        "logging rank writes lm_loss/grad-norm/learning-rate/etc. each log "
+        "interval, matching the scalar keys used by Megatron's standard "
+        "training_log so hetero and reference runs can be diffed in TB.",
+    )
 
     ckpt = parser.add_argument_group("checkpointing")
     ckpt.add_argument(
