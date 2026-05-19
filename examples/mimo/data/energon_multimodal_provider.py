@@ -30,6 +30,7 @@ def _supported_kwargs(fn, kwargs):
 
 import torch
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.energon import WorkerConfig
 from megatron.energon.task_encoder.multimodal import (
     MultiModalPackingEncoder,
@@ -120,6 +121,12 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
             max_num_tiles=vision_config.max_num_tiles,
             use_image_break_token=vision_config.use_image_break_token,
         )
+        # Stashed so batch() can compute per-image embedding counts under
+        # dynamic resolution (where the constant emb_per_tile doesn't apply).
+        self._dynamic_resolution = getattr(vision_config, "dynamic_resolution", False)
+        self._patch_dim = vision_config.patch_dim
+        self._pixel_shuffle = vision_config.pixel_shuffle
+        self._conv_merging = vision_config.conv_merging
 
     def batch(self, samples: list[PackedSample]) -> dict:
         """Expand image placeholders and return a MIMO-compatible batch."""
@@ -147,7 +154,20 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
             for idx, token in enumerate(tokens.tolist()):
                 if token == image_token_id:
                     n_tiles = num_tiles[img_idx] if img_idx < len(num_tiles) else 1
-                    n_tokens = n_tiles * emb_per_tile
+                    if self._dynamic_resolution:
+                        # Each image produces (h/p) * (w/p) patches; pixel_shuffle and
+                        # conv_merging each halve both axes => divide by 4 each.
+                        img_pix = sample.images[img_idx]
+                        h_pix = img_pix.shape[-2]
+                        w_pix = img_pix.shape[-1]
+                        per_image = (h_pix // self._patch_dim) * (w_pix // self._patch_dim)
+                        if self._pixel_shuffle:
+                            per_image //= 4
+                        if self._conv_merging:
+                            per_image //= 4
+                        n_tokens = per_image
+                    else:
+                        n_tokens = n_tiles * emb_per_tile
                     if budget is not None and len(new_tokens) + n_tokens > budget:
                         truncated = True
                         break
@@ -214,9 +234,24 @@ class MimoMultiModalPackingEncoder(MultiModalPackingEncoder):
         }
 
         if all_images:
-            images = self.tiling_strategy.stack(all_images)[0]
+            images, imgs_sizes, cu_lengths, max_seqlen = self.tiling_strategy.stack(all_images)
+            encoder_inputs = {self.encoder_input_key: images}
+            if imgs_sizes is not None:
+                encoder_inputs["imgs_sizes"] = imgs_sizes.to(torch.int32)
+            if cu_lengths is not None and max_seqlen is not None:
+                # THD packing metadata for RADIO's variable-length attention.
+                # Class-token offsets get applied inside RADIO.forward.
+                cu = cu_lengths.to(torch.int32)
+                max_q = max_seqlen.to(torch.int32) if torch.is_tensor(max_seqlen) else torch.tensor(int(max_seqlen), dtype=torch.int32)
+                encoder_inputs["packed_seq_params"] = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu,
+                    cu_seqlens_kv=cu,
+                    max_seqlen_q=max_q,
+                    max_seqlen_kv=max_q,
+                )
             result["modality_inputs"] = {
-                "images": {self.encoder_name: {self.encoder_input_key: images}}
+                "images": {self.encoder_name: encoder_inputs}
             }
 
         is_packed = any(len(sample.cu_lengths) > 2 for sample in samples)

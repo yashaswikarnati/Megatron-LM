@@ -90,6 +90,24 @@ def move_batch_to_cuda(value):
         return [move_batch_to_cuda(item) for item in value]
     if isinstance(value, tuple):
         return tuple(move_batch_to_cuda(item) for item in value)
+    # PackedSeqParams is a dataclass carrying tensors that TE attention needs
+    # on the GPU. Recurse through its tensor-valued fields so cu_seqlens_q/kv
+    # and max_seqlen_q/kv land on cuda alongside the rest of the batch.
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    if isinstance(value, PackedSeqParams):
+        for attr in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+            "max_seqlen_q",
+            "max_seqlen_kv",
+        ):
+            sub = getattr(value, attr, None)
+            if isinstance(sub, torch.Tensor) and not sub.is_cuda:
+                setattr(value, attr, sub.cuda(non_blocking=True))
+        return value
     return value
 
 

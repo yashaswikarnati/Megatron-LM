@@ -237,6 +237,42 @@ def validate_model_provider_args(args: argparse.Namespace) -> None:
         raise ValueError("--pad-token-id must be within --vocab-size")
 
 
+def _pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim, scale_factor=0.5, version=2):
+    """Pixel shuffle for dynamic resolution (variable tile sizes).
+
+    Splits the packed sequence by per-tile lengths, applies pixel shuffle to each
+    tile, then re-concatenates. Mirrors sasatheesh/pre-vlm-05's
+    llava_model.pixel_shuffle_dynamic_res; vendored here to avoid touching the
+    upstream-owned llava_model.py.
+    """
+    seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
+    splits = torch.split(x, seq_lens.tolist(), dim=-2)
+
+    out = []
+    for i, sv in enumerate(splits):
+        h = imgs_sizes[i][0] // patch_dim
+        w = imgs_sizes[i][1] // patch_dim
+        sv = sv.reshape(sv.shape[0], h, w, -1)
+
+        n, h, w, c = sv.size()
+        sv = sv.view(n, h, int(w * scale_factor), int(c / scale_factor))
+        sv = sv.permute(0, 2, 1, 3).contiguous()
+        sv = sv.view(
+            n,
+            int(w * scale_factor),
+            int(h * scale_factor),
+            int(c / (scale_factor * scale_factor)),
+        )
+
+        if version == 2:
+            sv = sv.permute(0, 2, 1, 3).contiguous()
+
+        sv = sv.reshape(sv.shape[0], -1, sv.shape[-1])
+        out.append(sv)
+
+    return torch.cat(out, dim=-2)
+
+
 class RADIOEncoderWrapper(torch.nn.Module):
     """RADIO encoder wrapper matching the Nemotron6-MoE VLM provider."""
 
@@ -252,12 +288,14 @@ class RADIOEncoderWrapper(torch.nn.Module):
         drop_class_token: bool = True,
         apply_pixel_shuffle: bool = True,
         force_eval_mode: bool = False,
+        dynamic_resolution: bool = False,
     ) -> None:
         super().__init__()
         self.class_token_len = class_token_len
         self.drop_class_token = drop_class_token
         self.apply_pixel_shuffle = apply_pixel_shuffle
         self.force_eval_mode = force_eval_mode
+        self.dynamic_resolution = dynamic_resolution
         self.radio_model = RADIOViTModel(
             transformer_config=transformer_config,
             transformer_layer_spec=transformer_layer_spec,
@@ -270,6 +308,7 @@ class RADIOEncoderWrapper(torch.nn.Module):
             max_img_w=2048,
             has_cpe=True,
             embedder_bias=False,
+            dynamic_resolution=dynamic_resolution,
             pg_collection=pg_collection,
         )
         if self.force_eval_mode:
@@ -287,19 +326,53 @@ class RADIOEncoderWrapper(torch.nn.Module):
         """Expose the underlying RADIO config for DDP wrapping."""
         return self.radio_model.config
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        imgs_sizes: Optional[torch.Tensor] = None,
+        packed_seq_params=None,
+    ) -> torch.Tensor:
         """Run RADIO, drop class tokens, and apply pixel shuffle."""
         context = torch.no_grad() if self.force_eval_mode else nullcontext()
         debug_rank(f"RADIO forward start: input_shape={tuple(x.shape)}")
         with context:
             x = x.to(dtype=self.radio_model.embedder.weight.dtype)
-            embeddings = self.radio_model(x)
+            embeddings = self.radio_model(
+                x, imgs_sizes=imgs_sizes, packed_seq_params=packed_seq_params
+            )
         debug_rank(f"RADIO forward done: output_shape={tuple(embeddings.shape)}")
         if self.drop_class_token:
-            embeddings = embeddings[:, self.class_token_len :, :]
+            if (
+                self.dynamic_resolution
+                and imgs_sizes is not None
+                and self.class_token_len > 0
+            ):
+                # Class tokens are interleaved between tiles; build mask to remove them.
+                remove_mask = torch.full(
+                    (embeddings.shape[-2],), True, dtype=torch.bool, device=embeddings.device
+                )
+                patch_dim = self.radio_model.patch_dim
+                if torch.is_tensor(imgs_sizes):
+                    seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
+                else:
+                    seq_lens = torch.tensor(
+                        [(h // patch_dim) * (w // patch_dim) for h, w in imgs_sizes]
+                    )
+                current_length = 0
+                for sl in seq_lens:
+                    remove_mask[current_length : current_length + self.class_token_len] = False
+                    current_length += int(sl) + self.class_token_len
+                embeddings = embeddings[:, remove_mask, :]
+            else:
+                embeddings = embeddings[:, self.class_token_len :, :]
             debug_rank(f"RADIO class tokens dropped: output_shape={tuple(embeddings.shape)}")
         if self.apply_pixel_shuffle:
-            embeddings = pixel_shuffle(embeddings, scale_factor=0.5)
+            if self.dynamic_resolution and imgs_sizes is not None:
+                embeddings = _pixel_shuffle_dynamic_res(
+                    embeddings, imgs_sizes, self.radio_model.patch_dim
+                )
+            else:
+                embeddings = pixel_shuffle(embeddings, scale_factor=0.5)
             debug_rank(f"RADIO pixel shuffle done: output_shape={tuple(embeddings.shape)}")
         return embeddings
 
@@ -458,6 +531,8 @@ def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) ->
     config.attention_softmax_in_fp32 = True
     config.attention_dropout = 0.0
     config.hidden_dropout = 0.0
+    # Trigger TransformerBlock's final_layernorm allocation (matches sanj path).
+    config.mtp_num_layers = 0
     return config
 
 
@@ -597,6 +672,7 @@ def vision_submodules_spec(
                 "drop_class_token": True,
                 "apply_pixel_shuffle": True,
                 "force_eval_mode": args.freeze_vit,
+                "dynamic_resolution": bool(getattr(args, "dynamic_resolution", False)),
             },
         )
         vision_projection_spec = ModuleSpec(

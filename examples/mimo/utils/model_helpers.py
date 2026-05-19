@@ -245,11 +245,25 @@ def load_nemotron_vlm_ckpt_hetero(
             flush=True,
         )
 
-    loaded = dist_checkpointing.load(
+    # RETURN_ALL semantics (megatron/core/dist_checkpointing/validation.py:267-274):
+    #   third return = keys we requested but ckpt does NOT have
+    #                  (DANGEROUS — those tensors would silently keep their
+    #                  random-init values; PyTorch load_state_dict calls this
+    #                  set "missing" but mcore returns it as "unexpected").
+    # Weaker modes (LOG_UNEXPECTED, ASSUME_OK_UNEXPECTED) skip this check
+    # entirely. Raise loudly on any non-extra_state mismatch.
+    loaded, _ckpt_only_keys, request_only_keys = dist_checkpointing.load(
         sharded_state_dict=wrapper_sd,
         checkpoint_dir=ckpt_dir,
-        strict=StrictHandling.LOG_UNEXPECTED,
+        strict=StrictHandling.RETURN_ALL,
     )
+    missing_in_ckpt = sorted(k for k in request_only_keys if "extra_state" not in k)
+    if missing_in_ckpt:
+        raise RuntimeError(
+            f"checkpoint is missing {len(missing_in_ckpt)} keys the model requested; "
+            f"these would silently keep random-init values. "
+            f"First 30: {missing_in_ckpt[:30]}"
+        )
     loaded_sd = loaded.get("state_dict", {})
 
     # Apply loaded tensors back to each submodule by stripping its checkpoint prefix.
