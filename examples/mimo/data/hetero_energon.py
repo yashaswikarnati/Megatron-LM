@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 from examples.mimo.training.hetero.topology import get_grid_coordinate, is_rank_in_grid
 from examples.mimo.utils.hetero import debug_rank, is_process_group_member
+from megatron.core.packed_seq_params import PackedSeqParams
 
 
 def build_energon_iterator(args, topology):
@@ -389,13 +390,21 @@ def _combine_encoder_batches(batches: list[dict]) -> dict:
 
 
 def _concat_nested_tensors(values):
-    """Concatenate a list of matching nested tensor structures along leading dim."""
+    """Concatenate a list of matching nested tensor structures along the
+    first dimension that varies across lanes.
+
+    For most per-lane tensors the varying dim is 0 (batch). For dynres-packed
+    image buffers the per-lane shape is ``(1, T_lane, C)`` — dim 0 is the
+    fixed lane batch size and dim 1 is the variable token axis, so the right
+    concatenation is along dim 1. Selecting the first-varying dim handles
+    both uniformly without any sibling-key context.
+    """
     present = [value for value in values if value is not None]
     if not present:
         return None
     first = present[0]
     if isinstance(first, torch.Tensor):
-        return torch.cat(present, dim=0)
+        return _concat_first_varying_dim(present)
     if isinstance(first, dict):
         keys = set().union(*(value.keys() for value in present if isinstance(value, dict)))
         merged = {}
@@ -404,7 +413,84 @@ def _concat_nested_tensors(values):
             if value is not None:
                 merged[key] = value
         return merged
+    if isinstance(first, PackedSeqParams):
+        return _concat_packed_seq_params(present)
     raise TypeError(f"cannot concatenate encoder batch value of type {type(first).__name__}")
+
+
+def _concat_first_varying_dim(tensors):
+    """Concatenate ``tensors`` along the first dimension whose size differs
+    across the list; default to dim 0 if all shapes match."""
+    if len(tensors) == 1:
+        return tensors[0]
+    first = tensors[0]
+    for d in range(first.dim()):
+        if any(t.shape[d] != first.shape[d] for t in tensors[1:]):
+            return torch.cat(tensors, dim=d)
+    return torch.cat(tensors, dim=0)
+
+
+def _concat_packed_seq_params(values: list) -> PackedSeqParams:
+    """Merge per-lane PackedSeqParams into one set covering the merged flat buffer.
+
+    The dim-0 image buffers from each lane are concatenated by the surrounding
+    tensor merge; here we re-number cu_seqlens so they index into that merged
+    buffer. Mirrors the offset-shift rule in
+    ``megatron.energon.task_encoder.multimodal.encoder``.
+    """
+    first = values[0]
+    for v in values[1:]:
+        if v.qkv_format != first.qkv_format:
+            raise ValueError(
+                f"qkv_format mismatch across encoder lanes: "
+                f"{first.qkv_format!r} vs {v.qkv_format!r}"
+            )
+        if v.local_cp_size != first.local_cp_size or v.cp_group is not first.cp_group:
+            raise ValueError("CP fields mismatch across encoder lanes; refusing to merge")
+
+    def _concat_cu(attr: str):
+        per_lane = [getattr(v, attr) for v in values]
+        if per_lane[0] is None:
+            if not all(x is None for x in per_lane):
+                raise ValueError(f"{attr} present on some lanes but not others")
+            return None
+        merged = [per_lane[0]]
+        offset = int(per_lane[0][-1].item())
+        for cu in per_lane[1:]:
+            merged.append(cu[1:] + offset)
+            offset += int(cu[-1].item())
+        return torch.cat(merged)
+
+    def _max_scalar(attr: str):
+        per_lane = [getattr(v, attr) for v in values]
+        if per_lane[0] is None:
+            if not all(x is None for x in per_lane):
+                raise ValueError(f"{attr} present on some lanes but not others")
+            return None
+        if torch.is_tensor(per_lane[0]):
+            return torch.stack([x.reshape(()) for x in per_lane]).max()
+        return max(per_lane)
+
+    def _sum_or_none(attr: str):
+        per_lane = [getattr(v, attr) for v in values]
+        if all(x is None for x in per_lane):
+            return None
+        if any(x is None for x in per_lane):
+            raise ValueError(f"{attr} present on some lanes but not others")
+        return sum(per_lane)
+
+    return PackedSeqParams(
+        qkv_format=first.qkv_format,
+        cu_seqlens_q=_concat_cu("cu_seqlens_q"),
+        cu_seqlens_kv=_concat_cu("cu_seqlens_kv"),
+        cu_seqlens_q_padded=_concat_cu("cu_seqlens_q_padded"),
+        cu_seqlens_kv_padded=_concat_cu("cu_seqlens_kv_padded"),
+        max_seqlen_q=_max_scalar("max_seqlen_q"),
+        max_seqlen_kv=_max_scalar("max_seqlen_kv"),
+        total_tokens=_sum_or_none("total_tokens"),
+        local_cp_size=first.local_cp_size,
+        cp_group=first.cp_group,
+    )
 
 
 def _build_tokenizer(args):
