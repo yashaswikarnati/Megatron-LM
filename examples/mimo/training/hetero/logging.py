@@ -22,7 +22,6 @@ from examples.mimo.utils.hetero import is_process_group_member
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
-from megatron.core.num_microbatches_calculator import get_num_microbatches
 
 
 @dataclass
@@ -100,34 +99,26 @@ class HeteroTrainingLogger:
             log_string += " number of nan iterations: {:3d} |".format(self.nan_iterations)
             sys.stdout.write(f"{log_string}\n")
             sys.stdout.flush()
-        # MoE aux-loss tracking (seq_load_balancing_loss etc.) — mirrors
-        # megatron.training.training.training_log:2196-2237. Reduces the
-        # per-microbatch tracker across the LLM lane and emits per-iter scalars.
-        # Runs on every LLM-lane rank because track_moe_metrics issues
-        # internal collectives across pg_collection — but only the language
-        # log rank's writer actually persists scalars.
-        if getattr(self.args, "num_experts", None) and is_process_group_member(
+        num_moe_experts = getattr(self.args, "num_moe_experts", None)
+        if num_moe_experts and is_process_group_member(
             getattr(self.topology.language_pg, "dp_cp", None)
         ):
-            track_names = []
-            lb_type = getattr(self.args, "moe_router_load_balancing_type", "")
-            if "aux_loss" in lb_type:
-                track_names.append("load_balancing_loss")
-            if "seq_aux_loss" in lb_type:
-                track_names.append("seq_load_balancing_loss")
-            if "global_aux_loss" in lb_type:
-                track_names.append("global_load_balancing_loss")
+            hybrid_pat = getattr(self.args, "hybrid_layer_pattern", None)
+            if hybrid_pat:
+                num_moe_layers = hybrid_pat.count("E")
+            else:
+                num_moe_layers = getattr(self.args, "num_layers", 0)
             track_moe_metrics(
-                loss_scale=1.0 / max(1, get_num_microbatches()),
+                loss_scale=1.0 / max(1, getattr(self.args, "num_microbatches", 1)),
                 iteration=iteration,
                 writer=self._tb_writer,
                 wandb_writer=None,
                 total_loss_dict=self._moe_total_loss_dict,
                 per_layer_logging=False,
                 force_initialize=True,
-                track_names=track_names,
-                num_layers=getattr(self.args, "num_layers", 0),
-                moe_layer_freq=getattr(self.args, "moe_layer_freq", None),
+                track_names=["seq_load_balancing_loss"],
+                num_layers=num_moe_layers,
+                moe_layer_freq=None,
                 mtp_num_layers=getattr(self.args, "mtp_num_layers", None),
                 pg_collection=self.topology.language_pg,
             )
