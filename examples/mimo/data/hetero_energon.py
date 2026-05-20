@@ -384,50 +384,93 @@ def _combine_encoder_batches(batches: list[dict]) -> dict:
         if batch.get("modality_inputs") is not None
     ]
     if modality_values:
-        combined["modality_inputs"] = _concat_nested_tensors(modality_values)
+        combined["modality_inputs"] = _merge_modality_inputs(modality_values)
 
     return combined
 
 
-def _concat_nested_tensors(values):
-    """Concatenate a list of matching nested tensor structures along the
-    first dimension that varies across lanes.
+# ---------------------------------------------------------------------------
+# Schema-aware merge of ``modality_inputs`` across LLM lanes served by one
+# encoder rank. The structure produced by the dataset is fixed:
+#
+#   modality_inputs = {
+#       "<modality_type>": {                # e.g. "images"
+#           "<encoder_name>": {              # e.g. "radio_encoder"
+#               <packed_buffer_key>: Tensor of shape (1, T_lane, C),
+#               "imgs_sizes":        Tensor of shape (N_images_lane, 2),
+#               "packed_seq_params": PackedSeqParams describing the T axis,
+#           }
+#       }
+#   }
+#
+# Each per-lane tensor has a known concat semantics; we encode them
+# explicitly rather than inferring from runtime shape variation:
+#
+#   * packed image buffer: leading dim is always 1 (lane batch == MBS=1);
+#     dim 1 is the variable token axis -> concat along dim 1.
+#   * ``imgs_sizes``: dim 0 = per-lane image count -> concat along dim 0.
+#   * ``packed_seq_params``: cu_seqlens need offset-shifting -> custom merge.
+# ---------------------------------------------------------------------------
 
-    For most per-lane tensors the varying dim is 0 (batch). For dynres-packed
-    image buffers the per-lane shape is ``(1, T_lane, C)`` — dim 0 is the
-    fixed lane batch size and dim 1 is the variable token axis, so the right
-    concatenation is along dim 1. Selecting the first-varying dim handles
-    both uniformly without any sibling-key context.
+
+def _merge_modality_inputs(per_lane_modality_inputs):
+    """Merge the ``modality_inputs`` field of N per-lane batches."""
+    merged = {}
+    modality_types = set().union(
+        *(p.keys() for p in per_lane_modality_inputs if isinstance(p, dict))
+    )
+    for mod_type in sorted(modality_types):
+        per_lane_mod = [p[mod_type] for p in per_lane_modality_inputs if mod_type in p]
+        merged_per_encoder = {}
+        encoder_names = set().union(
+            *(p.keys() for p in per_lane_mod if isinstance(p, dict))
+        )
+        for enc_name in sorted(encoder_names):
+            per_lane_enc = [p[enc_name] for p in per_lane_mod if enc_name in p]
+            merged_per_encoder[enc_name] = _merge_encoder_inputs(per_lane_enc)
+        merged[mod_type] = merged_per_encoder
+    return merged
+
+
+def _merge_encoder_inputs(per_lane_enc_inputs):
+    """Merge per-lane encoder-input dicts using a key-explicit schema.
+
+    Keys are categorized by name / value type:
+      * ``packed_seq_params`` -> ``_concat_packed_seq_params``
+      * ``imgs_sizes``        -> ``torch.cat(..., dim=0)``
+      * any other ``Tensor``  -> packed image buffer ``(1, T, C)``,
+                                 concat along dim 1
+    Anything else triggers a loud error so a future schema change has to be
+    handled here rather than guessed at by a heuristic.
     """
-    present = [value for value in values if value is not None]
-    if not present:
-        return None
-    first = present[0]
-    if isinstance(first, torch.Tensor):
-        return _concat_first_varying_dim(present)
-    if isinstance(first, dict):
-        keys = set().union(*(value.keys() for value in present if isinstance(value, dict)))
-        merged = {}
-        for key in sorted(keys):
-            value = _concat_nested_tensors([item.get(key) for item in present])
-            if value is not None:
-                merged[key] = value
-        return merged
-    if isinstance(first, PackedSeqParams):
-        return _concat_packed_seq_params(present)
-    raise TypeError(f"cannot concatenate encoder batch value of type {type(first).__name__}")
-
-
-def _concat_first_varying_dim(tensors):
-    """Concatenate ``tensors`` along the first dimension whose size differs
-    across the list; default to dim 0 if all shapes match."""
-    if len(tensors) == 1:
-        return tensors[0]
-    first = tensors[0]
-    for d in range(first.dim()):
-        if any(t.shape[d] != first.shape[d] for t in tensors[1:]):
-            return torch.cat(tensors, dim=d)
-    return torch.cat(tensors, dim=0)
+    merged = {}
+    keys = set().union(*(p.keys() for p in per_lane_enc_inputs if isinstance(p, dict)))
+    for key in sorted(keys):
+        vals = [p[key] for p in per_lane_enc_inputs if key in p]
+        if not vals:
+            continue
+        first = vals[0]
+        if isinstance(first, PackedSeqParams):
+            merged[key] = _concat_packed_seq_params(vals)
+        elif key == "imgs_sizes":
+            assert all(isinstance(v, torch.Tensor) for v in vals), (
+                f"imgs_sizes must be tensors, got {[type(v).__name__ for v in vals]}"
+            )
+            merged[key] = torch.cat(vals, dim=0)
+        elif isinstance(first, torch.Tensor):
+            # Packed image buffer: leading dim is the lane batch (==1); the
+            # variable token axis is dim 1.
+            assert first.dim() >= 2 and first.shape[0] == 1, (
+                f"unexpected packed-buffer shape for encoder key {key!r}: "
+                f"{tuple(first.shape)} (expected leading dim 1)"
+            )
+            merged[key] = torch.cat(vals, dim=1)
+        else:
+            raise TypeError(
+                f"unsupported encoder-input value for key {key!r}: "
+                f"{type(first).__name__}; extend _merge_encoder_inputs"
+            )
+    return merged
 
 
 def _concat_packed_seq_params(values: list) -> PackedSeqParams:
