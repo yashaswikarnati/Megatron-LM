@@ -60,6 +60,22 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--parity-atol", type=float, default=2e-3)
     p.add_argument("--parity-rtol", type=float, default=1e-2)
+    p.add_argument(
+        "--timeline-dir",
+        type=str,
+        default=None,
+        help="Directory for per-rank JSONL timeline traces. Disables timeline if unset.",
+    )
+    p.add_argument(
+        "--timeline-cuda-events",
+        action="store_true",
+        help="Also record CUDA event elapsed time on forward.",
+    )
+    p.add_argument(
+        "--timeline-nvtx",
+        action="store_true",
+        help="Push NVTX ranges for nsys profiling.",
+    )
     _ = NEMOTRON_54L_MODEL_PROVIDER  # silence import-unused; provider is selected via --model-provider
     args = p.parse_args()
     # Apply the same provider-default patching the production loop runs after
@@ -93,13 +109,36 @@ def main() -> None:
         radio_vision_config,
     )
     from examples.mimo.training.hetero.step import move_batch_to_cuda
-    from examples.mimo.training.hetero.topology import (
-        create_hypercomm_grid,
-        get_pg_collection,
-    )
+    from examples.mimo.training.hetero.topology import create_hypercomm_grid, get_pg_collection
     from megatron.core.models.vision.vit_layer_specs import (
         get_vit_layer_with_transformer_engine_spec,
     )
+    from megatron.core.pipeline_parallel.timeline import (
+        close_pipeline_timeline,
+        configure_pipeline_timeline,
+        flush_pipeline_timeline,
+        set_pipeline_timeline_iteration,
+        timeline_event,
+    )
+
+    lanes_per_encoder = args.llm_dp // args.encoder_dp
+    timeline_enabled = bool(args.timeline_dir)
+    configure_pipeline_timeline(
+        enabled=timeline_enabled,
+        output_dir=args.timeline_dir or "",
+        rank=rank,
+        world_size=world,
+        role="encoder",
+        metadata={
+            "encoder_dp": args.encoder_dp,
+            "llm_dp": args.llm_dp,
+            "lanes_per_encoder": lanes_per_encoder,
+        },
+        cuda_events=args.timeline_cuda_events,
+        nvtx=args.timeline_nvtx,
+    )
+    if timeline_enabled:
+        _print(rank, f"timeline ON dir={args.timeline_dir} cuda_events={args.timeline_cuda_events}")
 
     encoder_grid = create_hypercomm_grid(
         offset=0,
@@ -145,6 +184,42 @@ def main() -> None:
     encoder.eval()
     _print(rank, f"encoder built dtype={next(encoder.parameters()).dtype}")
 
+    # Timeline mode: install a lane-stats wrapper around _combine_encoder_batches
+    # so each iterator step emits an ``encoder.lane_combine`` event with per-lane
+    # image/token counts (visible to post-processing as per-lane fan-out data).
+    # Parity mode (below) stacks on top — its wrapper calls _he._combine which
+    # is now our stats wrapper, chaining correctly.
+    if timeline_enabled:
+        _real_combine_for_stats = _he._combine_encoder_batches
+
+        def _stats_capturing_combine(batches):
+            per_lane_images = []
+            per_lane_tokens = []
+            lanes_with_images = 0
+            for lb in batches:
+                if not isinstance(lb, dict) or lb.get("modality_inputs") is None:
+                    per_lane_images.append(0)
+                    per_lane_tokens.append(0)
+                    continue
+                lanes_with_images += 1
+                lei = lb["modality_inputs"]["images"]["radio_encoder"]
+                per_lane_images.append(int(lei["x"].shape[0]) if "x" in lei else 0)
+                psp = lei.get("packed_seq_params")
+                if psp is not None and psp.cu_seqlens_q.numel() > 0:
+                    per_lane_tokens.append(int(psp.cu_seqlens_q[-1].item()))
+                else:
+                    per_lane_tokens.append(0)
+            with timeline_event(
+                "encoder.lane_combine",
+                lane_count=len(batches),
+                lanes_with_images=lanes_with_images,
+                per_lane_images=per_lane_images,
+                per_lane_tokens=per_lane_tokens,
+            ):
+                return _real_combine_for_stats(batches)
+
+        _he._combine_encoder_batches = _stats_capturing_combine
+
     # Parity mode: install a module-level capture hook on
     # _combine_encoder_batches so we can pull both the per-lane batches and
     # the merged batch from a single iterator step (the routed iterator's
@@ -164,59 +239,95 @@ def main() -> None:
     dist.barrier()
 
     for step in range(args.n_steps):
-        t0 = time.time()
+        set_pipeline_timeline_iteration(step)
         try:
-            batch = next(iterator)
-        except Exception as e:
-            _print(rank, f"step={step} iterator FAILED: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            raise
+            with timeline_event("encoder.iter.total"):
+                t0 = time.time()
+                with timeline_event("encoder.data_next"):
+                    try:
+                        batch = next(iterator)
+                    except Exception as e:
+                        _print(rank, f"step={step} iterator FAILED: {type(e).__name__}: {e}")
+                        traceback.print_exc()
+                        raise
 
-        mi = batch.get("modality_inputs") if isinstance(batch, dict) else None
-        if mi is None:
-            _print(rank, f"step={step} no modality_inputs (text-only batch), skip")
-            continue
-        enc_inputs = mi["images"]["radio_encoder"]
-        psp = enc_inputs.get("packed_seq_params")
-        if psp is not None:
-            cu = psp.cu_seqlens_q
-            mono = bool(torch.all(cu[1:] >= cu[:-1]).item())
-            _print(
-                rank,
-                f"step={step} cu_seqlens_q={cu.tolist()} "
-                f"max_seqlen_q={int(psp.max_seqlen_q)} "
-                f"monotonic={mono} "
-                f"images.shape={tuple(enc_inputs['x'].shape)} "
-                f"imgs_sizes={enc_inputs.get('imgs_sizes')}",
-            )
-            if not mono:
-                raise RuntimeError(
-                    f"non-monotonic cu_seqlens_q at step={step}: {cu.tolist()}"
+                mi = batch.get("modality_inputs") if isinstance(batch, dict) else None
+                if mi is None:
+                    _print(rank, f"step={step} no modality_inputs (text-only batch), skip")
+                    continue
+                enc_inputs = mi["images"]["radio_encoder"]
+                psp = enc_inputs.get("packed_seq_params")
+                image_count = int(enc_inputs["x"].shape[0]) if "x" in enc_inputs else 0
+                token_count_total = (
+                    int(psp.cu_seqlens_q[-1].item())
+                    if psp is not None and psp.cu_seqlens_q.numel() > 0
+                    else 0
                 )
-        else:
-            _print(
-                rank,
-                f"step={step} no packed_seq_params; "
-                f"x.shape={tuple(enc_inputs['x'].shape)}",
-            )
+                max_seqlen_q = int(psp.max_seqlen_q) if psp is not None else 0
+                tile_count_total = (
+                    int(enc_inputs["imgs_sizes"].shape[0])
+                    if isinstance(enc_inputs.get("imgs_sizes"), torch.Tensor)
+                    else 0
+                )
+                # Instant event: metadata-only snapshot of this iter's encoder load.
+                with timeline_event(
+                    "encoder.batch_stats",
+                    image_count=image_count,
+                    token_count_total=token_count_total,
+                    max_seqlen_q=max_seqlen_q,
+                    tile_count_total=tile_count_total,
+                ):
+                    pass
 
-        enc_inputs_cuda = move_batch_to_cuda(enc_inputs)
+                if psp is not None:
+                    cu = psp.cu_seqlens_q
+                    mono = bool(torch.all(cu[1:] >= cu[:-1]).item())
+                    _print(
+                        rank,
+                        f"step={step} cu_seqlens_q={cu.tolist()} "
+                        f"max_seqlen_q={max_seqlen_q} "
+                        f"monotonic={mono} "
+                        f"images.shape={tuple(enc_inputs['x'].shape)} "
+                        f"imgs_sizes={enc_inputs.get('imgs_sizes')}",
+                    )
+                    if not mono:
+                        raise RuntimeError(
+                            f"non-monotonic cu_seqlens_q at step={step}: {cu.tolist()}"
+                        )
+                else:
+                    _print(
+                        rank,
+                        f"step={step} no packed_seq_params; "
+                        f"x.shape={tuple(enc_inputs['x'].shape)}",
+                    )
 
-        t1 = time.time()
-        try:
-            with torch.no_grad():
-                out = encoder(**enc_inputs_cuda)
-        except Exception as e:
-            _print(rank, f"step={step} forward FAILED: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            raise
-        torch.cuda.synchronize()
-        t2 = time.time()
-        _print(
-            rank,
-            f"step={step} OK out_shape={tuple(out.shape)} "
-            f"t_iter={t1 - t0:.2f}s t_fwd={t2 - t1:.2f}s",
-        )
+                with timeline_event("encoder.to_cuda"):
+                    enc_inputs_cuda = move_batch_to_cuda(enc_inputs)
+
+                t1 = time.time()
+                with timeline_event(
+                    "encoder.forward",
+                    cuda=True,
+                    image_count=image_count,
+                    token_count_total=token_count_total,
+                ):
+                    try:
+                        with torch.no_grad():
+                            out = encoder(**enc_inputs_cuda)
+                    except Exception as e:
+                        _print(rank, f"step={step} forward FAILED: {type(e).__name__}: {e}")
+                        traceback.print_exc()
+                        raise
+                    torch.cuda.synchronize()
+                t2 = time.time()
+                _print(
+                    rank,
+                    f"step={step} OK out_shape={tuple(out.shape)} "
+                    f"t_iter={t1 - t0:.2f}s t_fwd={t2 - t1:.2f}s "
+                    f"images={image_count} tokens={token_count_total}",
+                )
+        finally:
+            flush_pipeline_timeline()
 
         if args.parity and captured["lane_batches"] is not None:
             lane_batches = captured["lane_batches"]
@@ -291,6 +402,7 @@ def main() -> None:
 
     dist.barrier()
     _print(rank, "all steps done")
+    close_pipeline_timeline()
     dist.destroy_process_group()
 
 
