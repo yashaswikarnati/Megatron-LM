@@ -36,6 +36,7 @@ ENCODER_DP=8
 LLM_DP=128               # virtual; gives lanes_per_encoder=16 (matches 33n fan-out)
 N_STEPS=${N_STEPS:-200}
 PARITY=${PARITY:-0}      # off — we want production behavior, not per-step parity overhead
+TIMELINE=${TIMELINE:-1}  # opt-in JSONL timeline tracing (default ON for profiling runs)
 
 mkdir -p "${RUN_DIR}" "${RUN_DIR}/tmp" "${RUN_DIR}/resolved_configs"
 
@@ -96,7 +97,9 @@ export NCCL_SHM_DISABLE=1
 export NCCL_PROTO=simple
 export NCCL_NVLS_ENABLE=0
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
-export ENCODER_DP LLM_DP N_STEPS PARITY
+export ENCODER_DP LLM_DP N_STEPS PARITY TIMELINE
+export TIMELINE_DIR="${RUN_DIR}/timeline"
+mkdir -p "${TIMELINE_DIR}"
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
@@ -135,5 +138,6 @@ srun --kill-on-bad-exit=1 \
       --image-tag-type internvl \
       --freeze-vit \
       --n-steps "${N_STEPS}" \
-      $( [[ "${PARITY}" == "1" ]] && echo "--parity" )
+      $( [[ "${PARITY}" == "1" ]] && echo "--parity" ) \
+      $( [[ "${TIMELINE}" == "1" ]] && echo "--timeline-dir ${TIMELINE_DIR} --timeline-cuda-events" )
   '
