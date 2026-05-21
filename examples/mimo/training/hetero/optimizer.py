@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -13,7 +14,15 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
 
 def build_optimizer(args: argparse.Namespace, model: MimoModel):
-    """Build the MIMO optimizer for active hetero module optimizers."""
+    """Build the MIMO optimizer for active hetero module optimizers.
+
+    Plumbs ``--num-distributed-optimizer-instances`` to the LLM module so the
+    DistributedOptimizer partitions DP/CP and expt_dp stripes into the
+    requested number of intra groups (shrinks param-gather and grad-reduce
+    collectives by a factor of N). Encoder stays at 1.
+    """
+    n_inst = getattr(args, "num_distributed_optimizer_instances", 1)
+    per_module_n_inst = {MIMO_LANGUAGE_MODULE_KEY: n_inst} if n_inst > 1 else None
     return get_mimo_optimizer(
         model,
         OptimizerConfig(
@@ -28,6 +37,7 @@ def build_optimizer(args: argparse.Namespace, model: MimoModel):
             use_distributed_optimizer=True,
             log_num_zeros_in_grad=args.log_num_zeros_in_grad,
         ),
+        num_distributed_optimizer_instances=per_module_n_inst,
     )
 
 

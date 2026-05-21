@@ -120,6 +120,9 @@ def wrap_active_modules_with_ddp(
             bucket_size=_resolve_bucket_size(args, mimo_model.language_model),
             pad_buckets_for_high_nccl_busbw=pad_buckets,
             use_distributed_optimizer=True,
+            num_distributed_optimizer_instances=getattr(
+                args, "num_distributed_optimizer_instances", 1
+            ),
             # Keep main_grad in fp32. Default False → bf16 main_grad → step-2
             # weight drift after Adam.
             grad_reduce_in_fp32=getattr(args, "accumulate_allreduce_grads_in_fp32", True),

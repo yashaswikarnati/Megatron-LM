@@ -372,42 +372,192 @@ def _module_has_any_trainable_parameters(module, pg_collection: ProcessGroupColl
     return bool(local_has_params.item())
 
 
-def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
+def _create_dist_opt_instance_groups(grid, num_instances: int):
+    """Build hierarchical optimizer-instance groups split from a HyperCommGrid.
+
+    Mirrors the two halves of MCore's ``_initialize_model_parallel_groups`` that
+    partition the distributed optimizer when ``num_distributed_optimizer_instances > 1``:
+
+    * ``parallel_state.py:823-893``  — split the ``dp``/``cp`` rank stripes
+    * ``parallel_state.py:1247-1294`` — split the ``expt_dp`` rank stripes
+
+    The two splits are **independent**. ``expt_dp`` rank stripes are a different
+    enumeration than ``dp/cp`` stripes (different layout), so the intra/inter
+    groups for expert-DP must come from their own hierarchical call. Aliasing
+    ``intra_expt_dp = intra_dp_cp`` produces incorrect expert-gradient
+    reductions when EP > 1.
+
+    Also constructs ``intra_dist_opt`` — the union of (tp × cp × pp) rank stripes
+    spanning one intra ``dp_cp`` slice. Used by the optimizer for grad-stats
+    reduction (loss scale, grad norm).
+
+    Returns a dict with five process-group handles (or None for non-member ranks):
+    ``intra_dp_cp``, ``inter_dp_cp``, ``intra_expt_dp``, ``inter_expt_dp``,
+    ``intra_dist_opt``.
+
+    All ranks in the default group must call this with the same ``grid`` and
+    ``num_instances`` because ``dist.new_group`` is a collective operation.
+    """
+    import torch.distributed as dist
+
+    from megatron.core.parallel_state import create_hierarchical_groups
+
+    rank = dist.get_rank()
+
+    # --- DP/CP hierarchical split ---------------------------------------
+    dp_idx = grid.dim_names.index("dp")
+    cp_idx = grid.dim_names.index("cp")
+    dp_size = grid.shape[dp_idx]
+    cp_size = grid.shape[cp_idx]
+    dp_cp_size = dp_size * cp_size
+    if dp_cp_size % num_instances != 0:
+        raise ValueError(
+            f"dp_cp_size ({dp_cp_size}) must be divisible by "
+            f"num_distributed_optimizer_instances ({num_instances})"
+        )
+    intra_dp_cp_size = dp_cp_size // num_instances
+
+    intra_dp_cp_group = None
+    inter_dp_cp_group = None
+    for dp_cp_ranks in grid.get_rank_enum(["dp", "cp"]):
+        h_groups, _ = create_hierarchical_groups(
+            rank, dp_cp_ranks, [intra_dp_cp_size, num_instances], group_desc="MIMO_DIST_OPT_DP_CP"
+        )
+        if rank in dp_cp_ranks:
+            intra_dp_cp_group = h_groups[0]
+            inter_dp_cp_group = h_groups[1]
+
+    # --- expt_dp hierarchical split (independent from dp/cp) -----------
+    intra_expt_dp_group = None
+    inter_expt_dp_group = None
+    if "expert" in grid._layouts:
+        expert_layout = grid._layouts["expert"]
+        expt_dp_idx = expert_layout.dim_names.index("expt_dp")
+        expt_dp_size = expert_layout.shape[expt_dp_idx]
+        if expt_dp_size % num_instances != 0:
+            raise ValueError(
+                f"expt_dp_size ({expt_dp_size}) must be divisible by "
+                f"num_distributed_optimizer_instances ({num_instances})"
+            )
+        intra_expt_dp_size = expt_dp_size // num_instances
+        for expt_dp_ranks in grid.get_rank_enum("expt_dp"):
+            h_groups, _ = create_hierarchical_groups(
+                rank,
+                expt_dp_ranks,
+                [intra_expt_dp_size, num_instances],
+                group_desc="MIMO_DIST_OPT_EXPT_DP",
+            )
+            if rank in expt_dp_ranks:
+                intra_expt_dp_group = h_groups[0]
+                inter_expt_dp_group = h_groups[1]
+
+    # --- intra_dist_opt: MP × intra_DP_CP -------------------------------
+    # Each ``(tp, pp)`` rank stripe holds tp_size * pp_size ranks at a fixed
+    # ``(dp, cp)`` position. ``get_rank_enum(["tp","pp"])`` returns them
+    # ordered by ``(dp, cp)`` (dp slowest, cp fastest), so consecutive
+    # ``intra_dp_cp_size`` stripes form one contiguous intra DP-CP slice.
+    intra_dist_opt_group = None
+    tp_pp_stripes = grid.get_rank_enum(["tp", "pp"])
+    expected_stripes = dp_cp_size
+    if len(tp_pp_stripes) != expected_stripes:
+        raise RuntimeError(
+            f"unexpected tp-pp stripe count {len(tp_pp_stripes)}; "
+            f"expected {expected_stripes} (dp_size {dp_size} * cp_size {cp_size})"
+        )
+    accumulator: List[int] = []
+    for stripe_idx, stripe in enumerate(tp_pp_stripes):
+        accumulator.extend(stripe)
+        if (stripe_idx + 1) % intra_dp_cp_size == 0:
+            group_ranks = sorted(set(accumulator))
+            group = dist.new_group(ranks=group_ranks, group_desc="MIMO_INTRA_DIST_OPT")
+            if rank in group_ranks:
+                intra_dist_opt_group = group
+            accumulator = []
+
+    return {
+        "intra_dp_cp": intra_dp_cp_group,
+        "inter_dp_cp": inter_dp_cp_group,
+        "intra_expt_dp": intra_expt_dp_group,
+        "inter_expt_dp": inter_expt_dp_group,
+        "intra_dist_opt": intra_dist_opt_group,
+    }
+
+
+def _get_pg_collection_for_optimizer(
+    grid, num_dist_opt_instances: int = 1
+) -> ProcessGroupCollection:
     """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
 
-    Only fetches process groups required by the optimizer. Assumes all groups
-    are pre-created in the grid via grid.create_pg() - does not create any new groups.
+    ``num_dist_opt_instances == 1``: returns the existing single-instance
+    layout (intra_dp_cp = full dp_cp, intra_expt_dp = full expt_dp,
+    intra_dist_opt = full tp/cp/dp/pp group). No new groups created.
+
+    ``num_dist_opt_instances > 1``: builds hierarchical splits via
+    :func:`_create_dist_opt_instance_groups`. The split is applied to both
+    ``dp_cp`` and ``expt_dp`` *independently* (see that helper's docstring
+    for why). All ranks in the default group must call this with the same
+    ``num_dist_opt_instances`` because the hierarchical build is collective.
     """
     pg = ProcessGroupCollection()
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
-    pg.intra_dp_cp = pg.dp_cp
     pg.tp = grid.get_pg("tp")
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
     pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"])
     pg.expt_dp = grid.get_pg("expt_dp")
-    pg.intra_expt_dp = pg.expt_dp
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+
+    if num_dist_opt_instances > 1:
+        instance_groups = _create_dist_opt_instance_groups(grid, num_dist_opt_instances)
+        pg.intra_dp_cp = instance_groups["intra_dp_cp"]
+        pg.inter_dist_opt = instance_groups["inter_dp_cp"]
+        pg.intra_expt_dp = instance_groups["intra_expt_dp"]
+        # inter_expt_dp is created for symmetry but Megatron's optimizer does
+        # not currently consume it; populate ``inter_dist_opt`` from the
+        # DP/CP-side inter group, which matches parallel_state semantics.
+        pg.intra_dist_opt = instance_groups["intra_dist_opt"]
+    else:
+        pg.intra_dp_cp = pg.dp_cp
+        pg.intra_expt_dp = pg.expt_dp
+        pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+
     return pg
 
 
-def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
-    """Create optimizer for MimoModel with heterogeneous parallelism."""
+def get_mimo_optimizer(
+    mimo_model: "MimoModel",
+    config: OptimizerConfig,
+    num_distributed_optimizer_instances: Optional[Dict[str, int]] = None,
+) -> MimoOptimizer:
+    """Create optimizer for MimoModel with heterogeneous parallelism.
+
+    Args:
+        mimo_model: The MIMO model being trained.
+        config: Shared optimizer config (e.g. lr, weight_decay).
+        num_distributed_optimizer_instances: Optional per-module override of
+            ``num_distributed_optimizer_instances`` for the distributed
+            optimizer. Map module_name → N. When N > 1 the DP-CP and expt_dp
+            stripes are sub-partitioned into N intra groups via
+            :func:`_create_dist_opt_instance_groups`. Defaults to 1 for every
+            module. The same dict must be supplied on every rank — the
+            sub-partitioning calls ``dist.new_group`` collectively.
+    """
     from megatron.core.optimizer import get_megatron_optimizer
 
     grid_map = mimo_model.mimo_config.module_to_grid_map
     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
     lang_key = MIMO_LANGUAGE_MODULE_KEY
+    n_per_module: Dict[str, int] = dict(num_distributed_optimizer_instances or {})
 
     module_infos: Dict[str, ModuleOptimizerInfo] = {}
 
     for module_name, grid in grid_map.items():
         is_active = grid.is_current_rank_in_grid()
+        n_inst = n_per_module.get(module_name, 1)
 
         optimizer = None
-        pg_collection = _get_pg_collection_for_optimizer(grid)
+        pg_collection = _get_pg_collection_for_optimizer(grid, n_inst)
 
         if is_active:
             if module_name == lang_key:
@@ -425,16 +575,20 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 module, pg_collection
             )
             if module is not None and module_has_trainable_params:
-                assert (
-                    not hasattr(module, 'ddp_config')
-                    or module.ddp_config is None
-                    or module.ddp_config.num_distributed_optimizer_instances == 1
-                ), (
-                    "MIMO optimizer does not yet support "
-                    "num_distributed_optimizer_instances > 1. "
-                    f"Module '{module_name}' has "
-                    f"{module.ddp_config.num_distributed_optimizer_instances} instances."
+                # Sanity-check: when caller asked for multi-instance optimizer
+                # on this module, the DDP-wrapped module must report the same
+                # count via its ddp_config. Mismatch indicates a plumbing bug.
+                ddp_n = (
+                    module.ddp_config.num_distributed_optimizer_instances
+                    if hasattr(module, "ddp_config") and module.ddp_config is not None
+                    else 1
                 )
+                if ddp_n != n_inst:
+                    raise ValueError(
+                        f"Module '{module_name}': num_distributed_optimizer_instances "
+                        f"mismatch — caller requested {n_inst}, DDP config has {ddp_n}. "
+                        "Plumb the same value through both."
+                    )
                 optimizer = get_megatron_optimizer(
                     config=config,
                     model_chunks=[module],

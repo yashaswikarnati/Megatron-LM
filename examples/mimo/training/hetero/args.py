@@ -201,6 +201,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     train.add_argument(
+        "--num-distributed-optimizer-instances",
+        type=int,
+        default=1,
+        help=(
+            "Number of distributed optimizer instances for the LLM. N>1 partitions "
+            "the LLM DP/CP and expt_dp rank stripes into N intra groups, shrinking "
+            "the per-iter param-gather and grad-reduce collectives by a factor of N. "
+            "LLM_DP*LLM_CP and LLM_expt_dp must both be divisible by N. Encoder "
+            "stays at 1 instance regardless. Applies only when "
+            "--use-distributed-optimizer is on (always true in this hetero loop)."
+        ),
+    )
+    train.add_argument(
         "--ddp-pad-buckets-for-high-nccl-busbw",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -333,6 +346,20 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
         validate_energon_data_args(args)
     if args.num_moe_experts > 0 and args.num_moe_experts % args.llm_ep != 0:
         raise ValueError("--num-moe-experts must be divisible by --llm-ep")
+    n_inst = args.num_distributed_optimizer_instances
+    if n_inst < 1:
+        raise ValueError("--num-distributed-optimizer-instances must be >= 1")
+    if n_inst > 1:
+        if (args.llm_dp * args.llm_cp) % n_inst != 0:
+            raise ValueError(
+                f"--llm-dp * --llm-cp ({args.llm_dp * args.llm_cp}) must be divisible "
+                f"by --num-distributed-optimizer-instances ({n_inst})"
+            )
+        if args.llm_expt_dp is not None and args.llm_expt_dp % n_inst != 0:
+            raise ValueError(
+                f"--llm-expt-dp ({args.llm_expt_dp}) must be divisible "
+                f"by --num-distributed-optimizer-instances ({n_inst})"
+            )
     if args.save_interval is not None and args.save_interval < 1:
         raise ValueError("--save-interval must be >= 1 when set")
     if args.save_interval is not None and args.save is None:
