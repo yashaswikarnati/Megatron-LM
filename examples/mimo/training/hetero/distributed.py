@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import timedelta
 
 import torch
 import torch.distributed as dist
@@ -13,13 +14,23 @@ from megatron.core import parallel_state
 
 
 def initialize_distributed() -> None:
-    """Initialize torch.distributed for torchrun."""
+    """Initialize torch.distributed for torchrun.
+
+    Default NCCL watchdog timeout is 10 min, which is too tight when first-iter
+    collectives on large process groups (e.g. expt_dp=96 at 100n) take longer
+    than that to complete their initial NCCL channel setup. Bump via env var
+    ``HETERO_DIST_TIMEOUT_MIN`` (default 30 min).
+    """
     import os
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        timeout_min = int(os.environ.get("HETERO_DIST_TIMEOUT_MIN", "30"))
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(minutes=timeout_min),
+        )
     assert_megatron_parallel_state_uninitialized()
     try:
         parallel_state.get_global_memory_buffer()
