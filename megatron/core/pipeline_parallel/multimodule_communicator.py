@@ -370,10 +370,17 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
+                    _t = output_dict[module_name]
+                    _numel = int(_t.numel()) if hasattr(_t, "numel") else 0
+                    _bytes = (
+                        int(_t.element_size() * _t.numel()) if hasattr(_t, "element_size") else 0
+                    )
                     with timeline_event(
                         "bridge.send_forward",
                         src_module=bridge_comm.src_module_name,
                         dest_module=bridge_comm.dest_module_name,
+                        numel=_numel,
+                        tensor_bytes=_bytes,
                     ):
                         bridge_comm.send_forward(output_dict[module_name])
             else:
@@ -402,10 +409,17 @@ class MultiModulePipelineCommunicator:
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
+                    _t = output_dict[module_name]
+                    _numel = int(_t.numel()) if hasattr(_t, "numel") else 0
+                    _bytes = (
+                        int(_t.element_size() * _t.numel()) if hasattr(_t, "element_size") else 0
+                    )
                     with timeline_event(
                         "bridge.send_forward_recv_backward",
                         src_module=bridge_comm.src_module_name,
                         dest_module=bridge_comm.dest_module_name,
+                        numel=_numel,
+                        tensor_bytes=_bytes,
                     ):
                         grad = bridge_comm.send_forward_recv_backward(output_dict[module_name])
                     grad_dict[bridge_comm.src_module_name] = grad
@@ -440,10 +454,17 @@ class MultiModulePipelineCommunicator:
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     # If first stage, and has incoming modules, send backward gradient and
                     # receive forward activation by using bridge communicator.
+                    _t = grad_dict[bridge_comm.src_module_name]
+                    _numel = int(_t.numel()) if hasattr(_t, "numel") else 0
+                    _bytes = (
+                        int(_t.element_size() * _t.numel()) if hasattr(_t, "element_size") else 0
+                    )
                     with timeline_event(
                         "bridge.send_backward_recv_forward",
                         src_module=bridge_comm.src_module_name,
                         dest_module=bridge_comm.dest_module_name,
+                        numel=_numel,
+                        tensor_bytes=_bytes,
                     ):
                         received_tensor = bridge_comm.send_backward_recv_forward(
                             grad_dict[bridge_comm.src_module_name]

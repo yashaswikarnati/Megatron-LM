@@ -30,6 +30,7 @@ from megatron.core.pipeline_parallel.timeline import (
     close_pipeline_timeline,
     flush_pipeline_timeline,
     set_pipeline_timeline_iteration,
+    timeline_event,
 )
 
 
@@ -96,9 +97,11 @@ def run_train_loop(args: argparse.Namespace) -> None:
         for iteration in range(start_iteration + 1, args.train_iters + 1):
             debug_rank(f"iteration {iteration}: train step start")
             set_pipeline_timeline_iteration(iteration)
-            result = train_step(
-                args, model, topology, optimizer, opt_param_scheduler, communicator, data_iterator
-            )
+            with timeline_event("iter.total"):
+                result = train_step(
+                    args, model, topology, optimizer, opt_param_scheduler, communicator,
+                    data_iterator,
+                )
             flush_pipeline_timeline()
             logger.record_step(result)
             logger.maybe_log(iteration, optimizer, result)

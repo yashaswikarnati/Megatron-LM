@@ -207,6 +207,92 @@ def main():
               f"{min(lwi_all)} / {max(lwi_all)}")
         print()
 
+    # 6) Full percentile breakdown for top events
+    print("## Full percentile breakdown (host wall-time ms)")
+    rows = []
+    for ev in event_order[:6]:
+        vs = [v / 1000.0 for v in by_event_host_us[ev]]
+        rows.append([
+            ev, len(vs),
+            f"{_percentile(vs, 50):.1f}",
+            f"{_percentile(vs, 90):.1f}",
+            f"{_percentile(vs, 95):.1f}",
+            f"{_percentile(vs, 99):.1f}",
+            f"{max(vs):.1f}",
+        ])
+    print(_table(rows, ["event", "n", "p50", "p90", "p95", "p99", "max"]))
+    print()
+
+    # 7) Forward-vs-tokens — join encoder.forward with encoder.batch_stats by
+    #    (rank, iteration) so we can read per-token throughput and bucket the
+    #    forward distribution by image size.
+    fwd_token_pairs = []  # list of (token_count_total, forward_ms)
+    for rank in ranks:
+        recs = rank_records[rank]
+        by_iter_fwd = {}
+        by_iter_stats = {}
+        for r in recs:
+            it = r["iteration"]
+            if r["event"] == "encoder.forward":
+                by_iter_fwd[it] = r
+            elif r["event"] == "encoder.batch_stats":
+                by_iter_stats[it] = r
+        for it, fwd in by_iter_fwd.items():
+            stats = by_iter_stats.get(it)
+            if stats is None:
+                continue
+            tc = stats.get("token_count_total", 0)
+            if tc <= 0:
+                continue
+            fwd_ms = fwd["duration_us"] / 1000.0
+            fwd_token_pairs.append((tc, fwd_ms))
+
+    if fwd_token_pairs:
+        # Per-token throughput (µs per token)
+        us_per_token = [(fwd_ms * 1000.0) / tc for tc, fwd_ms in fwd_token_pairs]
+        # Token-count distribution
+        tcs = [tc for tc, _ in fwd_token_pairs]
+        # Bucket forward times by token count
+        buckets = [
+            ("≤1k", lambda t: t <= 1000),
+            ("1k–4k", lambda t: 1000 < t <= 4000),
+            ("4k–10k", lambda t: 4000 < t <= 10000),
+            (">10k", lambda t: t > 10000),
+        ]
+
+        print("## Token-count distribution (per forward call)")
+        print(f"- n forwards w/ token_count: {len(tcs)}")
+        print(f"- token_count median / p90 / p99 / max: "
+              f"{statistics.median(tcs):.0f} / "
+              f"{_percentile(tcs, 90):.0f} / "
+              f"{_percentile(tcs, 99):.0f} / "
+              f"{max(tcs)}")
+        print()
+
+        print("## Encoder forward time bucketed by token_count")
+        rows = []
+        for label, pred in buckets:
+            xs = [fwd_ms for tc, fwd_ms in fwd_token_pairs if pred(tc)]
+            if not xs:
+                rows.append([label, 0, "—", "—", "—", "—"])
+                continue
+            rows.append([
+                label, len(xs),
+                f"{statistics.median(xs):.1f}",
+                f"{_percentile(xs, 90):.1f}",
+                f"{_percentile(xs, 99):.1f}",
+                f"{max(xs):.1f}",
+            ])
+        print(_table(rows, ["token_count", "n", "med_ms", "p90_ms", "p99_ms", "max_ms"]))
+        print()
+
+        print("## µs / token (intrinsic encoder throughput)")
+        print(f"- median: {statistics.median(us_per_token):.3f} µs/token")
+        print(f"- p90:    {_percentile(us_per_token, 90):.3f}")
+        print(f"- p99:    {_percentile(us_per_token, 99):.3f}")
+        print(f"- max:    {max(us_per_token):.3f}")
+        print()
+
 
 if __name__ == "__main__":
     main()

@@ -121,31 +121,37 @@ def train_step(
     data_iterator,
 ) -> TrainStepResult:
     """Run one Megatron-shaped hetero training step."""
-    zero_active_grad_buffers(model)
+    with timeline_event("grad_buffers.zero"):
+        zero_active_grad_buffers(model)
     reset_modality_participation(model)
-    optimizer.zero_grad()
+    with timeline_event("optimizer.zero_grad"):
+        optimizer.zero_grad()
 
     debug_rank("starting forward/backward schedule")
-    losses = schedule.forward_backward_pipelining_without_interleaving(
-        forward_step_func=forward_step,
-        data_iterator=data_iterator,
-        model=[model],
-        num_microbatches=args.num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        forward_only=False,
-        p2p_communicator=communicator,
-        pg_collection=topology.schedule_pg_collection,
-    )
+    with timeline_event("schedule.fwd_bwd"):
+        losses = schedule.forward_backward_pipelining_without_interleaving(
+            forward_step_func=forward_step,
+            data_iterator=data_iterator,
+            model=[model],
+            num_microbatches=args.num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            forward_only=False,
+            p2p_communicator=communicator,
+            pg_collection=topology.schedule_pg_collection,
+        )
     debug_rank("schedule complete")
 
     debug_rank("optimizer step starting")
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-    update_successful = reduce_update_success(update_successful)
+    with timeline_event("optimizer.step", cuda=True):
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    with timeline_event("update_success.reduce"):
+        update_successful = reduce_update_success(update_successful)
     debug_rank("optimizer step complete")
 
     if update_successful:
-        opt_param_scheduler.step(increment=get_global_batch_size(args))
+        with timeline_event("opt_param_scheduler.step"):
+            opt_param_scheduler.step(increment=get_global_batch_size(args))
         skipped_iter = 0
     else:
         # Match Megatron train_step semantics: failed updates skip LR advancement but
