@@ -136,8 +136,11 @@ if [[ "${TIMELINE}" == "1" ]]; then
     --timeline-dir "${TIMELINE_DIR}"
     --timeline-ranks dp-replica
     --timeline-dp-replica 0
-    --timeline-cuda-events
   )
+  # NOTE: --timeline-cuda-events intentionally OFF. The recorder syncs
+  # CUDA events at every per-iter flush; with --overlap-grad-reduce and
+  # --overlap-param-gather, that stream-drain breaks the overlap and the
+  # iter cost balloons ~40x. Host wall-time is enough to find stalls.
 fi
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
