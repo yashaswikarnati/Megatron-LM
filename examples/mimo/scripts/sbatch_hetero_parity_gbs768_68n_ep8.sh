@@ -111,6 +111,10 @@ export LR_WARMUP_SAMPLES LR_DECAY_SAMPLES LR_WSD_DECAY_SAMPLES LR_WSD_DECAY_STYL
 export NUM_WORKERS PACKING_BUFFER_SIZE SHUFFLE_BUFFER_SIZE MAX_SAMPLES_PER_SEQUENCE CHECK_HEL_PATHS
 export TOKENIZER_MODEL VISION_CKPT
 
+TIMELINE=${TIMELINE:-1}  # opt-in JSONL timeline tracing for hetero loop (default ON)
+TIMELINE_DIR="${RUN_DIR}/timeline"
+mkdir -p "${TIMELINE_DIR}"
+
 TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
@@ -126,6 +130,16 @@ TRAIN_LAUNCH_ARGS=(
   --dynamic-resolution
   --tensorboard-dir "${RUN_DIR}/tensorboard"
 )
+if [[ "${TIMELINE}" == "1" ]]; then
+  TRAIN_LAUNCH_ARGS+=(
+    --timeline-profile
+    --timeline-dir "${TIMELINE_DIR}"
+    --timeline-ranks dp-replica
+    --timeline-dp-replica 0
+  )
+  # --timeline-cuda-events intentionally OFF — recorder syncs per iter and
+  # breaks overlap-grad-reduce / overlap-param-gather at production scale.
+fi
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
