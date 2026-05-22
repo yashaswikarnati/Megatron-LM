@@ -94,8 +94,10 @@ def create_topology(args: argparse.Namespace, encoder_size: int, llm_size: int) 
         language_embedding_groups = create_language_embedding_groups(llm_grid)
         debug_rank("language embedding groups ready")
 
+        llm_n_inst = getattr(args, "num_distributed_optimizer_instances", 1)
         language_pg = populate_language_embedding_groups(
-            get_pg_collection(llm_grid), language_embedding_groups
+            get_pg_collection(llm_grid, num_dist_opt_instances=llm_n_inst),
+            language_embedding_groups,
         )
         vision_pg = (
             None
@@ -187,25 +189,50 @@ def create_hypercomm_grid(
     return grid
 
 
-def get_pg_collection(grid: HyperCommGrid) -> ProcessGroupCollection:
-    """Build a ProcessGroupCollection from a populated HyperCommGrid."""
+def get_pg_collection(
+    grid: HyperCommGrid, num_dist_opt_instances: int = 1
+) -> ProcessGroupCollection:
+    """Build a ProcessGroupCollection from a populated HyperCommGrid.
+
+    When ``num_dist_opt_instances > 1``, the DP/CP and expt_dp stripes are
+    sub-partitioned into hierarchical intra/inter groups via
+    :func:`megatron.core.models.mimo.optimizer._create_dist_opt_instance_groups`.
+    These groups must be present on the pg_collection BEFORE DDP wrap because
+    ``ProcessGroupCollection.setup_process_groups_for_ddp`` checks for them
+    when the wrapped module's ``ddp_config.num_distributed_optimizer_instances
+    > 1``.
+
+    All world ranks must call this with the same ``num_dist_opt_instances``
+    because the hierarchical build calls ``dist.new_group`` collectively.
+    """
     pg = ProcessGroupCollection()
     pg.tp = grid.get_pg("tp")
     pg.cp = grid.get_pg("cp")
     pg.pp = grid.get_pg("pp")
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
-    pg.intra_dp_cp = pg.dp_cp
     pg.tp_cp = grid.get_pg(["tp", "cp"])
     pg.mp = grid.get_pg(["tp", "pp"])
     pg.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
     pg.ep = grid.get_pg("ep")
     pg.expt_tp = grid.get_pg("expt_tp")
     pg.expt_dp = grid.get_pg("expt_dp")
-    pg.intra_expt_dp = pg.expt_dp
     pg.tp_ep = grid.get_pg(["expt_tp", "ep"])
     pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"])
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+
+    if num_dist_opt_instances > 1:
+        from megatron.core.models.mimo.optimizer import _create_dist_opt_instance_groups
+
+        instance_groups = _create_dist_opt_instance_groups(grid, num_dist_opt_instances)
+        pg.intra_dp_cp = instance_groups["intra_dp_cp"]
+        pg.intra_expt_dp = instance_groups["intra_expt_dp"]
+        pg.inter_dist_opt = instance_groups["inter_dp_cp"]
+        pg.intra_dist_opt = instance_groups["intra_dist_opt"]
+    else:
+        pg.intra_dp_cp = pg.dp_cp
+        pg.intra_expt_dp = pg.expt_dp
+        pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
+
     return pg
 
 
