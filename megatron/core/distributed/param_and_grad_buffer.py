@@ -16,6 +16,7 @@ from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
+from megatron.core.pipeline_parallel.timeline import timeline_event
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
@@ -313,7 +314,8 @@ class _ParamAndGradBucketGroup:
 
         if force_sync:
             if self.param_gather_handle is not None:
-                self.param_gather_handle.wait()
+                with timeline_event("ddp.start_param_sync_force_wait"):
+                    self.param_gather_handle.wait()
                 self.param_gather_handle = None
                 return
         else:
@@ -450,7 +452,8 @@ class _ParamAndGradBucketGroup:
             self.start_param_sync()
 
         if self.param_gather_handle is not None:
-            self.param_gather_handle.wait()
+            with timeline_event("ddp.finish_param_sync"):
+                self.param_gather_handle.wait()
             self.param_gather_handle = None
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
@@ -688,7 +691,8 @@ class _ParamAndGradBucketGroup:
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
-            torch.cuda.current_stream().wait_stream(self.communication_stream)
+            with timeline_event("ddp.finish_grad_sync_stream_wait"):
+                torch.cuda.current_stream().wait_stream(self.communication_stream)
             self._copy_back_extra_main_grads()
             return
         assert self.grad_reduce_handle is not None, (
@@ -696,7 +700,8 @@ class _ParamAndGradBucketGroup:
             f"({len(self.per_param_grad_ready_counts)}/{len(self.params)} "
             "params have grad available)"
         )
-        self.grad_reduce_handle.wait()
+        with timeline_event("ddp.finish_grad_sync"):
+            self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
         self._copy_back_extra_main_grads()
 
@@ -709,7 +714,8 @@ class _ParamAndGradBucketGroup:
         the persistent checkpoint worker process.
         """
         if self.param_gather_handle is not None:
-            self.param_gather_handle.wait()
+            with timeline_event("ddp.free_overlap_buffers_param_wait"):
+                self.param_gather_handle.wait()
             self.param_gather_handle = None
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
