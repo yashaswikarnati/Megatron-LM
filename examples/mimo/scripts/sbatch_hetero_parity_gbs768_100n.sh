@@ -10,7 +10,7 @@
 #SBATCH -N 100
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
-#SBATCH --time=01:00:00
+#SBATCH --time=01:30:00
 #SBATCH -J mimo-scaling-gbs768-100n
 #SBATCH --exclusive
 #SBATCH --output=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.out
@@ -34,7 +34,8 @@ VISION_CKPT="${SCRATCH_ROOT}/encoders/post-c-radio-omni"
 
 NEMOTRON_CKPT="${NEMOTRON_CKPT:-/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/sasatheesh/workspace/output/3b_nano_vlm_sota_mtp2_90t10v_post_c_radio_omni_96n_tp2_ep16_selective_300b_20260511/checkpoints/iter_0001000}"
 
-RUN_NAME="mimo-scaling-gbs768-100n"
+NUM_DIST_OPT_INSTANCES=${NUM_DIST_OPT_INSTANCES:-1}
+RUN_NAME="mimo-scaling-gbs768-100n-n${NUM_DIST_OPT_INSTANCES}"
 RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
 # ---- topology: TP=2 EP=8 LLM (96 nodes, DP=384) + TP=1 DP=32 encoder lane (4 nodes)
@@ -45,7 +46,7 @@ LLM_ONLY=0
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=768
 NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 2
-TRAIN_ITERS=25
+TRAIN_ITERS=50
 LOG_INTERVAL=1
 SAVE_INTERVAL=99999999
 
@@ -130,6 +131,7 @@ TRAIN_LAUNCH_ARGS=(
   --no-load-optim --no-load-rng
   --load-nemotron-checkpoint "${NEMOTRON_CKPT}"
   --dynamic-resolution
+  --num-distributed-optimizer-instances "${NUM_DIST_OPT_INSTANCES}"
   --tensorboard-dir "${RUN_DIR}/tensorboard"
 )
 if [[ "${TIMELINE}" == "1" ]]; then
@@ -146,7 +148,7 @@ fi
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
 
-echo "=== hetero scaling GBS=768 100n (${TRAIN_ITERS} iters, 45 min wall, force-LB=${MOE_ROUTER_FORCE_LOAD_BALANCING}) ==="
+echo "=== hetero scaling GBS=768 100n (${TRAIN_ITERS} iters, NUM_DIST_OPT_INSTANCES=${NUM_DIST_OPT_INSTANCES}, force-LB=${MOE_ROUTER_FORCE_LOAD_BALANCING}) ==="
 echo "repo=${REPO_ROOT} run_dir=${RUN_DIR}"
 echo "world_size=${WORLD_SIZE} gbs=${GLOBAL_BATCH_SIZE} microbatches=${NUM_MICROBATCHES}"
 echo "layout: encoder(dp=${ENCODER_DP}) llm(tp=${LLM_TP},dp=${LLM_DP},ep=${LLM_EP})"
