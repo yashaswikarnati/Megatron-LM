@@ -8,7 +8,7 @@
 #     LR_WSD_DECAY_SAMPLES=18310547, LR_WSD_DECAY_STYLE=minus_sqrt
 #   * PACKING_BUFFER_SIZE=128
 #   * SAVE_INTERVAL=1000 (LOG_INTERVAL=1 for per-iter visibility)
-#   * NUM_WORKERS=1
+#   * NUM_WORKERS=2
 # Deviations from Sanjeev's baseline:
 #   * LLM_EP=8 (vs Sanjeev's EP=16) — kept from our scaling study
 #   * Hetero topology TP=2 (vs Sanjeev's TP=4)
@@ -77,7 +77,7 @@ TRAINING_STAGE=stage2
 MODEL_PROVIDER=nemotron-moe-vlm-54l
 ENABLE_EXPERIMENTAL=1
 MOE_ROUTER_FORCE_LOAD_BALANCING=0
-NUM_WORKERS=1
+NUM_WORKERS=2
 PACKING_BUFFER_SIZE=128
 SHUFFLE_BUFFER_SIZE=100
 MAX_SAMPLES_PER_SEQUENCE=100
