@@ -51,6 +51,14 @@ def _tracker_path(root: str) -> str:
     return os.path.join(root, _TRACKER_FILE)
 
 
+def _dataloader_state_path(root: str, iteration: int, basename: str) -> str:
+    return os.path.join(_iter_directory(root, iteration), basename)
+
+
+def _dataloader_load_root(args: argparse.Namespace) -> Optional[str]:
+    return getattr(args, "dataloader_load", None) or getattr(args, "dataloader_save", None)
+
+
 def _build_optim_metadata(args: argparse.Namespace) -> Dict[str, Any]:
     """Optimizer-side metadata controlling DistributedOptimizer sharding format."""
     metadata: Dict[str, Any] = {"chained_optim_avoid_prefix": True, "singleton_local_shards": False}
@@ -179,6 +187,62 @@ def _assemble_state_dict(
     return state_dict
 
 
+def maybe_save_dataloader_state(
+    data_iterator,
+    iteration: int,
+    args: argparse.Namespace,
+) -> None:
+    """Save Energon dataloader state for source ranks that own data."""
+    dataloader_save_path = getattr(args, "dataloader_save", None)
+    if not dataloader_save_path or data_iterator is None:
+        return
+    if not hasattr(data_iterator, "save_state") or not hasattr(
+        data_iterator, "dataloader_state_name"
+    ):
+        raise RuntimeError(
+            f"data iterator {type(data_iterator).__name__} does not support dataloader state save"
+        )
+
+    state_name = data_iterator.dataloader_state_name()
+    state = data_iterator.save_state()
+    if state_name is None or state is None:
+        return
+
+    data_state_save_path = _dataloader_state_path(dataloader_save_path, iteration, state_name)
+    Path(data_state_save_path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"dataloader_state_dict": state}, data_state_save_path)
+
+
+def maybe_restore_dataloader_state(
+    data_iterator,
+    iteration: int,
+    args: argparse.Namespace,
+) -> None:
+    """Restore Energon dataloader state for the checkpoint iteration being resumed."""
+    dataloader_load_path = _dataloader_load_root(args)
+    if iteration <= 0 or not dataloader_load_path or data_iterator is None:
+        return
+    if not hasattr(data_iterator, "restore_state") or not hasattr(
+        data_iterator, "dataloader_state_name"
+    ):
+        raise RuntimeError(
+            f"data iterator {type(data_iterator).__name__} does not support dataloader state restore"
+        )
+
+    state_name = data_iterator.dataloader_state_name()
+    if state_name is None:
+        return
+
+    data_state_load_path = _dataloader_state_path(dataloader_load_path, iteration, state_name)
+    if not os.path.exists(data_state_load_path):
+        raise RuntimeError(
+            f"missing hetero dataloader state for iteration {iteration}: {data_state_load_path}"
+        )
+
+    dataset_state_dict = torch.load(data_state_load_path, map_location="cpu", weights_only=False)
+    data_iterator.restore_state(dataset_state_dict["dataloader_state_dict"])
+
+
 def save_checkpoint(
     iteration: int,
     model: MimoModel,
@@ -186,6 +250,7 @@ def save_checkpoint(
     opt_param_scheduler: Optional[OptimizerParamScheduler],
     args: argparse.Namespace,
     topology: HeteroTopology,
+    data_iterator=None,
 ) -> None:
     """Save a hetero MIMO checkpoint at iteration `iteration` under `args.save`."""
     if not args.save:
@@ -216,6 +281,8 @@ def save_checkpoint(
     )
 
     content_metadata = _clean_metadata_for_serialization(_build_optim_metadata(args))
+
+    maybe_save_dataloader_state(data_iterator, iteration, args)
 
     dist_checkpointing.save(state_dict, target_dir, content_metadata=content_metadata)
 

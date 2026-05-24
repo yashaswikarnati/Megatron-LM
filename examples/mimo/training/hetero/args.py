@@ -101,12 +101,36 @@ def parse_args() -> argparse.Namespace:
     data.add_argument("--shuffle-buffer-size", type=int, default=100)
     data.add_argument("--max-samples-per-sequence", type=int, default=100)
     data.add_argument(
+        "--dataloader-save",
+        type=str,
+        default=None,
+        help="Directory where hetero Energon dataloader state is saved with checkpoints.",
+    )
+    data.add_argument(
+        "--dataloader-load",
+        type=str,
+        default=None,
+        help=(
+            "Directory to load hetero Energon dataloader state from on resume. "
+            "Defaults to --dataloader-save when omitted."
+        ),
+    )
+    data.add_argument(
         "--validate-energon-data-alignment",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
             "Check that encoder and LLM Energon readers start from matching samples. "
             "This is disabled by default because the validation all-gather is expensive at scale."
+        ),
+    )
+    data.add_argument(
+        "--energon-sample-trace-dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional directory for per-source-rank JSONL sample signatures used to validate "
+            "checkpoint replay. Disabled when unset."
         ),
     )
 

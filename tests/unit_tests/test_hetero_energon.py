@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import random
+from argparse import Namespace
 from collections import deque
 
 import pytest
@@ -9,6 +10,10 @@ import torch
 from examples.mimo.data import hetero_energon
 from examples.mimo.data.energon_multimodal_provider import MimoMultiModalPackingEncoder
 from examples.mimo.data.hetero_energon import EnergonIterator, _route_samples_to_lanes
+from examples.mimo.training.hetero.checkpointing import (
+    maybe_restore_dataloader_state,
+    maybe_save_dataloader_state,
+)
 
 _PROVENANCE_KEY = MimoMultiModalPackingEncoder.PROVENANCE_KEY
 
@@ -21,6 +26,30 @@ class RandomLoader:
 
     def __next__(self):
         return {"value": random.randrange(1_000_000)}
+
+
+class SavableListLoader:
+    """Small savable-loader stub with Energon's save/restore method names."""
+
+    def __init__(self, samples):
+        self.samples = list(samples)
+        self.index = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.index >= len(self.samples):
+            raise StopIteration
+        sample = dict(self.samples[self.index])
+        self.index += 1
+        return sample
+
+    def save_state_rank(self):
+        return {"index": self.index}
+
+    def restore_state_rank(self, state):
+        self.index = state["index"]
 
 
 def test_energon_iterator_uses_isolated_python_random_state():
@@ -43,6 +72,33 @@ def test_energon_iterator_uses_isolated_python_random_state():
 
     assert first_values == second_values
     assert len(set(first_values)) > 1
+
+
+def test_energon_iterator_restores_single_lane_loader_state():
+    """Restored single-lane iterators continue from the saved loader offset."""
+    loader = SavableListLoader([{"value": 10}, {"value": 11}, {"value": 12}])
+    iterator = EnergonIterator(
+        loader,
+        random_seed=123,
+        alignment_role="llm",
+        llm_lanes=[0],
+        state_name="train_dataloader_llm_lane000.pt",
+    )
+
+    assert next(iterator)["value"] == 10
+    state = iterator.save_state()
+    assert next(iterator)["value"] == 11
+
+    restored = EnergonIterator(
+        SavableListLoader([{"value": 10}, {"value": 11}, {"value": 12}]),
+        random_seed=123,
+        alignment_role="llm",
+        llm_lanes=[0],
+        state_name="train_dataloader_llm_lane000.pt",
+    )
+    restored.restore_state(state)
+
+    assert next(restored)["value"] == 11
 
 
 def test_combine_encoder_batches_drops_packing_and_concatenates_modalities():
@@ -107,7 +163,7 @@ def test_route_samples_to_lanes_round_robin_assigns_workers_to_lanes():
     )
     assert pulls == 4
     assert [b["payload"] for b in lane_batches] == ["w0", "w2", "w4", "w6"]
-    assert all(len(q) == 0 for q in pending.values())
+    assert all(len(q) == 0 for q in pending)
 
 
 def test_route_samples_to_lanes_surplus_lands_in_pending_fifo():
@@ -151,6 +207,89 @@ def test_route_samples_to_lanes_drains_pending_before_pulling():
     assert pulls == 1
     assert [b["payload"] for b in lane_batches] == ["stashed", "fresh"]
     assert len(pending[0]) == 0
+
+
+def test_routed_iterator_restores_pending_samples_before_pulling():
+    """Routed resume must keep samples already pulled ahead of the loader state."""
+
+    def make_iterator():
+        loader = SavableListLoader(
+            [_stamped(0, "a"), _stamped(1, "b"), _stamped(2, "c"), _stamped(3, "d")]
+        )
+        loader_iter_holder = [iter(loader)]
+        pending = [deque() for _ in range(2)]
+
+        def next_batch():
+            lane_batches, _ = _route_samples_to_lanes(
+                loader_iter_holder[0],
+                lanes_per_encoder=2,
+                lane_offset=0,
+                num_workers_per_lane=2,
+                encoder_dp_rank=0,
+                pending_by_lane=pending,
+                max_pulls_per_step=8,
+                provenance_key=_PROVENANCE_KEY,
+            )
+            return {"payload": [batch["payload"] for batch in lane_batches]}
+
+        def save_extra_state():
+            return {"pending_by_lane": [list(queue) for queue in pending]}
+
+        def restore_extra_state(state):
+            for queue, values in zip(pending, state["pending_by_lane"]):
+                queue.clear()
+                queue.extend(values)
+            loader_iter_holder[0] = iter(loader)
+
+        iterator = EnergonIterator(
+            loader,
+            source_rank=True,
+            local_batch_fn=next_batch,
+            alignment_role="encoder",
+            llm_lanes=[0, 1],
+            state_name="train_dataloader_encoder_dprank000_lanes000-001.pt",
+            extra_state_fn=save_extra_state,
+            restore_extra_state_fn=restore_extra_state,
+        )
+        return iterator
+
+    iterator = make_iterator()
+    assert next(iterator)["payload"] == ["a", "c"]
+    state = iterator.save_state()
+    assert next(iterator)["payload"] == ["b", "d"]
+
+    restored = make_iterator()
+    restored.restore_state(state)
+
+    assert next(restored)["payload"] == ["b", "d"]
+
+
+def test_checkpoint_helpers_roundtrip_iterator_state(tmp_path):
+    """Checkpoint helpers save under iter_NNNNNNN and restore the iterator state."""
+    samples = [{"value": 10}, {"value": 11}, {"value": 12}]
+    iterator = EnergonIterator(
+        SavableListLoader(samples),
+        alignment_role="llm",
+        llm_lanes=[0],
+        state_name="train_dataloader_llm_lane000.pt",
+    )
+    assert next(iterator)["value"] == 10
+
+    args = Namespace(dataloader_save=str(tmp_path), dataloader_load=None)
+    maybe_save_dataloader_state(iterator, 15, args)
+
+    state_path = tmp_path / "iter_0000015" / "train_dataloader_llm_lane000.pt"
+    assert state_path.exists()
+
+    restored = EnergonIterator(
+        SavableListLoader(samples),
+        alignment_role="llm",
+        llm_lanes=[0],
+        state_name="train_dataloader_llm_lane000.pt",
+    )
+    maybe_restore_dataloader_state(restored, 15, args)
+
+    assert next(restored)["value"] == 11
 
 
 def test_route_samples_to_lanes_lane_offset_shifts_global_lane():
