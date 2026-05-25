@@ -9,6 +9,7 @@ import torch
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..optimizer.param_layout import FullParamLayout
+from ..pipeline_parallel.timeline import timeline_event
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
@@ -491,7 +492,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
-            bucket_group.start_param_sync(force_sync=force_sync)
+            with timeline_event("ddp.start_param_sync", force_sync=force_sync):
+                bucket_group.start_param_sync(force_sync=force_sync)
 
             if not self.ddp_config.overlap_param_gather:
                 # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
@@ -539,7 +541,8 @@ class DistributedDataParallel(_BaseDataParallel):
         communication ops.
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
-            bucket_group.start_grad_sync()
+            with timeline_event("ddp.start_grad_sync"):
+                bucket_group.start_grad_sync()
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """

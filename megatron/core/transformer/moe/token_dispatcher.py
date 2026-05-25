@@ -11,6 +11,7 @@ from megatron.core.config import is_experimental_enabled
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.pipeline_parallel.timeline import timeline_event
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -674,26 +675,28 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_ep_alltoall", self.tokens_per_expert
         )
-        global_input_tokens = all_to_all(
-            self.ep_group,
-            permutated_local_input_tokens,
-            self.output_splits,
-            self.input_splits,
-            use_nccl_stream=self.use_nccl_stream,
-        )
+        with timeline_event("moe.a2a_dispatch_tokens"):
+            global_input_tokens = all_to_all(
+                self.ep_group,
+                permutated_local_input_tokens,
+                self.output_splits,
+                self.input_splits,
+                use_nccl_stream=self.use_nccl_stream,
+            )
         # Move the shared experts fc1 right after the tokens A2A, to prevent the probs A2A
         # block the launch of fc1 GEMM when CUDA_DEVICE_MAX_CONNECTIONS=1.
         # Forward launch order: tokens A2A -> shared experts fc1 -> probs A2A
         # Backward launch order: probs A2A -> tokens A2A -> shared experts fc1
         if self.shared_experts is not None:
             self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
-        global_probs = all_to_all(
-            self.ep_group,
-            permuted_probs,
-            self.output_splits,
-            self.input_splits,
-            use_nccl_stream=self.use_nccl_stream,
-        )
+        with timeline_event("moe.a2a_dispatch_probs"):
+            global_probs = all_to_all(
+                self.ep_group,
+                permuted_probs,
+                self.output_splits,
+                self.input_splits,
+                use_nccl_stream=self.use_nccl_stream,
+            )
 
         return global_input_tokens, global_probs
 
@@ -833,13 +836,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.wait_current_stream()
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
-        permutated_local_input_tokens = all_to_all(
-            self.ep_group,
-            hidden_states,
-            self.input_splits,
-            self.output_splits,
-            use_nccl_stream=self.use_nccl_stream,
-        )
+        with timeline_event("moe.a2a_combine"):
+            permutated_local_input_tokens = all_to_all(
+                self.ep_group,
+                hidden_states,
+                self.input_splits,
+                self.output_splits,
+                use_nccl_stream=self.use_nccl_stream,
+            )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
             self.shared_experts.post_forward_comm()
@@ -895,40 +899,42 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
         """
-        if not self.drop_and_pad:
-            if point == self.cuda_dtoh_point:
-                # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
-                on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
-                if on_side_stream:
-                    self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.cuda_dtoh_stream):
-                    # TODO: use MemcpyBatchAsync instead.
-                    tokens_per_expert = maybe_move_tensor_to_cpu(
-                        tokens_per_expert, record_stream=on_side_stream
-                    )
-                    self.input_splits = maybe_move_tensor_to_cpu(
-                        self.input_splits, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.output_splits = maybe_move_tensor_to_cpu(
-                        self.output_splits, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.output_splits_tp = maybe_move_tensor_to_cpu(
-                        self.output_splits_tp, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.num_out_tokens = maybe_move_tensor_to_cpu(
-                        self.num_out_tokens, record_stream=on_side_stream
-                    )
-                    if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
-                        self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
-                            self.num_global_tokens_per_local_expert, record_stream=on_side_stream
+        with timeline_event("moe.dtoh_sync", point=point):
+            if not self.drop_and_pad:
+                if point == self.cuda_dtoh_point:
+                    # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
+                    on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
+                    if on_side_stream:
+                        self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.cuda_dtoh_stream):
+                        # TODO: use MemcpyBatchAsync instead.
+                        tokens_per_expert = maybe_move_tensor_to_cpu(
+                            tokens_per_expert, record_stream=on_side_stream
                         )
-                self.d2h_event = self.cuda_dtoh_stream.record_event()
+                        self.input_splits = maybe_move_tensor_to_cpu(
+                            self.input_splits, as_numpy=True, record_stream=on_side_stream
+                        )
+                        self.output_splits = maybe_move_tensor_to_cpu(
+                            self.output_splits, as_numpy=True, record_stream=on_side_stream
+                        )
+                        self.output_splits_tp = maybe_move_tensor_to_cpu(
+                            self.output_splits_tp, as_numpy=True, record_stream=on_side_stream
+                        )
+                        self.num_out_tokens = maybe_move_tensor_to_cpu(
+                            self.num_out_tokens, record_stream=on_side_stream
+                        )
+                        if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
+                            self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
+                                self.num_global_tokens_per_local_expert,
+                                record_stream=on_side_stream,
+                            )
+                    self.d2h_event = self.cuda_dtoh_stream.record_event()
 
-            if point == self.cuda_sync_point:
-                # Synchronize with the DtoH stream at self.cuda_sync_point.
-                self.d2h_event.synchronize()
+                if point == self.cuda_sync_point:
+                    # Synchronize with the DtoH stream at self.cuda_sync_point.
+                    self.d2h_event.synchronize()
 
-        return tokens_per_expert
+            return tokens_per_expert
 
 
 class _DispatchManager(ABC):
