@@ -10,7 +10,7 @@
 #SBATCH -N 100
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
-#SBATCH --time=01:30:00
+#SBATCH --time=01:10:00
 #SBATCH -J mimo-scaling-gbs768-100n
 #SBATCH --exclusive
 #SBATCH --output=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.out
@@ -46,7 +46,7 @@ LLM_ONLY=0
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=768
 NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 2
-TRAIN_ITERS=50
+TRAIN_ITERS=100
 LOG_INTERVAL=1
 SAVE_INTERVAL=99999999
 
