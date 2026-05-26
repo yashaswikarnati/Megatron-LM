@@ -46,7 +46,8 @@ NEMOTRON_CKPT="${NEMOTRON_CKPT:-/scratch/fsw/portfolios/llmservice/projects/llms
 
 NUM_DIST_OPT_INSTANCES=${NUM_DIST_OPT_INSTANCES:-1}
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
-RUN_NAME="mimo-jitter-gbs768-34n-overlapPG${OVERLAP_PARAM_GATHER}"
+OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}
+RUN_NAME="mimo-jitter-gbs768-34n-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}"
 RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
 # ---- topology: TP=2 EP=8 LLM (32 nodes, DP=128) + TP=1 DP=16 encoder lane (2 nodes)
@@ -133,7 +134,6 @@ TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
   --max-num-tiles 1
-  --overlap-grad-reduce
   --ddp-num-buckets 8 --ddp-pad-buckets-for-high-nccl-busbw
   --correct-encoder-grad-for-partial-participation
   --seed 1234
@@ -145,9 +145,12 @@ TRAIN_LAUNCH_ARGS=(
   --num-distributed-optimizer-instances "${NUM_DIST_OPT_INSTANCES}"
   --tensorboard-dir "${RUN_DIR}/tensorboard"
 )
-# --overlap-param-gather is a store_true flag; including it = ON, omitting = OFF.
+# Both --overlap-param-gather and --overlap-grad-reduce are store_true; include = ON.
 if [[ "${OVERLAP_PARAM_GATHER}" == "1" ]]; then
   TRAIN_LAUNCH_ARGS+=( --overlap-param-gather )
+fi
+if [[ "${OVERLAP_GRAD_REDUCE}" == "1" ]]; then
+  TRAIN_LAUNCH_ARGS+=( --overlap-grad-reduce )
 fi
 if [[ "${TIMELINE}" == "1" ]]; then
   TRAIN_LAUNCH_ARGS+=(
@@ -162,12 +165,12 @@ fi
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
 
-echo "=== hetero JITTER GBS=768 34n (${TRAIN_ITERS} iters, OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}, force-LB=${MOE_ROUTER_FORCE_LOAD_BALANCING}) ==="
+echo "=== hetero JITTER GBS=768 34n (${TRAIN_ITERS} iters, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE}, force-LB=${MOE_ROUTER_FORCE_LOAD_BALANCING}) ==="
 echo "repo=${REPO_ROOT} run_dir=${RUN_DIR}"
 echo "world_size=${WORLD_SIZE} gbs=${GLOBAL_BATCH_SIZE} microbatches=${NUM_MICROBATCHES}"
 echo "layout: encoder(dp=${ENCODER_DP}) llm(tp=${LLM_TP},dp=${LLM_DP},ep=${LLM_EP})"
 echo "ckpt=${NEMOTRON_CKPT}"
-echo "overlap_param_gather: ${OVERLAP_PARAM_GATHER}"
+echo "overlap_param_gather: ${OVERLAP_PARAM_GATHER}  overlap_grad_reduce: ${OVERLAP_GRAD_REDUCE}"
 echo "========================================================"
 
 srun --kill-on-bad-exit=1 \
