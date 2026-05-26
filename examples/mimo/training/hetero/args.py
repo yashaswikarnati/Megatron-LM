@@ -93,6 +93,35 @@ def parse_args() -> argparse.Namespace:
         help="Push NVTX ranges with timeline event names for Nsight Systems.",
     )
 
+    # Nsys profiling (mirrors megatron/training/training.py's --profile* flags).
+    nsys = parser.add_argument_group("nsys profile")
+    nsys.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable nsys profile start/stop in the training loop "
+             "(matches Megatron's --profile flag).",
+    )
+    nsys.add_argument("--profile-step-start", type=int, default=10,
+                      help="Iter at which cudaProfilerStart fires.")
+    nsys.add_argument("--profile-step-end", type=int, default=12,
+                      help="Iter at which cudaProfilerStop fires.")
+    nsys.add_argument(
+        "--profile-ranks", type=int, nargs="+", default=[],
+        help="Global ranks to profile. Empty list means all ranks.",
+    )
+    nsys.add_argument(
+        "--use-pytorch-profiler", action="store_true",
+        help="Use torch.profiler instead of nsys (kept for parity with Megatron's flag).",
+    )
+    nsys.add_argument(
+        "--nvtx-ranges", action="store_true",
+        help="Enable NVTX layer-name ranges around model ops during profiling.",
+    )
+    nsys.add_argument(
+        "--record-shapes", action="store_true",
+        help="Pass record_shapes=True to torch.autograd.profiler.emit_nvtx.",
+    )
+
     data = parser.add_argument_group("data")
     data.add_argument("--dataset-provider", choices=["mock", "energon_multimodal"], default="mock")
     data.add_argument("--data-path", type=str, default=None)
