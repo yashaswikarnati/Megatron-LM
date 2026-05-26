@@ -32,6 +32,20 @@ from megatron.core.pipeline_parallel.timeline import (
     set_pipeline_timeline_iteration,
     timeline_event,
 )
+from megatron.core.utils import configure_nvtx_profiling
+
+
+def _rank_should_profile(args: argparse.Namespace) -> bool:
+    """Return True if this rank should activate nsys profiling.
+
+    Mirrors megatron/training/training.py: empty list means "all ranks".
+    """
+    if not getattr(args, "profile", False):
+        return False
+    profile_ranks = getattr(args, "profile_ranks", None) or []
+    if not profile_ranks:
+        return True
+    return torch.distributed.get_rank() in profile_ranks
 
 
 def run_train_loop(args: argparse.Namespace) -> None:
@@ -94,9 +108,23 @@ def run_train_loop(args: argparse.Namespace) -> None:
         )
 
         last_saved = start_iteration
+        nsys_nvtx_context = None  # holds emit_nvtx context for nsys profiling
+        profile_active_rank = _rank_should_profile(args)
         for iteration in range(start_iteration + 1, args.train_iters + 1):
             debug_rank(f"iteration {iteration}: train step start")
             set_pipeline_timeline_iteration(iteration)
+
+            # nsys profiling: start at profile_step_start (per Megatron's pattern).
+            if profile_active_rank and iteration == getattr(args, "profile_step_start", -1):
+                if getattr(args, "nvtx_ranges", False):
+                    configure_nvtx_profiling(True)
+                if not getattr(args, "use_pytorch_profiler", False):
+                    torch.cuda.cudart().cudaProfilerStart()
+                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(
+                        record_shapes=getattr(args, "record_shapes", False)
+                    )
+                    nsys_nvtx_context.__enter__()
+
             with timeline_event("iter.total"):
                 result = train_step(
                     args, model, topology, optimizer, opt_param_scheduler, communicator,
@@ -106,6 +134,16 @@ def run_train_loop(args: argparse.Namespace) -> None:
             logger.record_step(result)
             logger.maybe_log(iteration, optimizer, result)
             debug_rank(f"iteration {iteration}: train step complete")
+
+            # nsys profiling: stop at profile_step_end.
+            if profile_active_rank and iteration == getattr(args, "profile_step_end", -1):
+                if getattr(args, "nvtx_ranges", False):
+                    configure_nvtx_profiling(False)
+                if not getattr(args, "use_pytorch_profiler", False):
+                    torch.cuda.cudart().cudaProfilerStop()
+                    if nsys_nvtx_context is not None:
+                        nsys_nvtx_context.__exit__(None, None, None)
+                        nsys_nvtx_context = None
 
             if (
                 args.save

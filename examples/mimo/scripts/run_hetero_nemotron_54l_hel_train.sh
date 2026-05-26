@@ -305,4 +305,25 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+# nsys profile wrapper for selected ranks.
+# Set NSYS_RANKS to a comma-separated list of global ranks (e.g. "16,17,18,19,20,21,22,23")
+# and NSYS_OUT_DIR to the per-job output dir.  Only those ranks invoke nsys profile.
+# The in-code cudaProfilerStart/Stop (in loop.py, gated by --profile-step-start/end)
+# bounds the actual capture window.
+if [[ -n "${NSYS_RANKS:-}" && -n "${NSYS_OUT_DIR:-}" ]]; then
+  if [[ ",${NSYS_RANKS}," == *",${RANK_ID},"* ]]; then
+    mkdir -p "${NSYS_OUT_DIR}"
+    NSYS_OUT_FILE="${NSYS_OUT_DIR}/rank$(printf '%05d' "${RANK_ID}")"
+    echo "[nsys] rank ${RANK_ID}: wrapping with nsys profile -> ${NSYS_OUT_FILE}.nsys-rep"
+    exec nsys profile \
+      -s cpu \
+      -t nvtx,cuda,nccl \
+      --capture-range=cudaProfilerApi \
+      --capture-range-end=stop \
+      --force-overwrite=true \
+      -o "${NSYS_OUT_FILE}" \
+      "${CMD[@]}"
+  fi
+fi
+
 exec "${CMD[@]}"
