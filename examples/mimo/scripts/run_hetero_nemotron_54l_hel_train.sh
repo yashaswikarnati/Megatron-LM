@@ -318,9 +318,12 @@ if [[ -n "${NSYS_RANKS:-}" && -n "${NSYS_OUT_DIR:-}" ]]; then
     # Disable torch inductor background compile workers — nsys's process
     # instrumentation breaks subprocess Python init (sysconfig ImportError).
     export TORCHINDUCTOR_COMPILE_THREADS=1
+    # Note: nsys in this container doesn't accept '--trace=nccl'.  NCCL kernels
+    # still show up under 'cuda' tracing (they're CUDA kernels on the comm
+    # stream).  cudnn covers cuBLAS/cuDNN ops.
     exec nsys profile \
       -s none \
-      -t nvtx,cuda,nccl \
+      -t nvtx,cuda,cudnn \
       --capture-range=cudaProfilerApi \
       --capture-range-end=stop \
       --force-overwrite=true \
