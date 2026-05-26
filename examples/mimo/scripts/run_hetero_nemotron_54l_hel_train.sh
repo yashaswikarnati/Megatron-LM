@@ -315,8 +315,11 @@ if [[ -n "${NSYS_RANKS:-}" && -n "${NSYS_OUT_DIR:-}" ]]; then
     mkdir -p "${NSYS_OUT_DIR}"
     NSYS_OUT_FILE="${NSYS_OUT_DIR}/rank$(printf '%05d' "${RANK_ID}")"
     echo "[nsys] rank ${RANK_ID}: wrapping with nsys profile -> ${NSYS_OUT_FILE}.nsys-rep"
+    # Disable torch inductor background compile workers — nsys's process
+    # instrumentation breaks subprocess Python init (sysconfig ImportError).
+    export TORCHINDUCTOR_COMPILE_THREADS=1
     exec nsys profile \
-      -s cpu \
+      -s none \
       -t nvtx,cuda,nccl \
       --capture-range=cudaProfilerApi \
       --capture-range-end=stop \
