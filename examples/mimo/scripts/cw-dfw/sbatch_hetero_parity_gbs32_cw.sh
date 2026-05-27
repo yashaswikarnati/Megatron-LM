@@ -16,7 +16,7 @@
 # Same topology as the original: 3 nodes (1n encoder DP=8 + 2n LLM TP=2 DP=8 EP=16),
 # GBS=32, 100 iters.
 
-#SBATCH -A nemotron_n4_pre
+#SBATCH -A coreai_dlalgo_genai
 #SBATCH -p batch
 #SBATCH -N 3
 #SBATCH --ntasks-per-node=8
