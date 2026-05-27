@@ -8,7 +8,7 @@
 #SBATCH -N 3
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
-#SBATCH --time=00:30:00
+#SBATCH --time=00:50:00
 #SBATCH -J mimo-parity-gbs32
 #SBATCH --exclusive
 #SBATCH --output=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.out
@@ -32,7 +32,9 @@ VISION_CKPT="${SCRATCH_ROOT}/encoders/post-c-radio-omni"
 
 NEMOTRON_CKPT="${NEMOTRON_CKPT:-/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/sasatheesh/workspace/output/3b_nano_vlm_sota_mtp2_90t10v_post_c_radio_omni_96n_tp2_ep16_selective_300b_20260511/checkpoints/iter_0001000}"
 
-RUN_NAME="mimo-parity-gbs32"
+OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
+OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}
+RUN_NAME="mimo-parity-gbs32-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}"
 RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
 # ---- topology: TP=2 EP=16 LLM + TP=1 DP=8 encoder lane ----------------------
@@ -43,7 +45,7 @@ LLM_ONLY=0
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=32
 NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 4
-TRAIN_ITERS=20
+TRAIN_ITERS=100
 LOG_INTERVAL=1
 SAVE_INTERVAL=99999999
 
@@ -115,7 +117,6 @@ TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
   --max-num-tiles 1
-  --overlap-grad-reduce --overlap-param-gather
   --ddp-num-buckets 8 --ddp-pad-buckets-for-high-nccl-busbw
   --correct-encoder-grad-for-partial-participation
   --seed 1234
@@ -126,11 +127,29 @@ TRAIN_LAUNCH_ARGS=(
   --dynamic-resolution
   --tensorboard-dir "${RUN_DIR}/tensorboard"
 )
+if [[ "${OVERLAP_PARAM_GATHER}" == "1" ]]; then
+  TRAIN_LAUNCH_ARGS+=( --overlap-param-gather )
+fi
+if [[ "${OVERLAP_GRAD_REDUCE}" == "1" ]]; then
+  TRAIN_LAUNCH_ARGS+=( --overlap-grad-reduce )
+fi
+
+# Timeline tracing — all-rank by default for small-scale 3-node debug runs.
+TIMELINE=${TIMELINE:-1}
+TIMELINE_DIR="${RUN_DIR}/timeline"
+mkdir -p "${TIMELINE_DIR}"
+if [[ "${TIMELINE}" == "1" ]]; then
+  TRAIN_LAUNCH_ARGS+=(
+    --timeline-profile
+    --timeline-dir "${TIMELINE_DIR}"
+    --timeline-ranks all
+  )
+fi
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
 
-echo "=== hetero parity GBS=32 (${TRAIN_ITERS} iters) ==="
+echo "=== hetero parity GBS=32 (${TRAIN_ITERS} iters, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE}) ==="
 echo "repo=${REPO_ROOT} run_dir=${RUN_DIR}"
 echo "world_size=${WORLD_SIZE} gbs=${GLOBAL_BATCH_SIZE} microbatches=${NUM_MICROBATCHES}"
 echo "layout: encoder(dp=${ENCODER_DP}) llm(tp=${LLM_TP},dp=${LLM_DP},ep=${LLM_EP})"
