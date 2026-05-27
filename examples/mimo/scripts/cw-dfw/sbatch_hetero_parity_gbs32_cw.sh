@@ -10,9 +10,10 @@
 #   * /scratch/fsw/portfolios/llmservice does not exist on cw-dfw host; bind-mounted
 #     from /lustre/fsw/portfolios/llmservice so the blend's /scratch/... paths
 #     resolve inside the container.
-#   * /scratch/fsw/portfolios/llmservice_fm_text does not exist either; bind-mounted
-#     from ${BLEND_SHIM_DIR} which holds the unmodified McoreBlend JSON at the
-#     expected sub-path users/rkarimimahab/workspace/blends/1T-phase1var-moresft.json.
+#   * /scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/...
+#     /1T-phase1var-moresft.json is overlaid via a nested bind-mount of
+#     ${BLEND_SHIM_DIR} at /scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text
+#     (more-specific mount overrides the broader llmservice mount).
 # Same topology as the original: 3 nodes (1n encoder DP=8 + 2n LLM TP=2 DP=8 EP=16),
 # GBS=32, 100 iters.
 
@@ -170,7 +171,7 @@ fi
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT}"
 CONTAINER_MOUNTS+=",/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice"
 CONTAINER_MOUNTS+=",/lustre/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
-CONTAINER_MOUNTS+=",${BLEND_SHIM_DIR}:/scratch/fsw/portfolios/llmservice_fm_text"
+CONTAINER_MOUNTS+=",${BLEND_SHIM_DIR}:/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
 
 echo "=== hetero parity GBS=32 cw-dfw (${TRAIN_ITERS} iters, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE} FLB=${MOE_ROUTER_FORCE_LOAD_BALANCING}) ==="
