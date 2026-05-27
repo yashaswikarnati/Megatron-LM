@@ -51,6 +51,11 @@ BLEND_SHIM_DIR="${BLEND_SHIM_DIR:-${SCRATCH_ROOT}/blend-shim}"
 # Empty by default on cw-dfw (no resume checkpoint available).
 NEMOTRON_CKPT="${NEMOTRON_CKPT:-}"
 
+# OmniCorpus tars on cw-dfw are symlinks into /lustre/.../portfolios/nvr/ which
+# our user account can't read. Use the text-only blend (100% 1T wrapper, no
+# OmniCorpus) for cw-dfw runs.
+export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/examples/mimo/blend_files/text_only_1t_hel.yaml}"
+
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}
 MOE_ROUTER_FORCE_LOAD_BALANCING=${MOE_ROUTER_FORCE_LOAD_BALANCING:-1}
