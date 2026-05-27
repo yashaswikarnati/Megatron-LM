@@ -8,7 +8,7 @@
 #     LR_WSD_DECAY_SAMPLES=18310547, LR_WSD_DECAY_STYLE=minus_sqrt
 #   * PACKING_BUFFER_SIZE=128
 #   * SAVE_INTERVAL=1000 (LOG_INTERVAL=1 for per-iter visibility)
-#   * NUM_WORKERS=1
+#   * NUM_WORKERS=2
 # Deviations: LLM_EP=8 (vs 16), hetero TP=2 (vs 4), force-LB=0, no MTP.
 
 #SBATCH -A nemotron_n4_pre
@@ -72,7 +72,7 @@ TRAINING_STAGE=stage2
 MODEL_PROVIDER=nemotron-moe-vlm-54l
 ENABLE_EXPERIMENTAL=1
 MOE_ROUTER_FORCE_LOAD_BALANCING=0
-NUM_WORKERS=1
+NUM_WORKERS=2
 PACKING_BUFFER_SIZE=128
 SHUFFLE_BUFFER_SIZE=100
 MAX_SAMPLES_PER_SEQUENCE=100
@@ -138,7 +138,7 @@ TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
   --max-num-tiles 1
-  --overlap-grad-reduce --overlap-param-gather
+  --overlap-grad-reduce
   --ddp-num-buckets 8 --ddp-pad-buckets-for-high-nccl-busbw
   --correct-encoder-grad-for-partial-participation
   --seed 1234

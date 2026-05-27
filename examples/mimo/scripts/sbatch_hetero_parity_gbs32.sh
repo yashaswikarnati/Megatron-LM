@@ -128,7 +128,7 @@ TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
   --max-num-tiles 1
-  --overlap-grad-reduce --overlap-param-gather
+  --overlap-grad-reduce
   --ddp-num-buckets 8 --ddp-pad-buckets-for-high-nccl-busbw
   --correct-encoder-grad-for-partial-participation
   --seed 1234
