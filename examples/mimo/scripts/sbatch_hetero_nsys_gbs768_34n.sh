@@ -165,6 +165,7 @@ if [[ "${TIMELINE}" == "1" ]]; then
     --timeline-profile
     --timeline-dir "${TIMELINE_DIR}"
     --timeline-ranks all
+    --timeline-nvtx
   )
 fi
 

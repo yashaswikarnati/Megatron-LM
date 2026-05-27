@@ -1,7 +1,13 @@
 #!/bin/bash
-# Short hetero-MIMO parity run vs Sanjeev pre-vlm-05.
-# 3 nodes (1n encoder DP=8 + 2n LLM TP=2 DP=8 EP=16), GBS=32, 20 iters.
-# Paired with sbatch_sanjeev_parity_gbs32.sh.
+# Nsys profile run at 3 nodes / GBS=32.
+# Matches the 3n PG=1 GR=1 FLB=1 jitter repro so nsys data is comparable to the
+# JSONL timeline we just analyzed (median iter 2672 ms, stdev 537 ms).
+#
+# Profile window: iters 30-40 (11 iters). Captures both fast and slow iters
+# (max 4417 ms, p90 3711 ms).
+# Profiled ranks: all 16 LLM ranks (8..23).
+# Total run iters: 50 (warmup + profile window + small buffer).
+# NVTX ranges enabled (--timeline-nvtx) so iter and mb are visible in nsys-ui.
 
 #SBATCH -A nemotron_n4_pre
 #SBATCH -p batch
@@ -9,7 +15,7 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
 #SBATCH --time=00:50:00
-#SBATCH -J mimo-parity-gbs32
+#SBATCH -J mimo-nsys-gbs32
 #SBATCH --exclusive
 #SBATCH --output=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.out
 #SBATCH --error=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.err
@@ -34,11 +40,11 @@ NEMOTRON_CKPT="${NEMOTRON_CKPT:-/scratch/fsw/portfolios/llmservice/projects/llms
 
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}
-MOE_ROUTER_FORCE_LOAD_BALANCING=${MOE_ROUTER_FORCE_LOAD_BALANCING:-0}
-RUN_NAME="mimo-parity-gbs32-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}-FLB${MOE_ROUTER_FORCE_LOAD_BALANCING}"
+MOE_ROUTER_FORCE_LOAD_BALANCING=${MOE_ROUTER_FORCE_LOAD_BALANCING:-1}
+RUN_NAME="mimo-nsys-gbs32-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}-FLB${MOE_ROUTER_FORCE_LOAD_BALANCING}"
 RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
-# ---- topology: TP=2 EP=16 LLM + TP=1 DP=8 encoder lane ----------------------
+# ---- topology: TP=2 EP=16 LLM + TP=1 DP=8 encoder lane (matches sbatch_hetero_parity_gbs32.sh) ----
 ENCODER_TP=1; ENCODER_CP=1; ENCODER_PP=1; ENCODER_DP=8; ENCODER_EP=1
 LLM_TP=2;     LLM_CP=1;     LLM_PP=1;     LLM_DP=8;    LLM_EP=16;   LLM_EXPT_TP=1
 LLM_ONLY=0
@@ -46,7 +52,7 @@ LLM_ONLY=0
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=32
 NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 4
-TRAIN_ITERS=100
+TRAIN_ITERS=50
 LOG_INTERVAL=1
 SAVE_INTERVAL=99999999
 
@@ -74,7 +80,7 @@ WORLD_SIZE=$(( ENCODER_TP * ENCODER_CP * ENCODER_PP * ENCODER_DP \
 [[ "${WORLD_SIZE}" -eq 24 ]] || { echo "ERROR: derived world_size=${WORLD_SIZE} (expected 24)" >&2; exit 1; }
 
 mkdir -p "${RUN_DIR}/logs/app" "${RUN_DIR}/logs/torchrun" "${RUN_DIR}/checkpoints" \
-         "${RUN_DIR}/tensorboard" "${RUN_DIR}/data_cache" "${RUN_DIR}/tmp"
+         "${RUN_DIR}/tensorboard" "${RUN_DIR}/data_cache" "${RUN_DIR}/tmp" "${RUN_DIR}/nsys"
 
 export REPO_ROOT RUN_DIR SCRATCH_ROOT
 export OUTPUT_PATH="${RUN_DIR}" LOG_DIR="${RUN_DIR}/logs/app" APP_LOG_DIR="${RUN_DIR}/logs/app"
@@ -82,7 +88,6 @@ export TORCHRUN_LOG_DIR="${RUN_DIR}/logs/torchrun"
 export CHECKPOINT_SAVE_PATH="${RUN_DIR}/checkpoints" CHECKPOINT_LOAD_PATH="${NEMOTRON_CKPT}"
 export CHECKPOINT_DIR="${RUN_DIR}/checkpoints" TENSORBOARD_PATH="${RUN_DIR}/tensorboard" TB_DIR="${RUN_DIR}/tensorboard"
 export DATA_CACHE_DIR="${RUN_DIR}/data_cache"
-# DataLoader worker AF_UNIX sockets must stay under 108 chars; RUN_DIR is too long.
 export TMPDIR="/tmp"
 
 export HOME="${SCRATCH_ROOT}/runtime/megatron_lm/home"
@@ -113,6 +118,17 @@ export LR_WARMUP_SAMPLES LR_DECAY_SAMPLES LR_WSD_DECAY_SAMPLES LR_WSD_DECAY_STYL
 export NUM_WORKERS PACKING_BUFFER_SIZE SHUFFLE_BUFFER_SIZE MAX_SAMPLES_PER_SEQUENCE CHECK_HEL_PATHS
 export TOKENIZER_MODEL VISION_CKPT
 
+# nsys profile: wrap all 16 LLM ranks (8..23).
+NSYS_RANKS="${NSYS_RANKS:-8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23}"
+NSYS_OUT_DIR="${RUN_DIR}/nsys"
+export NSYS_RANKS NSYS_OUT_DIR
+
+# Timeline JSONL stays ON, with NVTX ranges enabled so each event also pushes an
+# NVTX range (formatted as e.g. "schedule.forward/iter=N/mb=M/role=llm").
+TIMELINE=${TIMELINE:-1}
+TIMELINE_DIR="${RUN_DIR}/timeline"
+mkdir -p "${TIMELINE_DIR}"
+
 TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
@@ -126,6 +142,12 @@ TRAIN_LAUNCH_ARGS=(
   --load-nemotron-checkpoint "${NEMOTRON_CKPT}"
   --dynamic-resolution
   --tensorboard-dir "${RUN_DIR}/tensorboard"
+  --profile
+  --profile-step-start 30
+  --profile-step-end 40
+  --profile-ranks 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+  --nvtx-ranges
+  --record-shapes
 )
 if [[ "${OVERLAP_PARAM_GATHER}" == "1" ]]; then
   TRAIN_LAUNCH_ARGS+=( --overlap-param-gather )
@@ -133,28 +155,25 @@ fi
 if [[ "${OVERLAP_GRAD_REDUCE}" == "1" ]]; then
   TRAIN_LAUNCH_ARGS+=( --overlap-grad-reduce )
 fi
-
-# Timeline tracing — all-rank by default for small-scale 3-node debug runs.
-TIMELINE=${TIMELINE:-1}
-TIMELINE_DIR="${RUN_DIR}/timeline"
-mkdir -p "${TIMELINE_DIR}"
 if [[ "${TIMELINE}" == "1" ]]; then
   TRAIN_LAUNCH_ARGS+=(
     --timeline-profile
     --timeline-dir "${TIMELINE_DIR}"
     --timeline-ranks all
+    --timeline-nvtx
   )
 fi
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
 
-echo "=== hetero parity GBS=32 (${TRAIN_ITERS} iters, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE}) ==="
+echo "=== hetero NSYS GBS=32 3n (${TRAIN_ITERS} iters, profile 30-40 on ranks ${NSYS_RANKS}, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE} FLB=${MOE_ROUTER_FORCE_LOAD_BALANCING}) ==="
 echo "repo=${REPO_ROOT} run_dir=${RUN_DIR}"
 echo "world_size=${WORLD_SIZE} gbs=${GLOBAL_BATCH_SIZE} microbatches=${NUM_MICROBATCHES}"
 echo "layout: encoder(dp=${ENCODER_DP}) llm(tp=${LLM_TP},dp=${LLM_DP},ep=${LLM_EP})"
 echo "ckpt=${NEMOTRON_CKPT}"
-echo "=================================================="
+echo "nsys ranks=${NSYS_RANKS}  nsys out=${NSYS_OUT_DIR}"
+echo "========================================================"
 
 srun --kill-on-bad-exit=1 \
   --ntasks="${WORLD_SIZE}" \
