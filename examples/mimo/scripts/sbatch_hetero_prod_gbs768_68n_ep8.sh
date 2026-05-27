@@ -8,7 +8,7 @@
 #     LR_WSD_DECAY_SAMPLES=18310547, LR_WSD_DECAY_STYLE=minus_sqrt
 #   * PACKING_BUFFER_SIZE=128
 #   * SAVE_INTERVAL=1000 (LOG_INTERVAL=1 for per-iter visibility)
-#   * NUM_WORKERS=1
+#   * NUM_WORKERS=2
 # Deviations: LLM_EP=8 (vs 16), hetero TP=2 (vs 4), force-LB=0, no MTP.
 
 #SBATCH -A nemotron_n4_pre
@@ -72,7 +72,7 @@ TRAINING_STAGE=stage2
 MODEL_PROVIDER=nemotron-moe-vlm-54l
 ENABLE_EXPERIMENTAL=1
 MOE_ROUTER_FORCE_LOAD_BALANCING=0
-NUM_WORKERS=1
+NUM_WORKERS=2
 PACKING_BUFFER_SIZE=128
 SHUFFLE_BUFFER_SIZE=100
 MAX_SAMPLES_PER_SEQUENCE=100
@@ -89,6 +89,9 @@ export REPO_ROOT RUN_DIR SCRATCH_ROOT
 export OUTPUT_PATH="${RUN_DIR}" LOG_DIR="${RUN_DIR}/logs/app" APP_LOG_DIR="${RUN_DIR}/logs/app"
 export TORCHRUN_LOG_DIR="${RUN_DIR}/logs/torchrun"
 export CHECKPOINT_SAVE_PATH="${RUN_DIR}/checkpoints" CHECKPOINT_LOAD_PATH="${NEMOTRON_CKPT}"
+export DATALOADER_SAVE_PATH="${DATALOADER_SAVE_PATH:-${CHECKPOINT_SAVE_PATH}/dataloader}"
+export DATALOADER_LOAD_PATH="${DATALOADER_LOAD_PATH:-}"
+export ENERGON_SAMPLE_TRACE_DIR="${ENERGON_SAMPLE_TRACE_DIR:-}"
 export CHECKPOINT_DIR="${RUN_DIR}/checkpoints" TENSORBOARD_PATH="${RUN_DIR}/tensorboard" TB_DIR="${RUN_DIR}/tensorboard"
 export DATA_CACHE_DIR="${RUN_DIR}/data_cache"
 export TMPDIR="/tmp"
@@ -121,21 +124,37 @@ export LR_WARMUP_SAMPLES LR_DECAY_SAMPLES LR_WSD_DECAY_SAMPLES LR_WSD_DECAY_STYL
 export NUM_WORKERS PACKING_BUFFER_SIZE SHUFFLE_BUFFER_SIZE MAX_SAMPLES_PER_SEQUENCE CHECK_HEL_PATHS
 export TOKENIZER_MODEL VISION_CKPT
 
+RESUME_CHECKPOINT_PATH="${RESUME_CHECKPOINT_PATH:-}"
+LOAD_ARGS=()
+if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
+  LOAD_ARGS+=(--load "${RESUME_CHECKPOINT_PATH}")
+  DATALOADER_LOAD_PATH="${DATALOADER_LOAD_PATH:-${RESUME_CHECKPOINT_PATH}/dataloader}"
+else
+  LOAD_ARGS+=(--no-load-optim --no-load-rng --load-nemotron-checkpoint "${NEMOTRON_CKPT}")
+fi
+export DATALOADER_LOAD_PATH
+
 TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
   --max-num-tiles 1
-  --overlap-grad-reduce --overlap-param-gather
+  --overlap-grad-reduce
   --ddp-num-buckets 8 --ddp-pad-buckets-for-high-nccl-busbw
   --correct-encoder-grad-for-partial-participation
   --seed 1234
   --save "${CHECKPOINT_SAVE_PATH}"
   --save-interval "${SAVE_INTERVAL}"
-  --no-load-optim --no-load-rng
-  --load-nemotron-checkpoint "${NEMOTRON_CKPT}"
+  --dataloader-save "${DATALOADER_SAVE_PATH}"
+  "${LOAD_ARGS[@]}"
   --dynamic-resolution
   --tensorboard-dir "${RUN_DIR}/tensorboard"
 )
+if [[ -n "${DATALOADER_LOAD_PATH}" ]]; then
+  TRAIN_LAUNCH_ARGS+=(--dataloader-load "${DATALOADER_LOAD_PATH}")
+fi
+if [[ -n "${ENERGON_SAMPLE_TRACE_DIR}" ]]; then
+  TRAIN_LAUNCH_ARGS+=(--energon-sample-trace-dir "${ENERGON_SAMPLE_TRACE_DIR}")
+fi
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"

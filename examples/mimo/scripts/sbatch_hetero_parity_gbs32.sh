@@ -32,8 +32,8 @@ VISION_CKPT="${SCRATCH_ROOT}/encoders/post-c-radio-omni"
 
 NEMOTRON_CKPT="${NEMOTRON_CKPT:-/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text/users/sasatheesh/workspace/output/3b_nano_vlm_sota_mtp2_90t10v_post_c_radio_omni_96n_tp2_ep16_selective_300b_20260511/checkpoints/iter_0001000}"
 
-RUN_NAME="mimo-parity-gbs32"
-RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
+RUN_NAME="${RUN_NAME:-mimo-parity-gbs32}"
+RUN_DIR="${RUN_DIR:-${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}}"
 
 # ---- topology: TP=2 EP=16 LLM + TP=1 DP=8 encoder lane ----------------------
 ENCODER_TP=1; ENCODER_CP=1; ENCODER_PP=1; ENCODER_DP=8; ENCODER_EP=1
@@ -43,9 +43,9 @@ LLM_ONLY=0
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=32
 NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 4
-TRAIN_ITERS=20
+TRAIN_ITERS="${TRAIN_ITERS:-20}"
 LOG_INTERVAL=1
-SAVE_INTERVAL=99999999
+SAVE_INTERVAL="${SAVE_INTERVAL:-99999999}"
 
 LR=1.2e-3
 MIN_LR=1.2e-5
@@ -55,7 +55,7 @@ LR_WARMUP_SAMPLES=0
 LR_DECAY_SAMPLES=121046313
 LR_WSD_DECAY_SAMPLES=1
 LR_WSD_DECAY_STYLE=minus_sqrt
-TRAIN_SAMPLES=$(( TRAIN_ITERS * GLOBAL_BATCH_SIZE ))
+TRAIN_SAMPLES="${TRAIN_SAMPLES:-$(( TRAIN_ITERS * GLOBAL_BATCH_SIZE ))}"
 
 TRAINING_STAGE=stage2
 MODEL_PROVIDER=nemotron-moe-vlm-54l
@@ -78,6 +78,9 @@ export REPO_ROOT RUN_DIR SCRATCH_ROOT
 export OUTPUT_PATH="${RUN_DIR}" LOG_DIR="${RUN_DIR}/logs/app" APP_LOG_DIR="${RUN_DIR}/logs/app"
 export TORCHRUN_LOG_DIR="${RUN_DIR}/logs/torchrun"
 export CHECKPOINT_SAVE_PATH="${RUN_DIR}/checkpoints" CHECKPOINT_LOAD_PATH="${NEMOTRON_CKPT}"
+export DATALOADER_SAVE_PATH="${DATALOADER_SAVE_PATH:-${CHECKPOINT_SAVE_PATH}/dataloader}"
+export DATALOADER_LOAD_PATH="${DATALOADER_LOAD_PATH:-}"
+export ENERGON_SAMPLE_TRACE_DIR="${ENERGON_SAMPLE_TRACE_DIR:-}"
 export CHECKPOINT_DIR="${RUN_DIR}/checkpoints" TENSORBOARD_PATH="${RUN_DIR}/tensorboard" TB_DIR="${RUN_DIR}/tensorboard"
 export DATA_CACHE_DIR="${RUN_DIR}/data_cache"
 # DataLoader worker AF_UNIX sockets must stay under 108 chars; RUN_DIR is too long.
@@ -111,21 +114,37 @@ export LR_WARMUP_SAMPLES LR_DECAY_SAMPLES LR_WSD_DECAY_SAMPLES LR_WSD_DECAY_STYL
 export NUM_WORKERS PACKING_BUFFER_SIZE SHUFFLE_BUFFER_SIZE MAX_SAMPLES_PER_SEQUENCE CHECK_HEL_PATHS
 export TOKENIZER_MODEL VISION_CKPT
 
+RESUME_CHECKPOINT_PATH="${RESUME_CHECKPOINT_PATH:-}"
+LOAD_ARGS=()
+if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
+  LOAD_ARGS+=(--load "${RESUME_CHECKPOINT_PATH}")
+  DATALOADER_LOAD_PATH="${DATALOADER_LOAD_PATH:-${RESUME_CHECKPOINT_PATH}/dataloader}"
+else
+  LOAD_ARGS+=(--no-load-optim --no-load-rng --load-nemotron-checkpoint "${NEMOTRON_CKPT}")
+fi
+export DATALOADER_LOAD_PATH
+
 TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
   --max-num-tiles 1
-  --overlap-grad-reduce --overlap-param-gather
+  --overlap-grad-reduce
   --ddp-num-buckets 8 --ddp-pad-buckets-for-high-nccl-busbw
   --correct-encoder-grad-for-partial-participation
   --seed 1234
   --save "${CHECKPOINT_SAVE_PATH}"
   --save-interval "${SAVE_INTERVAL}"
-  --no-load-optim --no-load-rng
-  --load-nemotron-checkpoint "${NEMOTRON_CKPT}"
+  --dataloader-save "${DATALOADER_SAVE_PATH}"
+  "${LOAD_ARGS[@]}"
   --dynamic-resolution
   --tensorboard-dir "${RUN_DIR}/tensorboard"
 )
+if [[ -n "${DATALOADER_LOAD_PATH}" ]]; then
+  TRAIN_LAUNCH_ARGS+=(--dataloader-load "${DATALOADER_LOAD_PATH}")
+fi
+if [[ -n "${ENERGON_SAMPLE_TRACE_DIR}" ]]; then
+  TRAIN_LAUNCH_ARGS+=(--energon-sample-trace-dir "${ENERGON_SAMPLE_TRACE_DIR}")
+fi
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},/lustre/fsw/portfolios/llmservice:/lustre/fsw/portfolios/llmservice,/scratch/fsw/portfolios/llmservice:/scratch/fsw/portfolios/llmservice"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"

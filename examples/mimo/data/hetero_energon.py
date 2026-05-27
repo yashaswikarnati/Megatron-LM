@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import random
 from collections import deque
 from typing import Callable, Optional
@@ -256,7 +258,7 @@ def _build_routed_encoder_iterator(args, tp_group, encoder_dp_rank, llm_lanes):
         watchdog_initial_timeout_seconds=5 * 60,
     )
 
-    loader_iter_holder: list = [iter(loader)]
+    loader_iter_holder: list = [None]
     # Dense integer keys (0..lanes_per_encoder-1) → use a list so the hot-path
     # routing in ``_route_samples_to_lanes`` does O(1) array indexing rather
     # than dict probing.
@@ -271,10 +273,30 @@ def _build_routed_encoder_iterator(args, tp_group, encoder_dp_rank, llm_lanes):
     max_pulls_per_step = max(4 * lanes_per_encoder, 2 * num_workers_enc)
     provenance_key = MimoMultiModalPackingEncoder.PROVENANCE_KEY
 
+    def get_loader_iter():
+        if loader_iter_holder[0] is None:
+            loader_iter_holder[0] = iter(loader)
+        return loader_iter_holder[0]
+
+    def save_route_state():
+        return {"pending_by_lane": [list(queue) for queue in pending_by_lane]}
+
+    def restore_route_state(state):
+        saved_pending = state.get("pending_by_lane", [])
+        if len(saved_pending) != lanes_per_encoder:
+            raise RuntimeError(
+                f"routed encoder dataloader state has {len(saved_pending)} pending lanes, "
+                f"expected {lanes_per_encoder}"
+            )
+        for queue, values in zip(pending_by_lane, saved_pending):
+            queue.clear()
+            queue.extend(values)
+        loader_iter_holder[0] = None
+
     def next_encoder_batch():
         try:
             lane_batches, _pulls = _route_samples_to_lanes(
-                loader_iter_holder[0],
+                get_loader_iter(),
                 lanes_per_encoder=lanes_per_encoder,
                 lane_offset=lane_offset,
                 num_workers_per_lane=num_workers_per_lane,
@@ -291,7 +313,7 @@ def _build_routed_encoder_iterator(args, tp_group, encoder_dp_rank, llm_lanes):
             # a pseudo-infinite source; this branch is rarely hit in practice.
             loader_iter_holder[0] = iter(loader)
             lane_batches, _pulls = _route_samples_to_lanes(
-                loader_iter_holder[0],
+                get_loader_iter(),
                 lanes_per_encoder=lanes_per_encoder,
                 lane_offset=lane_offset,
                 num_workers_per_lane=num_workers_per_lane,
@@ -304,13 +326,20 @@ def _build_routed_encoder_iterator(args, tp_group, encoder_dp_rank, llm_lanes):
         return _combine_encoder_batches(lane_batches), signatures
 
     return EnergonIterator(
-        None,
+        loader,
         tp_group=tp_group,
         source_rank=True,
         random_seed=args.seed,
         local_batch_fn=next_encoder_batch,
         alignment_role="encoder",
         llm_lanes=llm_lanes,
+        state_name=(
+            f"train_dataloader_encoder_dprank{encoder_dp_rank:03d}"
+            f"_lanes{llm_lanes[0]:03d}-{llm_lanes[-1]:03d}.pt"
+        ),
+        extra_state_fn=save_route_state,
+        restore_extra_state_fn=restore_route_state,
+        trace_dir=getattr(args, "energon_sample_trace_dir", None),
     )
 
 
@@ -357,13 +386,16 @@ def _build_single_lane_iterator(args, tp_group, lane: int, role: str, random_see
         watchdog_timeout_seconds=5 * 60,
         watchdog_initial_timeout_seconds=5 * 60,
     )
+    state_role = "encoder" if role.startswith("encoder") else "llm"
     return EnergonIterator(
         loader,
         tp_group=tp_group,
         source_rank=True,
         random_seed=random_seed,
-        alignment_role="encoder" if role.startswith("encoder") else "llm",
+        alignment_role=state_role,
         llm_lanes=[lane],
+        state_name=f"train_dataloader_{state_role}_lane{lane:03d}.pt",
+        trace_dir=getattr(args, "energon_sample_trace_dir", None),
     )
 
 
@@ -562,6 +594,10 @@ class EnergonIterator:
         local_batch_fn: Optional[Callable[[], dict]] = None,
         alignment_role: Optional[str] = None,
         llm_lanes: Optional[list[int]] = None,
+        state_name: Optional[str] = None,
+        extra_state_fn: Optional[Callable[[], dict]] = None,
+        restore_extra_state_fn: Optional[Callable[[dict], None]] = None,
+        trace_dir: Optional[str] = None,
     ) -> None:
         self._dataloader = dataloader
         self._iterator = None
@@ -573,10 +609,67 @@ class EnergonIterator:
         self._prefetched = None
         self._prefetched_component_signatures = None
         self._local_component_signatures = None
+        self._state_name = state_name
+        self._extra_state_fn = extra_state_fn
+        self._restore_extra_state_fn = restore_extra_state_fn
+        self._trace_dir = trace_dir
+        self._trace_step = 0
+        self._trace_file = None
         self._python_random_state = None
         if random_seed is not None:
             rng = random.Random(random_seed)
             self._python_random_state = rng.getstate()
+
+    def dataloader_state_name(self) -> Optional[str]:
+        """Return the per-rank checkpoint filename for this iterator's state."""
+        if not self._source_rank:
+            return None
+        return self._state_name
+
+    def save_state(self):
+        """Return a picklable snapshot of the Energon loader and wrapper state."""
+        if not self._source_rank:
+            return None
+        if self._dataloader is None or not hasattr(self._dataloader, "save_state_rank"):
+            raise RuntimeError(f"cannot save dataloader state for {type(self._dataloader).__name__}")
+
+        state = {
+            "version": 1,
+            "role": self._alignment_role,
+            "llm_lanes": list(self._llm_lanes),
+            "dataloader_state_dict": self._dataloader.save_state_rank(),
+            "python_random_state": self._python_random_state,
+            "prefetched": self._prefetched,
+            "prefetched_component_signatures": self._prefetched_component_signatures,
+            "trace_step": self._trace_step,
+        }
+        if self._extra_state_fn is not None:
+            state["extra_state"] = self._extra_state_fn()
+        return state
+
+    def restore_state(self, state) -> None:
+        """Restore a snapshot previously returned by :meth:`save_state`."""
+        if not self._source_rank:
+            return
+        if state.get("version") != 1:
+            raise RuntimeError(f"unsupported dataloader state version: {state.get('version')}")
+        if list(state.get("llm_lanes", [])) != list(self._llm_lanes):
+            raise RuntimeError(
+                f"dataloader state lanes {state.get('llm_lanes')} do not match "
+                f"current lanes {self._llm_lanes}"
+            )
+        if self._dataloader is None or not hasattr(self._dataloader, "restore_state_rank"):
+            raise RuntimeError(f"cannot restore dataloader state for {type(self._dataloader).__name__}")
+
+        self._dataloader.restore_state_rank(state["dataloader_state_dict"])
+        self._iterator = None
+        self._python_random_state = state.get("python_random_state")
+        self._prefetched = state.get("prefetched")
+        self._prefetched_component_signatures = state.get("prefetched_component_signatures")
+        self._local_component_signatures = None
+        self._trace_step = state.get("trace_step", self._trace_step)
+        if self._restore_extra_state_fn is not None:
+            self._restore_extra_state_fn(state.get("extra_state", {}))
 
     def __iter__(self):
         return self
@@ -594,6 +687,7 @@ class EnergonIterator:
             dist.broadcast_object_list(obj, src=self._tp_source_rank(), group=self._tp_group)
             batch, component_signatures = obj[0]
         self._prefetched_component_signatures = component_signatures
+        self._trace_sample(component_signatures)
         return batch
 
     def peek_alignment(self):
@@ -655,6 +749,25 @@ class EnergonIterator:
         if self._local_component_signatures is not None:
             return self._local_component_signatures
         return [self._batch_signature(batch)]
+
+    def _trace_sample(self, component_signatures) -> None:
+        """Write optional per-source-rank sample signatures for replay validation."""
+        if not self._trace_dir or not self._source_rank or component_signatures is None:
+            return
+        if self._trace_file is None:
+            os.makedirs(self._trace_dir, exist_ok=True)
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            name = self._state_name or f"{self._alignment_role}_rank{rank:05d}.pt"
+            path = os.path.join(self._trace_dir, f"{name}.rank{rank:05d}.jsonl")
+            self._trace_file = open(path, "a", encoding="utf-8", buffering=1)
+        record = {
+            "step": self._trace_step,
+            "role": self._alignment_role,
+            "llm_lanes": self._llm_lanes,
+            "signatures": [list(signature) for signature in component_signatures],
+        }
+        self._trace_file.write(json.dumps(record, sort_keys=True) + "\n")
+        self._trace_step += 1
 
     def _tp_source_rank(self) -> int:
         """Return the global source rank for the local TP batch broadcast."""

@@ -12,7 +12,11 @@ import numpy as np
 import torch
 
 from examples.mimo.training.hetero.args import prepare_args
-from examples.mimo.training.hetero.checkpointing import load_checkpoint, save_checkpoint
+from examples.mimo.training.hetero.checkpointing import (
+    load_checkpoint,
+    maybe_restore_dataloader_state,
+    save_checkpoint,
+)
 from examples.mimo.training.hetero.data import select_data_iterator, validate_data_iterator
 from examples.mimo.training.hetero.distributed import print_rank_0
 from examples.mimo.training.hetero.grad_sync import configure_grad_sync
@@ -67,7 +71,6 @@ def run_train_loop(args: argparse.Namespace) -> None:
         communicator = build_pipeline_communicator(model, topology)
         debug_rank("selecting data iterator")
         data_iterator = select_data_iterator(args, topology)
-        validate_data_iterator(args, data_iterator, topology)
         logger = HeteroTrainingLogger(args=args, topology=topology)
         debug_rank("training setup ready")
 
@@ -77,6 +80,8 @@ def run_train_loop(args: argparse.Namespace) -> None:
             start_iteration = 0
         else:
             start_iteration = load_checkpoint(model, optimizer, opt_param_scheduler, args, topology)
+            maybe_restore_dataloader_state(data_iterator, start_iteration, args)
+        validate_data_iterator(args, data_iterator, topology)
         if start_iteration >= args.train_iters:
             print_rank_0(
                 f"Resume iteration ({start_iteration}) >= --train-iters ({args.train_iters}); "
@@ -110,11 +115,15 @@ def run_train_loop(args: argparse.Namespace) -> None:
                 and iteration % args.save_interval == 0
                 and iteration != args.train_iters
             ):
-                save_checkpoint(iteration, model, optimizer, opt_param_scheduler, args, topology)
+                save_checkpoint(
+                    iteration, model, optimizer, opt_param_scheduler, args, topology, data_iterator
+                )
                 last_saved = iteration
 
         if args.save and last_saved != args.train_iters:
-            save_checkpoint(args.train_iters, model, optimizer, opt_param_scheduler, args, topology)
+            save_checkpoint(
+                args.train_iters, model, optimizer, opt_param_scheduler, args, topology, data_iterator
+            )
     finally:
         close_pipeline_timeline()
         if model is not None:
