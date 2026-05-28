@@ -120,7 +120,7 @@ if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
   LOAD_ARGS+=(--load "${RESUME_CHECKPOINT_PATH}")
   DATALOADER_LOAD_PATH="${DATALOADER_LOAD_PATH:-${RESUME_CHECKPOINT_PATH}/dataloader}"
 else
-  LOAD_ARGS+=(--no-load-optim --no-load-rng --load-nemotron-checkpoint "${NEMOTRON_CKPT}")
+  LOAD_ARGS+=(--no-load-optim --no-load-rng --load-vision-from "${VISION_CKPT}")
 fi
 export DATALOADER_LOAD_PATH
 
