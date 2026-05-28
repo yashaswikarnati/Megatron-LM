@@ -136,6 +136,13 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> None:
     provider.add_argument("--freeze-lm", action="store_true")
     provider.add_argument("--freeze-vit", action="store_true")
     provider.add_argument("--freeze-projection", action="store_true")
+    provider.add_argument(
+        "--vision-projection-type",
+        type=str,
+        choices=["mlp", "affine"],
+        default="affine",
+        help="Projection module from frozen vision features to language hidden size.",
+    )
     provider.add_argument("--training-stage", choices=["stage1", "stage2", "stage3"], default=None)
     provider.add_argument("--fp32", action="store_true")
 
@@ -680,7 +687,7 @@ def vision_submodules_spec(
             params={
                 "config": nemotron_projection_config(args, tp_size),
                 "submodules": nemotron_projection_layer_spec().submodules,
-                "projector_type": "mlp",
+                "projector_type": args.vision_projection_type,
                 "input_size": 5120,
                 "tp_group": tp_pg if is_process_group_member(tp_pg) else None,
             },

@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -49,14 +50,14 @@ class MultimodalProjector(MegatronModule):
                     config=config, submodules=submodules, input_size=input_size, tp_group=tp_group
                 )
             elif self.projector_type == "affine":
-                self.encoder = submodules.linear_fc1(
+                self.encoder = ColumnParallelLinear(
                     input_size,
                     config.hidden_size,
                     config=config,
                     init_method=not_none(config.init_method),
-                    gather_output=True,
                     bias=config.add_bias_linear,
-                    skip_bias_add=True,
+                    gather_output=True,
+                    skip_bias_add=False,
                     is_expert=False,
                     tp_comm_buffer_name=None,
                     tp_group=tp_group,
