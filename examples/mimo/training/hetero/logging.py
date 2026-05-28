@@ -23,6 +23,32 @@ from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 
+_MB = 1024.0 * 1024.0
+
+
+def _vm_rss_mb() -> float:
+    """Read process RSS from /proc/self/status; cheap and dependency-free."""
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0
+
+
+def _vm_peak_mb() -> float:
+    """Read process VmPeak (peak virtual size) from /proc/self/status."""
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0
+
 
 @dataclass
 class HeteroTrainingLogger:
@@ -80,6 +106,12 @@ class HeteroTrainingLogger:
         learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         loss_scale = optimizer.get_loss_scale().item()
 
+        cuda_alloc_mb = torch.cuda.memory_allocated() / _MB
+        cuda_peak_mb = torch.cuda.max_memory_allocated() / _MB
+        rss_mb = _vm_rss_mb()
+        host_peak_mb = _vm_peak_mb()
+        torch.cuda.reset_peak_memory_stats()
+
         if is_language_log_rank(self.topology):
             log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
             log_string += " iteration {:8d}/{:8d} |".format(iteration, self.args.train_iters)
@@ -97,6 +129,10 @@ class HeteroTrainingLogger:
                 log_string += f" num zeros: {int(result.num_zeros_in_grad)} |"
             log_string += " number of skipped iterations: {:3d} |".format(self.skipped_iterations)
             log_string += " number of nan iterations: {:3d} |".format(self.nan_iterations)
+            log_string += (
+                f" cuda alloc: {cuda_alloc_mb:.0f}MB peak: {cuda_peak_mb:.0f}MB |"
+                f" host rss: {rss_mb:.0f}MB peak: {host_peak_mb:.0f}MB |"
+            )
             sys.stdout.write(f"{log_string}\n")
             sys.stdout.flush()
         num_moe_experts = getattr(self.args, "num_moe_experts", None)
@@ -149,6 +185,10 @@ class HeteroTrainingLogger:
             self._tb_writer.add_scalar(
                 "iteration-time-ms", elapsed_ms, iteration
             )
+            self._tb_writer.add_scalar("mem/cuda-allocated-mb", cuda_alloc_mb, iteration)
+            self._tb_writer.add_scalar("mem/cuda-peak-mb", cuda_peak_mb, iteration)
+            self._tb_writer.add_scalar("mem/host-rss-mb", rss_mb, iteration)
+            self._tb_writer.add_scalar("mem/host-peak-mb", host_peak_mb, iteration)
             self._tb_writer.flush()
         self.reset_interval()
 
