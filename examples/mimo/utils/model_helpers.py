@@ -40,6 +40,36 @@ def _resolve_ckpt_dir(ckpt_dir: str) -> str:
     return ckpt_dir
 
 
+def _drill_through_ddp(mod: torch.nn.Module) -> torch.nn.Module:
+    """Unwrap DDP / Float16Module wrappers so we hit the raw nn.Module."""
+    seen = set()
+    while True:
+        inner = getattr(mod, "module", None)
+        if inner is None or id(inner) in seen:
+            return mod
+        seen.add(id(inner))
+        mod = inner
+
+
+def _tp_slice(
+    tensor: torch.Tensor, param_shape: torch.Size, tp_rank: int, tp_size: int
+) -> torch.Tensor:
+    """Slice a full (TP=1) tensor to the appropriate TP rank shard.
+
+    Handles column-parallel (first-dim split) and row-parallel (second-dim split).
+    Identity when ``tp_size == 1`` or the tensor already matches the param shape.
+    """
+    if tp_size == 1 or tensor.shape == param_shape:
+        return tensor
+    if tensor.shape[0] != param_shape[0]:
+        start = tp_rank * param_shape[0]
+        return tensor[start : start + param_shape[0], ...]
+    if len(tensor.shape) > 1 and tensor.shape[1] != param_shape[1]:
+        start = tp_rank * param_shape[1]
+        return tensor[:, start : start + param_shape[1]]
+    return tensor
+
+
 def load_submodule_ckpt(module: torch.nn.Module, ckpt_dir: str):
     """Load ``ckpt_dir`` into ``module`` using a flat ``module.*`` prefix.
 
@@ -150,20 +180,6 @@ def load_nemotron_vlm_ckpt_hetero(
     # and hit a world barrier while LLM ranks are still inside the load).
     combined_sd: dict[str, Any] = {}
     targets: list[tuple[torch.nn.Module, str, str]] = []
-
-    def _drill_through_ddp(mod):
-        """Unwrap DDP / Float16Module wrappers so we hit the raw nn.Module."""
-        try:
-            from megatron.core.distributed import DistributedDataParallel as _DDP
-        except Exception:  # pylint: disable=broad-except
-            _DDP = ()
-        seen = set()
-        while True:
-            inner = getattr(mod, "module", None)
-            if inner is None or id(inner) in seen:
-                return mod
-            seen.add(id(inner))
-            mod = inner
 
     if has_language:
         if not hasattr(mimo_model, "language_model") or mimo_model.language_model is None:
@@ -347,4 +363,101 @@ def load_and_refresh_nemotron_checkpoint(model, optimizer, topology, args) -> No
         ),
         skip_projection=False,
     )
+    optimizer.reload_model_params()
+
+
+def load_radio_from_dcp(mimo_model, optimizer, topology, ckpt_dir: str) -> None:
+    """Warm-start only the RADIO vision encoder from a torch DCP checkpoint.
+
+    Mirrors Sanjeev's ``pretrain_vlm_energon._load_vision_from_checkpoint``.
+    The ckpt at ``ckpt_dir`` is a raw torch DCP (``__N_M.distcp`` + ``.metadata``)
+    with mcore-style keys ``model.vision_model.<param>``; we read it with
+    ``torch.distributed.checkpoint`` (not mcore's wrapper, which expects its own
+    ``metadata.json`` sidecar).
+
+    Encoder ranks read + copy into ``radio_model`` parameters/buffers; LLM ranks
+    no-op. ``optimizer.reload_model_params()`` is called on all ranks afterward
+    to sync the DistributedOptimizer FP32 main-param shards. Language model and
+    vision projection remain at random init.
+    """
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint import FileSystemReader
+    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+
+    from examples.mimo.model_providers.nemotron_moe_vlm import NEMOTRON_VISION_ENCODER_KEY
+
+    iter_dir = _resolve_ckpt_dir(ckpt_dir)
+    world_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if world_rank == 0:
+        print(f"[load-vision-from] resolved iter_dir: {iter_dir}", flush=True)
+
+    rank_in_enc = topology.vision_pg is not None and is_process_group_member(
+        getattr(topology.vision_pg, "dp_cp", None)
+    )
+
+    if rank_in_enc:
+        submodules = getattr(mimo_model, "modality_submodules", None)
+        if submodules is None or topology.encoder_name not in submodules:
+            raise RuntimeError(
+                f"encoder rank but mimo_model.modality_submodules[{topology.encoder_name!r}] missing."
+            )
+        vision_submodule = _drill_through_ddp(submodules[topology.encoder_name])
+        encoders = getattr(vision_submodule, "encoders", None)
+        if encoders is None or NEMOTRON_VISION_ENCODER_KEY not in encoders:
+            raise RuntimeError(
+                f"vision submodule missing encoders[{NEMOTRON_VISION_ENCODER_KEY!r}]."
+            )
+        radio_wrapper = encoders[NEMOTRON_VISION_ENCODER_KEY]
+        radio_model = getattr(radio_wrapper, "radio_model", None)
+        if radio_model is None:
+            raise RuntimeError("radio_wrapper.radio_model is None on this rank.")
+
+        reader = FileSystemReader(iter_dir)
+        ckpt_metadata = reader.read_metadata().state_dict_metadata
+        prefix = "model.vision_model."
+        load_sd = {
+            k: torch.empty(meta.size, dtype=meta.properties.dtype)
+            for k, meta in ckpt_metadata.items()
+            if k.startswith(prefix) and isinstance(meta, TensorStorageMetadata)
+        }
+        if not load_sd:
+            raise RuntimeError(
+                f"[load-vision-from] no '{prefix}*' keys in {iter_dir}; "
+                "ckpt does not look like a Megatron-Bridge vision encoder DCP."
+            )
+
+        # Scope DCP's collectives to encoder ranks only. At encoder TP=1 CP=1,
+        # vision_pg.dp_cp covers exactly the encoder ranks. (For TP>1 encoders
+        # we'd need a wider tp_dp_cp group, not built today.)
+        encoder_pg = topology.vision_pg.dp_cp
+        dcp.load(load_sd, storage_reader=reader, process_group=encoder_pg)
+
+        tp_pg = getattr(topology.vision_pg, "tp", None)
+        tp_rank = torch.distributed.get_rank(tp_pg) if tp_pg is not None else 0
+        tp_size = torch.distributed.get_world_size(tp_pg) if tp_pg is not None else 1
+
+        model_tensors = dict(radio_model.named_parameters())
+        model_tensors.update(dict(radio_model.named_buffers()))
+
+        loaded = skipped = 0
+        for ckpt_key, tensor in load_sd.items():
+            rel_key = ckpt_key[len(prefix):]
+            param = model_tensors.get(rel_key)
+            if param is None:
+                skipped += 1
+                continue
+            tensor = _tp_slice(tensor, param.shape, tp_rank, tp_size)
+            param.data.copy_(tensor.to(dtype=param.dtype, device=param.device))
+            loaded += 1
+
+        print(
+            f"[load-vision-from] rank={world_rank} ViT loaded "
+            f"({loaded}/{len(load_sd)} tensors, skipped={skipped})",
+            flush=True,
+        )
+
+    # Resync DistributedOptimizer FP32 main-param shards on ALL ranks. Required
+    # because we wrote into model_param.data after optimizer build — without
+    # this, encoder ranks would silently train with stale main_param values
+    # (NMFW-478 optimizer-update anomaly).
     optimizer.reload_model_params()
