@@ -46,8 +46,10 @@ BLEND_SHIM_DIR="${BLEND_SHIM_DIR:-${SCRATCH_ROOT}/blend-shim}"
 # Empty by default on cw-dfw (no resume checkpoint available).
 NEMOTRON_CKPT="${NEMOTRON_CKPT:-}"
 
-# Use text-only blend (drops OmniCorpus; symlinks into nvr portfolio, unreadable).
-export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/examples/mimo/blend_files/text_only_1t_hel.yaml}"
+# Use cw-dfw production 90/10 blend variant (same as nb-hel except OmniCorpus
+# root swapped to OmniCorpus-CC-210M-no-links; the original symlinks into the
+# nvr portfolio aren't readable to ykarnati on cw-dfw).
+export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/examples/mimo/blend_files/text_omnicorpus_blend_10_90_hel_cw.yaml}"
 
 NUM_DIST_OPT_INSTANCES=${NUM_DIST_OPT_INSTANCES:-1}
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
