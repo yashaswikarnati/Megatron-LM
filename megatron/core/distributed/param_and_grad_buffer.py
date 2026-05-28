@@ -265,36 +265,40 @@ class _ParamAndGradBucketGroup:
         """
         rerun_state_machine = get_rerun_state_machine()
         for i in range(len(self.buckets)):
-            grad_norm = self.buckets[i].grad_data.norm(p=2)
-            # check for NaN, Inf and unexpectedly large grads
-            if check_for_nan_or_inf:
-                rerun_state_machine.validate_result(
-                    result=grad_norm,
-                    rejection_func=torch.isnan,
-                    message=f"found NaN in local grad norm for bucket #{i} "
-                    f"in backward pass before data-parallel communication collective",
-                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
-                    fatal=True,
-                )
-                rerun_state_machine.validate_result(
-                    result=grad_norm,
-                    rejection_func=torch.isinf,
-                    message=f"found Inf in local grad norm for bucket #{i} "
-                    f"in backward pass before data-parallel communication collective",
-                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
-                    fatal=True,
-                )
-            if check_for_large:
-                rerun_state_machine.validate_result(
-                    result=grad_norm,
-                    rejection_func=partial(
-                        rerun_state_machine.is_unexpectedly_large, threshold=10, context="grads"
-                    ),
-                    message=f"found unexpected large grads in bucket #{i} "
-                    f"in backward pass before data-parallel communication collective",
-                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
-                    fatal=False,
-                )
+            # Wrap the whole per-bucket cost (norm kernel launch + validate_result
+            # which calls .item() → host-blocking sync). Prime suspect for the
+            # mb=last bwd boundary cost.
+            with timeline_event("ddp.check_grads.bucket", bucket=i):
+                grad_norm = self.buckets[i].grad_data.norm(p=2)
+                # check for NaN, Inf and unexpectedly large grads
+                if check_for_nan_or_inf:
+                    rerun_state_machine.validate_result(
+                        result=grad_norm,
+                        rejection_func=torch.isnan,
+                        message=f"found NaN in local grad norm for bucket #{i} "
+                        f"in backward pass before data-parallel communication collective",
+                        tolerance=0.001,
+                        fatal=True,
+                    )
+                    rerun_state_machine.validate_result(
+                        result=grad_norm,
+                        rejection_func=torch.isinf,
+                        message=f"found Inf in local grad norm for bucket #{i} "
+                        f"in backward pass before data-parallel communication collective",
+                        tolerance=0.001,
+                        fatal=True,
+                    )
+                if check_for_large:
+                    rerun_state_machine.validate_result(
+                        result=grad_norm,
+                        rejection_func=partial(
+                            rerun_state_machine.is_unexpectedly_large, threshold=10, context="grads"
+                        ),
+                        message=f"found unexpected large grads in bucket #{i} "
+                        f"in backward pass before data-parallel communication collective",
+                        tolerance=0.001,
+                        fatal=False,
+                    )
 
     def start_param_sync(self, force_sync: bool = False):
         """
@@ -749,15 +753,18 @@ class _ParamAndGradBucketGroup:
             self.ddp_config.overlap_grad_reduce
         ), "register_grad_ready() should only be called when overlap_grad_reduce is True"
         if self.is_last_microbatch:
-            assert param in self.param_to_bucket, "Param is not in the bucket group"
-            if param not in self.per_param_grad_ready_counts:
-                self.per_param_grad_ready_counts[param] = 0
-            self.per_param_grad_ready_counts[param] += 1
-            # If all params in bucket group have grads available, issue communication call.
-            if not self.is_first_batch:
-                if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
-                    assert len(self.per_param_grad_ready_counts) == len(self.params)
-                    self.start_grad_sync(force_all_reduce=force_all_reduce)
+            # Only fires on the last microbatch's backward; each param-ready
+            # hook may trigger a start_grad_sync (which can do .item() syncs).
+            with timeline_event("ddp.register_grad_ready"):
+                assert param in self.param_to_bucket, "Param is not in the bucket group"
+                if param not in self.per_param_grad_ready_counts:
+                    self.per_param_grad_ready_counts[param] = 0
+                self.per_param_grad_ready_counts[param] += 1
+                # If all params in bucket group have grads available, issue communication call.
+                if not self.is_first_batch:
+                    if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
+                        assert len(self.per_param_grad_ready_counts) == len(self.params)
+                        self.start_grad_sync(force_all_reduce=force_all_reduce)
 
 
 def group_params_for_buffers(

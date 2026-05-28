@@ -497,10 +497,15 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
     if output_tensor[0].requires_grad:
-        if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
-        else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+        # Time autograd.backward separately from the surrounding scheduling /
+        # tensor unwrap / hook setup so we can tell how much of schedule.backward
+        # is pure-autograd vs hook side effects (esp. on mb=last where
+        # register_grad_ready/start_grad_sync hooks fire).
+        with timeline_event("autograd.backward"):
+            if config.deallocate_pipeline_outputs:
+                custom_backward(output_tensor[0], output_tensor_grad[0])
+            else:
+                torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -562,12 +567,13 @@ def backward_step_multimodule(
         # In multi-modal models like VLM, some batches may not have images.
         # In such cases, skip backward while preserving zero gradients.
         if output_tensor_module is not None and output_tensor_module.requires_grad:
-            if config.deallocate_pipeline_outputs:
-                custom_backward(output_tensor_module, output_tensor_grad_module)
-            else:
-                torch.autograd.backward(
-                    output_tensor_module, grad_tensors=output_tensor_grad_module
-                )
+            with timeline_event("autograd.backward", module=module_name):
+                if config.deallocate_pipeline_outputs:
+                    custom_backward(output_tensor_module, output_tensor_grad_module)
+                else:
+                    torch.autograd.backward(
+                        output_tensor_module, grad_tensors=output_tensor_grad_module
+                    )
 
     # Collect gradients for input tensors.
     input_tensor_grad = {}
