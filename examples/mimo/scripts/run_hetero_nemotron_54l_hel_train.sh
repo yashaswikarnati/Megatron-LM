@@ -305,6 +305,40 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+# Optional: disable Transparent Huge Pages for this process via libnothp.so
+# (calls prctl(PR_SET_THP_DISABLE) in a constructor before main()).
+# Gated by DISABLE_THP=1.  Builds the .so on demand in a shared location.
+if [[ "${DISABLE_THP:-0}" == "1" ]]; then
+  LIBNOTHP_SRC="${REPO_ROOT}/benchmarks/libnothp/disable_thp.c"
+  LIBNOTHP_OUT_DIR="${SCRATCH_ROOT}/runtime/megatron_lm/libnothp"
+  mkdir -p "${LIBNOTHP_OUT_DIR}"
+  LIBNOTHP_SO="${LIBNOTHP_OUT_DIR}/libnothp.so"
+  if [[ ! -f "${LIBNOTHP_SO}" || "${LIBNOTHP_SRC}" -nt "${LIBNOTHP_SO}" ]]; then
+    if command -v gcc >/dev/null 2>&1; then
+      gcc -shared -fPIC -O2 -o "${LIBNOTHP_SO}" "${LIBNOTHP_SRC}" \
+        && echo "[disable_thp] built ${LIBNOTHP_SO}" \
+        || echo "[disable_thp] WARNING: gcc build failed; THP not disabled"
+    else
+      echo "[disable_thp] WARNING: gcc not available; THP not disabled"
+    fi
+  fi
+  if [[ -f "${LIBNOTHP_SO}" ]]; then
+    export LD_PRELOAD="${LIBNOTHP_SO}${LD_PRELOAD:+:${LD_PRELOAD}}"
+    echo "[disable_thp] rank ${RANK_ID}: LD_PRELOAD=${LD_PRELOAD}"
+  fi
+fi
+
+# Optional: cuBLASLt logging to a per-rank file so logs from different ranks
+# don't interleave.  Gated by CUBLASLT_LOG_LEVEL being set non-zero.
+#   CUBLASLT_LOG_LEVEL=2     # 0=off, 1=error, 2=trace, 3=debug
+# Output goes to per-rank file at ${RUN_DIR}/cublas/cublaslt-rank<N>.log
+if [[ -n "${CUBLASLT_LOG_LEVEL:-}" && "${CUBLASLT_LOG_LEVEL}" != "0" ]]; then
+  CUBLAS_LOG_DIR="${RUN_DIR}/cublas"
+  mkdir -p "${CUBLAS_LOG_DIR}"
+  export CUBLASLT_LOG_FILE="${CUBLAS_LOG_DIR}/cublaslt-rank$(printf '%05d' "${RANK_ID}").log"
+  echo "[cublaslt] rank ${RANK_ID}: LOG_LEVEL=${CUBLASLT_LOG_LEVEL} LOG_FILE=${CUBLASLT_LOG_FILE}"
+fi
+
 # nsys profile wrapper for selected ranks.
 # Set NSYS_RANKS to a comma-separated list of global ranks (e.g. "16,17,18,19,20,21,22,23")
 # and NSYS_OUT_DIR to the per-job output dir.  Only those ranks invoke nsys profile.
@@ -318,15 +352,29 @@ if [[ -n "${NSYS_RANKS:-}" && -n "${NSYS_OUT_DIR:-}" ]]; then
     # Disable torch inductor background compile workers — nsys's process
     # instrumentation breaks subprocess Python init (sysconfig ImportError).
     export TORCHINDUCTOR_COMPILE_THREADS=1
-    # Note: nsys in this container doesn't accept '--trace=nccl'.  NCCL kernels
-    # still show up under 'cuda' tracing (they're CUDA kernels on the comm
-    # stream).  cudnn covers cuBLAS/cuDNN ops.
+    # Defaults enable CPU sampling, OS Runtime tracing, Python sampling, and
+    # DWARF backtraces in addition to CUDA + NVTX so we capture the host side
+    # too.  nsys in this container does not accept '--trace=nccl'; NCCL kernels
+    # still show up under 'cuda' tracing.
+    #
+    # Env overrides:
+    #   NSYS_TRACE       — -t value (default "cuda,nvtx,osrt")
+    #   NSYS_SAMPLE      — -s value (default "cpu"; "none" disables CPU sampling)
+    #   NSYS_EXTRA_ARGS  — appended verbatim
+    #     (default: --python-sampling=true --python-sampling-frequency=2000
+    #               --backtrace=dwarf)
+    NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,osrt}"
+    NSYS_SAMPLE="${NSYS_SAMPLE:-cpu}"
+    NSYS_EXTRA_ARGS="${NSYS_EXTRA_ARGS:---python-sampling=true --python-sampling-frequency=2000 --backtrace=dwarf}"
+    # Intentional word-splitting on NSYS_EXTRA_ARGS so each flag becomes a
+    # separate argv entry.
     exec nsys profile \
-      -s none \
-      -t nvtx,cuda,cudnn \
+      -s "${NSYS_SAMPLE}" \
+      -t "${NSYS_TRACE}" \
       --capture-range=cudaProfilerApi \
       --capture-range-end=stop \
       --force-overwrite=true \
+      ${NSYS_EXTRA_ARGS} \
       -o "${NSYS_OUT_FILE}" \
       "${CMD[@]}"
   fi

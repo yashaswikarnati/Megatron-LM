@@ -495,18 +495,23 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if (
-            hasattr(self, "_inference_token_dispatcher")
-            and self.is_inference_cuda_graphed_iteration
-        ):
-            routing_map = self.token_dispatcher.routing_map
-            expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
-            )
-        else:
-            expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
-            )
+        # Lazy import: top-level import would create a circular dep via
+        # pipeline_parallel/__init__.py -> schedules -> moe.router -> moe_utils.
+        from megatron.core.pipeline_parallel.timeline import timeline_event
+
+        with timeline_event("moe.grouped_mlp", layer=getattr(self, "layer_number", -1)):
+            if (
+                hasattr(self, "_inference_token_dispatcher")
+                and self.is_inference_cuda_graphed_iteration
+            ):
+                routing_map = self.token_dispatcher.routing_map
+                expert_output, mlp_bias = apply_module(self.experts)(
+                    dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
+                )
+            else:
+                expert_output, mlp_bias = apply_module(self.experts)(
+                    dispatched_input, tokens_per_expert, permuted_probs
+                )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
@@ -615,23 +620,27 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        if self.moe_layer_recompute and self.training:
-            if self.config.fp8 or self.config.fp4:
-                outputs = te_checkpoint(
-                    custom_forward,
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.tp_group,
-                    hidden_states,
-                    intermediate_tensors,
-                    padding_mask,
-                )
+        # Lazy import (see routed_experts_compute for circular-import details).
+        from megatron.core.pipeline_parallel.timeline import timeline_event
+
+        with timeline_event("moe.forward", layer=getattr(self, "layer_number", -1)):
+            if self.moe_layer_recompute and self.training:
+                if self.config.fp8 or self.config.fp4:
+                    outputs = te_checkpoint(
+                        custom_forward,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        self.tp_group,
+                        hidden_states,
+                        intermediate_tensors,
+                        padding_mask,
+                    )
+                else:
+                    outputs = tensor_parallel.checkpoint(
+                        custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                    )
             else:
-                outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
-                )
-        else:
-            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+                outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
 

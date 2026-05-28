@@ -144,9 +144,16 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
 
-        mixer_out_with_bias = self.mixer(
-            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
-        )
+        # Lazy import: top-level import would create a circular dep via
+        # pipeline_parallel/__init__.py.
+        from megatron.core.pipeline_parallel.timeline import timeline_event
+
+        with timeline_event("mamba.forward", layer=self.layer_number):
+            mixer_out_with_bias = self.mixer(
+                hidden_states,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mamba_bda(
