@@ -611,19 +611,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self._set_proj_residual(residual)
 
         # Self attention.
+        # Lazy import — `from megatron.core.pipeline_parallel.timeline import timeline_event`
+        # at module scope creates a circular import via pipeline_parallel/__init__.py
+        # that ends up re-entering this very module during package init.
+        from megatron.core.pipeline_parallel.timeline import timeline_event
+
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
+        with timeline_event("attention.forward", layer=self.layer_number):
+            attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
@@ -764,60 +770,66 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
-        nvtx_range_push(suffix="mlp")
-        # Potentially chunk the MLP computation during prefill to minimize the peak activation size
-        should_chunk_mlp_for_prefill = (
-            self.config.mlp_chunks_for_prefill > 1
-            and inference_context is not None
-            and not inference_context.is_decode_only()
-            and not isinstance(self.mlp, IdentityOp)
-            and not self.config.transformer_impl == "inference_optimized"
-        )
+        # Lazy import (see _forward_attention for explanation of circular-import workaround).
+        from megatron.core.pipeline_parallel.timeline import timeline_event
 
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
-        )
+        with timeline_event("mlp.forward", layer=self.layer_number):
+            nvtx_range_push(suffix="mlp")
+            # Potentially chunk MLP computation during prefill to minimize peak activation size
+            should_chunk_mlp_for_prefill = (
+                self.config.mlp_chunks_for_prefill > 1
+                and inference_context is not None
+                and not inference_context.is_decode_only()
+                and not isinstance(self.mlp, IdentityOp)
+                and not self.config.transformer_impl == "inference_optimized"
+            )
 
-        if self.recompute_mlp:
-            if self.config.fp8 or self.config.fp4:
-                # import here to avoid circular import
-                from megatron.core.extensions.transformer_engine import te_checkpoint
+            using_fused_tp_inference_kernel = (not self.training) and (
+                self.config.inference_fuse_tp_communication
+            )
 
-                mlp_output_with_bias = te_checkpoint(
-                    self.mlp,
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
+            if self.recompute_mlp:
+                if self.config.fp8 or self.config.fp4:
+                    # import here to avoid circular import
+                    from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                    mlp_output_with_bias = te_checkpoint(
+                        self.mlp,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        self.pg_collection.tp,
+                        pre_mlp_layernorm_output,
+                        padding_mask=padding_mask,
+                    )
+                else:
+                    mlp_output_with_bias = tensor_parallel.checkpoint(
+                        functools.partial(self.mlp, padding_mask=padding_mask),
+                        False,
+                        pre_mlp_layernorm_output,
+                    )
+            elif should_chunk_mlp_for_prefill:
+                # Chunk input along sequence dimension
+                num_chunks = min(
+                    self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0]
                 )
+                chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+
+                # Compute outputs for each chunk
+                outputs = [self.mlp(chunk) for chunk in chunks]
+
+                # Aggregate chunk outputs
+                mlp_output = torch.cat([out for out, _ in outputs], dim=0)
+                bias_chunks = [bias for _, bias in outputs if bias is not None]
+                bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+                mlp_output_with_bias = (mlp_output, bias_output)
             else:
-                mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, padding_mask=padding_mask),
-                    False,
-                    pre_mlp_layernorm_output,
-                )
-        elif should_chunk_mlp_for_prefill:
-            # Chunk input along sequence dimension
-            num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
-            chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+                if using_fused_tp_inference_kernel:
+                    # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
+                    # operation in MLP's fc2.
+                    self._set_fc2_residual(residual)
+                mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
 
-            # Compute outputs for each chunk
-            outputs = [self.mlp(chunk) for chunk in chunks]
-
-            # Aggregate chunk outputs
-            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
-            bias_chunks = [bias for _, bias in outputs if bias is not None]
-            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
-            mlp_output_with_bias = (mlp_output, bias_output)
-        else:
-            if using_fused_tp_inference_kernel:
-                # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
-                # operation in MLP's fc2.
-                self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
-
-        nvtx_range_pop(suffix="mlp")
+            nvtx_range_pop(suffix="mlp")
 
         if (
             self.is_moe_layer
