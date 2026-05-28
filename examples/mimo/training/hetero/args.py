@@ -257,14 +257,13 @@ def parse_args() -> argparse.Namespace:
         "training_log so hetero and reference runs can be diffed in TB.",
     )
     train.add_argument(
-        "--log-memory-interval",
-        type=int,
-        default=None,
+        "--log-memory",
+        action="store_true",
+        default=False,
         help=(
-            "If set, every N iterations every rank prints its current/peak GPU "
-            "allocated/reserved memory and resets peak counters. Useful for "
-            "diagnosing per-rank OOM trajectories. Must be a multiple of "
-            "--log-interval."
+            "If set, every rank prints its current/peak GPU allocated/reserved "
+            "memory at the same cadence as --log-interval and resets peak "
+            "counters. Useful for diagnosing per-rank OOM trajectories."
         ),
     )
 
@@ -370,11 +369,6 @@ def validate_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
         raise ValueError("Phase 2 mock training currently supports CP=1 only")
     if args.log_interval < 1:
         raise ValueError("--log-interval must be >= 1")
-    if args.log_memory_interval is not None:
-        if args.log_memory_interval < 1:
-            raise ValueError("--log-memory-interval must be >= 1")
-        if args.log_memory_interval % args.log_interval != 0:
-            raise ValueError("--log-memory-interval must be a multiple of --log-interval")
     if args.timeline_dp_replica < 0:
         raise ValueError("--timeline-dp-replica must be >= 0")
 

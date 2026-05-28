@@ -157,9 +157,9 @@ class HeteroTrainingLogger:
         """Per-rank GPU memory probe. Prints current/peak alloc+reserved and
         resets the peak counters so the next interval reports a fresh peak.
         Logs from every rank (not just the language log rank) so OOM trajectories
-        on individual ranks become visible."""
-        interval = getattr(self.args, "log_memory_interval", None)
-        if interval is None or iteration % interval != 0:
+        on individual ranks become visible. Fires whenever the iter-time line
+        fires (gated by --log-memory)."""
+        if not getattr(self.args, "log_memory", False):
             return
         if not torch.cuda.is_available():
             return
