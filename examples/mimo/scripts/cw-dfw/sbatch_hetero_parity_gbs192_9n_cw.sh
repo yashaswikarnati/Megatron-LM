@@ -1,25 +1,16 @@
 #!/bin/bash
-# cw-dfw variant of sbatch_hetero_jitter_gbs768_34n.sh — timeline-only 34n run
-# for cross-cluster jitter comparison vs nb-hel 34n nsys (job 297782).
-# 34 nodes (2n encoder DP=16 + 32n LLM TP=2 DP=128 EP=8), GBS=768, 100 iters.
-# Differences vs the nb-hel jitter script:
-#   * Account: coreai_dlalgo_genai (better fairshare on cw-dfw)
-#   * NEMOTRON_CKPT defaults empty (sasatheesh iter_0001000 not on cw-dfw).
-#     --load-nemotron-checkpoint appended only if NEMOTRON_CKPT non-empty.
-#   * VISION_CKPT dropped (dead code in run_hetero_nemotron_54l_hel_train.sh).
-#   * DATA_PATH defaults to text_only_1t_hel.yaml — cw-dfw OmniCorpus tars are
-#     symlinks into the nvr portfolio that ykarnati can't read.
-#   * Container mounts include /lustre/.../llmservice:/scratch/.../llmservice
-#     plus a nested ${BLEND_SHIM_DIR} overlay at /scratch/.../llmservice/projects
-#     /llmservice_fm_text so the McoreBlend JSON resolves at the canonical path.
+# cw-dfw 9n boundary-mb gut-check: 1n encoder + 8n LLM, GBS=192, NMB=6, 100 iters.
+# Same topology as nb-hel sbatch_hetero_parity_gbs192.sh; NMB=6 reproduces the
+# LLM mb=0 fwd / mb=last bwd boundary cost we see at 34n, but at ~9× lower
+# cluster cost so we can iterate fast on hypotheses.
 
 #SBATCH -A coreai_dlalgo_genai
 #SBATCH -p batch
-#SBATCH -N 34
+#SBATCH -N 9
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
-#SBATCH --time=01:00:00
-#SBATCH -J mimo-jitter-gbs768-34n-cw
+#SBATCH --time=00:30:00
+#SBATCH -J mimo-boundary-9n-cw
 #SBATCH --exclusive
 #SBATCH --output=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.out
 #SBATCH --error=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch/runs/%x-%j.err
@@ -36,38 +27,29 @@ fi
 SCRATCH_ROOT=/lustre/fsw/portfolios/nemotron/users/ykarnati/agents-scratch
 CONTAINER_IMAGE="${HETERO_CONTAINER_IMAGE:-${SCRATCH_ROOT}/images/m_lm_energon_0506.sqsh}"
 export HETERO_SKIP_UV="${HETERO_SKIP_UV:-1}"
+export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
 ENV_ROOT="${SCRATCH_ROOT}/envs/megatron_lm/01f0da7539da4b39"
 TOKENIZER_MODEL="${SCRATCH_ROOT}/tokenizers/sanjeevnv-multimodal-pretraining-26f81d5db838eb6dee2ff8692db83a2fbc76f3ff"
-
-# Bind-mount shim: holds the unmodified McoreBlend JSON at
-# users/rkarimimahab/workspace/blends/1T-phase1var-moresft.json
 BLEND_SHIM_DIR="${BLEND_SHIM_DIR:-${SCRATCH_ROOT}/blend-shim}"
-
-# Empty by default on cw-dfw (no resume checkpoint available).
 NEMOTRON_CKPT="${NEMOTRON_CKPT:-}"
 
-# Use cw-dfw production 90/10 blend variant (same as nb-hel except OmniCorpus
-# root swapped to OmniCorpus-CC-210M-no-links; the original symlinks into the
-# nvr portfolio aren't readable to ykarnati on cw-dfw).
 export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/examples/mimo/blend_files/text_omnicorpus_blend_10_90_hel_cw.yaml}"
 
 NUM_DIST_OPT_INSTANCES=${NUM_DIST_OPT_INSTANCES:-1}
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}
-# CHECK_FOR_NAN_IN_GRAD=0 passes --no-check-for-nan-in-loss-and-grad. This
-# disables per-bucket .norm().item() syncs inside start_grad_sync that fire
-# from autograd hooks on mb=last bwd and may inflate mb=last bwd host wall.
+DDP_NUM_BUCKETS=${DDP_NUM_BUCKETS:-8}
 CHECK_FOR_NAN_IN_GRAD=${CHECK_FOR_NAN_IN_GRAD:-1}
-RUN_NAME="mimo-jitter-gbs768-34n-cw-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}-NAN${CHECK_FOR_NAN_IN_GRAD}"
+RUN_NAME="mimo-boundary-9n-cw-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}-NDOI${NUM_DIST_OPT_INSTANCES}-B${DDP_NUM_BUCKETS}-NAN${CHECK_FOR_NAN_IN_GRAD}"
 RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
-# ---- topology: TP=2 EP=8 LLM (32 nodes, DP=128) + TP=1 DP=16 encoder lane (2 nodes)
-ENCODER_TP=1;  ENCODER_CP=1;  ENCODER_PP=1;  ENCODER_DP=16;  ENCODER_EP=1
-LLM_TP=2;      LLM_CP=1;      LLM_PP=1;      LLM_DP=128;     LLM_EP=8;    LLM_EXPT_TP=1
+# ---- topology: TP=2 EP=16 LLM (8n DP=32) + TP=1 DP=8 encoder (1n) ----
+ENCODER_TP=1;  ENCODER_CP=1;  ENCODER_PP=1;  ENCODER_DP=8;   ENCODER_EP=1
+LLM_TP=2;      LLM_CP=1;      LLM_PP=1;      LLM_DP=32;      LLM_EP=16;   LLM_EXPT_TP=1
 LLM_ONLY=0
 
 MICRO_BATCH_SIZE=1
-GLOBAL_BATCH_SIZE=768
+GLOBAL_BATCH_SIZE=192
 NUM_MICROBATCHES=$(( GLOBAL_BATCH_SIZE / (MICRO_BATCH_SIZE * LLM_DP) ))   # = 6
 TRAIN_ITERS=100
 LOG_INTERVAL=1
@@ -95,7 +77,7 @@ CHECK_HEL_PATHS=1
 
 WORLD_SIZE=$(( ENCODER_TP * ENCODER_CP * ENCODER_PP * ENCODER_DP \
              + LLM_TP * LLM_CP * LLM_PP * LLM_DP ))
-[[ "${WORLD_SIZE}" -eq 272 ]] || { echo "ERROR: derived world_size=${WORLD_SIZE} (expected 272)" >&2; exit 1; }
+[[ "${WORLD_SIZE}" -eq 72 ]] || { echo "ERROR: derived world_size=${WORLD_SIZE} (expected 72)" >&2; exit 1; }
 
 mkdir -p "${RUN_DIR}/logs/app" "${RUN_DIR}/logs/torchrun" "${RUN_DIR}/checkpoints" \
          "${RUN_DIR}/tensorboard" "${RUN_DIR}/data_cache" "${RUN_DIR}/tmp"
@@ -125,7 +107,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16 NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NCCL_P2P_NET_CHUNKSIZE=2097152 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_DEBUG=WARN NCCL_SHM_DISABLE=1 NCCL_PROTO=simple NCCL_NVLS_ENABLE=0
-export HETERO_DIST_TIMEOUT_MIN=25
+export HETERO_DIST_TIMEOUT_MIN=15
 export TORCH_NCCL_AVOID_RECORD_STREAMS=0 NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
 
 export TRAINING_STAGE MODEL_PROVIDER ENABLE_EXPERIMENTAL MOE_ROUTER_FORCE_LOAD_BALANCING
@@ -137,7 +119,7 @@ export LR_WARMUP_SAMPLES LR_DECAY_SAMPLES LR_WSD_DECAY_SAMPLES LR_WSD_DECAY_STYL
 export NUM_WORKERS PACKING_BUFFER_SIZE SHUFFLE_BUFFER_SIZE MAX_SAMPLES_PER_SEQUENCE CHECK_HEL_PATHS
 export TOKENIZER_MODEL
 
-TIMELINE=${TIMELINE:-1}  # opt-in JSONL timeline tracing for hetero loop (default ON)
+TIMELINE=${TIMELINE:-1}
 TIMELINE_DIR="${RUN_DIR}/timeline"
 mkdir -p "${TIMELINE_DIR}"
 
@@ -145,7 +127,7 @@ TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
   --max-num-tiles 1
-  --ddp-num-buckets 8 --ddp-pad-buckets-for-high-nccl-busbw
+  --ddp-num-buckets "${DDP_NUM_BUCKETS}" --ddp-pad-buckets-for-high-nccl-busbw
   --correct-encoder-grad-for-partial-participation
   --seed 1234
   --save "${CHECKPOINT_SAVE_PATH}"
@@ -173,8 +155,6 @@ if [[ "${TIMELINE}" == "1" ]]; then
     --timeline-dir "${TIMELINE_DIR}"
     --timeline-ranks all
   )
-  # --timeline-cuda-events intentionally OFF — recorder syncs per iter and
-  # breaks overlap-grad-reduce / overlap-param-gather at production scale.
 fi
 
 CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT}"
@@ -183,13 +163,11 @@ CONTAINER_MOUNTS+=",/lustre/fsw/portfolios/llmservice:/scratch/fsw/portfolios/ll
 CONTAINER_MOUNTS+=",${BLEND_SHIM_DIR}:/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
 
-echo "=== hetero JITTER GBS=768 34n cw-dfw (${TRAIN_ITERS} iters, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE}, force-LB=${MOE_ROUTER_FORCE_LOAD_BALANCING}) ==="
+echo "=== boundary-mb 9n cw-dfw (${TRAIN_ITERS} iters, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE} FLB=${MOE_ROUTER_FORCE_LOAD_BALANCING} NDOI=${NUM_DIST_OPT_INSTANCES} BUCKETS=${DDP_NUM_BUCKETS}) ==="
 echo "repo=${REPO_ROOT} run_dir=${RUN_DIR}"
 echo "world_size=${WORLD_SIZE} gbs=${GLOBAL_BATCH_SIZE} microbatches=${NUM_MICROBATCHES}"
 echo "layout: encoder(dp=${ENCODER_DP}) llm(tp=${LLM_TP},dp=${LLM_DP},ep=${LLM_EP})"
 echo "ckpt=${NEMOTRON_CKPT:-<random-init>}"
-echo "overlap_param_gather: ${OVERLAP_PARAM_GATHER}  overlap_grad_reduce: ${OVERLAP_GRAD_REDUCE}"
-echo "blend_shim=${BLEND_SHIM_DIR}"
 echo "========================================================"
 
 srun --kill-on-bad-exit=1 \
