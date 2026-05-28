@@ -27,7 +27,10 @@ from examples.mimo.training.hetero.step import train_step
 from examples.mimo.training.hetero.timeline import configure_hetero_timeline
 from examples.mimo.training.hetero.topology import HeteroTopology, create_topology
 from examples.mimo.utils.hetero import debug_rank
-from examples.mimo.utils.model_helpers import load_and_refresh_nemotron_checkpoint
+from examples.mimo.utils.model_helpers import (
+    load_and_refresh_nemotron_checkpoint,
+    load_radio_from_dcp,
+)
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.timeline import (
@@ -75,8 +78,17 @@ def run_train_loop(args: argparse.Namespace) -> None:
         debug_rank("training setup ready")
 
         nemotron_ckpt = getattr(args, "load_nemotron_checkpoint", None)
+        vision_only_ckpt = getattr(args, "load_vision_from", None)
+        if sum(bool(x) for x in (args.load, nemotron_ckpt, vision_only_ckpt)) > 1:
+            raise ValueError(
+                "--load, --load-nemotron-checkpoint, and --load-vision-from are "
+                "mutually exclusive; pick at most one."
+            )
         if nemotron_ckpt:
             load_and_refresh_nemotron_checkpoint(model, optimizer, topology, args)
+            start_iteration = 0
+        elif vision_only_ckpt:
+            load_radio_from_dcp(model, optimizer, topology, vision_only_ckpt)
             start_iteration = 0
         else:
             start_iteration = load_checkpoint(model, optimizer, opt_param_scheduler, args, topology)

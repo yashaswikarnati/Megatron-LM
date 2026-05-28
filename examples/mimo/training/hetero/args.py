@@ -318,6 +318,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     ckpt.add_argument(
+        "--load-vision-from",
+        type=str,
+        default=None,
+        help=(
+            "Path to a Megatron-Bridge RADIO encoder DCP (torch DCP layout with "
+            "`model.vision_model.*` keys; e.g. post-c-radio-omni). Loads only "
+            "the vision encoder; LLM and vision projection are random-init. "
+            "Training starts at iter 0; mutually exclusive with --load and "
+            "--load-nemotron-checkpoint."
+        ),
+    )
+    ckpt.add_argument(
         "--dist-ckpt-optim-fully-reshardable",
         action=argparse.BooleanOptionalAction,
         default=False,
