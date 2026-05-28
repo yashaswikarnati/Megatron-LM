@@ -150,7 +150,31 @@ class HeteroTrainingLogger:
                 "iteration-time-ms", elapsed_ms, iteration
             )
             self._tb_writer.flush()
+        self._maybe_log_memory(iteration)
         self.reset_interval()
+
+    def _maybe_log_memory(self, iteration: int) -> None:
+        """Per-rank GPU memory probe. Prints current/peak alloc+reserved and
+        resets the peak counters so the next interval reports a fresh peak.
+        Logs from every rank (not just the language log rank) so OOM trajectories
+        on individual ranks become visible."""
+        interval = getattr(self.args, "log_memory_interval", None)
+        if interval is None or iteration % interval != 0:
+            return
+        if not torch.cuda.is_available():
+            return
+        mb = 1024.0 * 1024.0
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        line = (
+            f" [mem] iter={iteration} rank={rank}"
+            f" alloc_MB={torch.cuda.memory_allocated() / mb:.0f}"
+            f" max_alloc_MB={torch.cuda.max_memory_allocated() / mb:.0f}"
+            f" reserved_MB={torch.cuda.memory_reserved() / mb:.0f}"
+            f" max_reserved_MB={torch.cuda.max_memory_reserved() / mb:.0f}"
+        )
+        sys.stdout.write(f"{line}\n")
+        sys.stdout.flush()
+        torch.cuda.reset_peak_memory_stats()
 
     def reset_interval(self) -> None:
         """Reset interval accumulators after a log event."""
