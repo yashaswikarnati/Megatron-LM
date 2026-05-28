@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import os
 import random
 from typing import Optional
 
@@ -110,6 +112,22 @@ def run_train_loop(args: argparse.Namespace) -> None:
         last_saved = start_iteration
         nsys_nvtx_context = None  # holds emit_nvtx context for nsys profiling
         profile_active_rank = _rank_should_profile(args)
+
+        # Python automatic generational GC can fire mid-iteration and add
+        # multi-hundred-ms pauses. HETERO_DISABLE_AUTO_GC=1 disables the
+        # automatic collector for the train loop; HETERO_GC_INTERVAL>0
+        # triggers an explicit gc.collect() every N iters to bound heap
+        # growth without the variance of automatic generational sweeps.
+        gc_disabled = os.environ.get("HETERO_DISABLE_AUTO_GC", "0") == "1"
+        gc_interval = int(os.environ.get("HETERO_GC_INTERVAL", "0") or "0")
+        if gc_disabled:
+            gc.collect()
+            gc.disable()
+            print_rank_0(
+                f"HETERO_DISABLE_AUTO_GC=1 — Python automatic GC disabled "
+                f"(HETERO_GC_INTERVAL={gc_interval})"
+            )
+
         for iteration in range(start_iteration + 1, args.train_iters + 1):
             debug_rank(f"iteration {iteration}: train step start")
             set_pipeline_timeline_iteration(iteration)
@@ -153,6 +171,10 @@ def run_train_loop(args: argparse.Namespace) -> None:
             ):
                 save_checkpoint(iteration, model, optimizer, opt_param_scheduler, args, topology)
                 last_saved = iteration
+
+            if gc_disabled and gc_interval > 0 and iteration % gc_interval == 0:
+                with timeline_event("iter.gc_collect"):
+                    gc.collect()
 
         if args.save and last_saved != args.train_iters:
             save_checkpoint(args.train_iters, model, optimizer, opt_param_scheduler, args, topology)
