@@ -133,7 +133,10 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
 # NCCL_PROTO: simple (robust), LL (low-latency small msgs), LL128 (low-latency + bw).
 # NCCL_NVLS_ENABLE: 0 (default) or 1 to use NVSwitch SHARP in-network reduce.
-export NCCL_PROTO="${NCCL_PROTO:-simple}"
+# LL128 is the validated default on cw-dfw at 34n (job 12251160): p99 -20%,
+# stdev -28% vs simple. NVLS=1 (job 12251162) regressed (no AllReduce in hot
+# path), so keep it off.
+export NCCL_PROTO="${NCCL_PROTO:-LL128}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export HETERO_DIST_TIMEOUT_MIN=25
 export TORCH_NCCL_AVOID_RECORD_STREAMS=0 NVTE_ALLOW_NONDETERMINISTIC_ALGO=1
