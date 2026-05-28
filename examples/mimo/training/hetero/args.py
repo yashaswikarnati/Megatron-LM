@@ -256,6 +256,16 @@ def parse_args() -> argparse.Namespace:
         "interval, matching the scalar keys used by Megatron's standard "
         "training_log so hetero and reference runs can be diffed in TB.",
     )
+    train.add_argument(
+        "--log-memory",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, every rank prints its current/peak GPU allocated/reserved "
+            "memory at the same cadence as --log-interval and resets peak "
+            "counters. Useful for diagnosing per-rank OOM trajectories."
+        ),
+    )
 
     ckpt = parser.add_argument_group("checkpointing")
     ckpt.add_argument(
