@@ -54,11 +54,12 @@ export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/examples/mimo/blend_files/text_omnic
 NUM_DIST_OPT_INSTANCES=${NUM_DIST_OPT_INSTANCES:-1}
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}
+DDP_NUM_BUCKETS=${DDP_NUM_BUCKETS:-8}
 # CHECK_FOR_NAN_IN_GRAD=0 passes --no-check-for-nan-in-loss-and-grad. This
 # disables per-bucket .norm().item() syncs inside start_grad_sync that fire
 # from autograd hooks on mb=last bwd and may inflate mb=last bwd host wall.
 CHECK_FOR_NAN_IN_GRAD=${CHECK_FOR_NAN_IN_GRAD:-1}
-RUN_NAME="mimo-jitter-gbs768-34n-cw-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}-NAN${CHECK_FOR_NAN_IN_GRAD}"
+RUN_NAME="mimo-jitter-gbs768-34n-cw-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}-NDOI${NUM_DIST_OPT_INSTANCES}-B${DDP_NUM_BUCKETS}-NAN${CHECK_FOR_NAN_IN_GRAD}"
 RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
 # ---- topology: TP=2 EP=8 LLM (32 nodes, DP=128) + TP=1 DP=16 encoder lane (2 nodes)
@@ -145,7 +146,7 @@ TRAIN_LAUNCH_ARGS=(
   --class-token-len 10
   --image-tag-type internvl
   --max-num-tiles 1
-  --ddp-num-buckets 8 --ddp-pad-buckets-for-high-nccl-busbw
+  --ddp-num-buckets "${DDP_NUM_BUCKETS}" --ddp-pad-buckets-for-high-nccl-busbw
   --correct-encoder-grad-for-partial-participation
   --seed 1234
   --save "${CHECKPOINT_SAVE_PATH}"
@@ -183,7 +184,7 @@ CONTAINER_MOUNTS+=",/lustre/fsw/portfolios/llmservice:/scratch/fsw/portfolios/ll
 CONTAINER_MOUNTS+=",${BLEND_SHIM_DIR}:/scratch/fsw/portfolios/llmservice/projects/llmservice_fm_text"
 [[ "${REPO_ROOT}" == "${SCRATCH_ROOT}"/* ]] || CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${REPO_ROOT}:${REPO_ROOT}"
 
-echo "=== hetero JITTER GBS=768 34n cw-dfw (${TRAIN_ITERS} iters, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE}, force-LB=${MOE_ROUTER_FORCE_LOAD_BALANCING}) ==="
+echo "=== hetero JITTER GBS=768 34n cw-dfw (${TRAIN_ITERS} iters, PG=${OVERLAP_PARAM_GATHER} GR=${OVERLAP_GRAD_REDUCE} FLB=${MOE_ROUTER_FORCE_LOAD_BALANCING} NDOI=${NUM_DIST_OPT_INSTANCES} BUCKETS=${DDP_NUM_BUCKETS} NAN=${CHECK_FOR_NAN_IN_GRAD}) ==="
 echo "repo=${REPO_ROOT} run_dir=${RUN_DIR}"
 echo "world_size=${WORLD_SIZE} gbs=${GLOBAL_BATCH_SIZE} microbatches=${NUM_MICROBATCHES}"
 echo "layout: encoder(dp=${ENCODER_DP}) llm(tp=${LLM_TP},dp=${LLM_DP},ep=${LLM_EP})"
