@@ -60,9 +60,10 @@ DDP_NUM_BUCKETS=${DDP_NUM_BUCKETS:-8}
 # from autograd hooks on mb=last bwd and may inflate mb=last bwd host wall.
 CHECK_FOR_NAN_IN_GRAD=${CHECK_FOR_NAN_IN_GRAD:-1}
 # NCCL knob tags read for RUN_NAME (values get exported later before training).
-_NCCL_PROTO_TAG="${NCCL_PROTO:-simple}"
+_NCCL_PROTO_TAG="${NCCL_PROTO:-LL128}"
 _NCCL_NVLS_TAG="${NCCL_NVLS_ENABLE:-0}"
-RUN_NAME="mimo-jitter-gbs768-34n-cw-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}-NDOI${NUM_DIST_OPT_INSTANCES}-B${DDP_NUM_BUCKETS}-NAN${CHECK_FOR_NAN_IN_GRAD}-${_NCCL_PROTO_TAG}-NVLS${_NCCL_NVLS_TAG}"
+_CDMC_TAG="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+RUN_NAME="mimo-jitter-gbs768-34n-cw-PG${OVERLAP_PARAM_GATHER}-GR${OVERLAP_GRAD_REDUCE}-NDOI${NUM_DIST_OPT_INSTANCES}-B${DDP_NUM_BUCKETS}-NAN${CHECK_FOR_NAN_IN_GRAD}-${_NCCL_PROTO_TAG}-NVLS${_NCCL_NVLS_TAG}-CDMC${_CDMC_TAG}"
 RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
 # ---- topology: TP=2 EP=8 LLM (32 nodes, DP=128) + TP=1 DP=16 encoder lane (2 nodes)
@@ -125,7 +126,12 @@ export UV_PROJECT_ENVIRONMENT="${ENV_ROOT}/.venv"
 export VIRTUAL_ENV="${UV_PROJECT_ENVIRONMENT}"
 export PATH="${UV_PROJECT_ENVIRONMENT}/bin:${PATH}"
 
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+# CUDA_DEVICE_MAX_CONNECTIONS: Megatron defaults to 1 for TP-correctness
+# (ensures TP collectives complete in order vs compute). Raising it gives
+# more launch-queue room — may reduce host-side D-state stalls on
+# cudaLaunchKernel when many small kernels queue (e.g., causal_conv1d in
+# Mamba). Verify loss curve matches baseline when sweeping >1.
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export NVTE_FWD_LAYERNORM_SM_MARGIN=16 NVTE_BWD_LAYERNORM_SM_MARGIN=16
 export NCCL_P2P_NET_CHUNKSIZE="${NCCL_P2P_NET_CHUNKSIZE:-2097152}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
