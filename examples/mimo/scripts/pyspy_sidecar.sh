@@ -39,9 +39,14 @@ log() { echo "[pyspy $(date -u +%H:%M:%S) $NODE] $*" | tee -a "$LOG" >&2 ; }
 
 log "out=$NODE_OUT interval=${INTERVAL}s duration=${DURATION}s match=$PROC_MATCH"
 
-# py-spy must already be on PATH (provisioned by the venv at $VIRTUAL_ENV).
-# We never pip-install at runtime — that's slow, can hit egress restrictions,
-# and obscures provenance. Fail loud if it's missing.
+# Resolve py-spy. The venv ships it (py-spy 0.4.2) but the runner uses
+# `bash -l` which re-sources /etc/profile and drops ${VIRTUAL_ENV}/bin from
+# PATH. Prepend the venv's bin explicitly if VIRTUAL_ENV is set. We never
+# pip-install at runtime — that's slow, can hit egress restrictions, and
+# obscures provenance. Fail loud if py-spy is still missing.
+if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/py-spy" ]]; then
+  export PATH="${VIRTUAL_ENV}/bin:$PATH"
+fi
 if ! command -v py-spy >/dev/null 2>&1; then
   log "FATAL: py-spy not on PATH"
   log "       PATH=$PATH"
