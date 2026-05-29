@@ -228,6 +228,25 @@ DATA_LOADER_ARGS=(
 if [[ "${PACKING_BUFFER_SIZE}" != "0" ]]; then
   DATA_LOADER_ARGS+=(--packing-buffer-size "${PACKING_BUFFER_SIZE}")
 fi
+# DATASET_PROVIDER=mock skips energon entirely and uses the synthetic
+# in-memory iterator from examples/mimo/data/hetero_mock.py. Used to
+# isolate cross-rank jitter sources from data-loader stalls.
+DATASET_PROVIDER="${DATASET_PROVIDER:-energon_multimodal}"
+DATASET_ARGS=()
+if [[ "${DATASET_PROVIDER}" == "mock" ]]; then
+  DATASET_ARGS+=(--dataset-provider mock)
+  if [[ -n "${IMAGE_SEQ_LENGTH:-}" ]]; then
+    DATASET_ARGS+=(--image-seq-length "${IMAGE_SEQ_LENGTH}")
+  fi
+  if [[ -n "${VISION_INPUT_MODE:-}" ]]; then
+    DATASET_ARGS+=(--vision-input-mode "${VISION_INPUT_MODE}")
+  fi
+  if [[ -n "${MOCK_NUM_IMAGE_TILES:-}" ]]; then
+    DATASET_ARGS+=(--num-image-tiles "${MOCK_NUM_IMAGE_TILES}")
+  fi
+else
+  DATASET_ARGS+=(--dataset-provider energon_multimodal --data-path "${DATA_TRAIN}")
+fi
 MODEL_ARGS=()
 if [[ "${ENABLE_EXPERIMENTAL}" == "1" || "${ENABLE_EXPERIMENTAL}" == "true" ]]; then
   MODEL_ARGS+=(--enable-experimental)
@@ -242,7 +261,6 @@ fi
 CMD=(
   "${PYTHON_BIN}" -u examples/mimo/train_hetero.py
   --model-provider "${MODEL_PROVIDER}"
-  --dataset-provider energon_multimodal
   --training-stage "${TRAINING_STAGE}"
   --encoder-tp "${ENCODER_TP}"
   --encoder-cp "${ENCODER_CP}"
@@ -260,7 +278,7 @@ CMD=(
   "${MODEL_ARGS[@]}"
   --vocab-size 131072
   --max-num-tiles 12
-  --data-path "${DATA_TRAIN}"
+  "${DATASET_ARGS[@]}"
   "${DATA_LOADER_ARGS[@]}"
   --tokenizer-model "${TOKENIZER_MODEL}"
   --tokenizer-prompt-format nemotron6-moe
