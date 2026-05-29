@@ -83,19 +83,29 @@ class MockVLMIterator:
         loss_mask = (labels != -100).to(dtype=torch.float32)
 
         if self.vision_input_mode == "pixels":
-            encoder_inputs = {
-                self.vision_encoder_key: {
-                    "x": torch.randn(
-                        self.micro_batch_size * args.num_image_tiles,
-                        3,
-                        args.img_h,
-                        args.img_w,
-                        device="cuda",
-                        dtype=self.dtype,
-                        generator=self.generator,
-                    )
-                }
+            num_tiles = self.micro_batch_size * args.num_image_tiles
+            pixel_inputs = {
+                "x": torch.randn(
+                    num_tiles,
+                    3,
+                    args.img_h,
+                    args.img_w,
+                    device="cuda",
+                    dtype=self.dtype,
+                    generator=self.generator,
+                )
             }
+            # RADIO with --dynamic-resolution needs imgs_sizes per tile so it
+            # can compute per-tile patch counts. Without it, the encoder
+            # falls into a code path that mismatches the patch projection
+            # shape. Pass identical sizes for all mock tiles.
+            if getattr(args, "dynamic_resolution", False):
+                pixel_inputs["imgs_sizes"] = torch.tensor(
+                    [[args.img_h, args.img_w]] * num_tiles,
+                    dtype=torch.long,
+                    device="cuda",
+                )
+            encoder_inputs = {self.vision_encoder_key: pixel_inputs}
         else:
             encoder_hidden_states = torch.randn(
                 self.image_seq_length,
