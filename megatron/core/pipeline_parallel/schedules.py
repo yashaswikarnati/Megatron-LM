@@ -2242,6 +2242,27 @@ def forward_backward_pipelining_without_interleaving(
         output_tensors = []
     forward_data_store = []
 
+    # MIMO_FWD_SYNC_PROBE=1: per-mb diagnostic. Bracket each mb's forward
+    # with dist.barrier(group=tp_dp_cp) + cuda.synchronize() so that the
+    # duration of mb_pre_barrier on each rank measures the wall-clock skew
+    # that accumulated since the last mb boundary. This pinpoints which mb
+    # of the iter is the source of cross-rank divergence; otherwise the
+    # cost is opaquely absorbed into the next cross-rank collective inside
+    # backward. Costs perf (kills overlap, serializes), so off by default.
+    import os as _os
+
+    _fwd_sync_probe = _os.environ.get("MIMO_FWD_SYNC_PROBE", "0") == "1"
+    _probe_barrier_group = getattr(pg_collection, "tp_dp_cp", None) if _fwd_sync_probe else None
+
+    def _probe_pre_mb(mb_idx):
+        if not _fwd_sync_probe:
+            return
+        if _probe_barrier_group is not None:
+            with timeline_event("mb_pre_barrier", microbatch=mb_idx):
+                torch.distributed.barrier(group=_probe_barrier_group)
+        with timeline_event("mb_pre_sync", microbatch=mb_idx):
+            torch.cuda.synchronize()
+
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -2257,6 +2278,7 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor = p2p_communicator.recv_forward(
                 recv_tensor_shapes, p2p_communicator.is_pp_first_stage
             )
+        _probe_pre_mb(i)
         with timeline_event("schedule.forward", phase="warmup", microbatch=i, cuda=True):
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
@@ -2307,6 +2329,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        _probe_pre_mb(forward_microbatch)
         with timeline_event(
             "schedule.forward", phase="steady", microbatch=forward_microbatch, cuda=True
         ):
