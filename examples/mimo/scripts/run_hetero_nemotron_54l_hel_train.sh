@@ -238,9 +238,8 @@ if [[ "${DATASET_PROVIDER}" == "mock" ]]; then
   if [[ -n "${IMAGE_SEQ_LENGTH:-}" ]]; then
     DATASET_ARGS+=(--image-seq-length "${IMAGE_SEQ_LENGTH}")
   fi
-  if [[ -n "${VISION_INPUT_MODE:-}" ]]; then
-    DATASET_ARGS+=(--vision-input-mode "${VISION_INPUT_MODE}")
-  fi
+  # vision_input_mode is auto-set by nemotron_moe_vlm provider ("pixels" for
+  # nemotron-moe-vlm-* so encoder gets real images), so no CLI arg needed.
   if [[ -n "${MOCK_NUM_IMAGE_TILES:-}" ]]; then
     DATASET_ARGS+=(--num-image-tiles "${MOCK_NUM_IMAGE_TILES}")
   fi

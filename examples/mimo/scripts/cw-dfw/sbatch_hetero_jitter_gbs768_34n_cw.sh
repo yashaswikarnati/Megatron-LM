@@ -162,7 +162,7 @@ export TOKENIZER_MODEL
 # DATASET_PROVIDER=mock to validate that slow-iter jitter is data-loader-driven
 # (skips energon, uses examples/mimo/data/hetero_mock.py with fixed shapes).
 DATASET_PROVIDER="${DATASET_PROVIDER:-energon_multimodal}"
-export DATASET_PROVIDER IMAGE_SEQ_LENGTH VISION_INPUT_MODE MOCK_NUM_IMAGE_TILES
+export DATASET_PROVIDER IMAGE_SEQ_LENGTH MOCK_NUM_IMAGE_TILES
 
 TIMELINE=${TIMELINE:-1}  # opt-in JSONL timeline tracing for hetero loop (default ON)
 TIMELINE_DIR="${RUN_DIR}/timeline"
