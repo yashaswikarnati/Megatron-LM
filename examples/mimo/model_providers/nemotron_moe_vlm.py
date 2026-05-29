@@ -147,6 +147,15 @@ def prepare_model_provider_args(args: argparse.Namespace) -> None:
     resolve_image_token_id(args)
     args.vision_encoder_key = get_encoder_module_name(args)
     args.vision_input_mode = "pixels" if is_nemotron_moe_vlm(args) else "hidden_states"
+    # MIMO_VISION_INPUT_MODE env override lets diagnostic runs force
+    # "hidden_states" with the nemotron_moe_vlm provider — bypasses encoder
+    # forward so the mock iterator's synthetic pixels don't need to match
+    # the encoder's patch geometry. Used to isolate data-loader jitter
+    # without engaging the encoder.
+    import os as _os
+    _override = _os.environ.get("MIMO_VISION_INPUT_MODE")
+    if _override in ("pixels", "hidden_states"):
+        args.vision_input_mode = _override
 
 
 def apply_model_provider_defaults(args: argparse.Namespace) -> None:
