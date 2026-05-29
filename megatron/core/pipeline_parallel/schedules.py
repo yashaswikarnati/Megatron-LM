@@ -559,6 +559,15 @@ def backward_step_multimodule(
         if output_tensor_grad[module_name] is None and config.grad_scale_func is not None:
             output_tensor[module_name] = config.grad_scale_func(output_tensor[module_name])
 
+    # When MIMO_BWD_SYNC_PROBE=1, bracket autograd.backward with explicit
+    # cuda syncs to split: (a) drain of pending fwd kernels, (b) pure host
+    # launch cost, (c) drain of bwd kernels + grad collectives. Otherwise
+    # the existing host-wall measurement is opaque and a 2 s spike could be
+    # any of NCCL wait / kernel-launch back-pressure / kernel runtime.
+    import os as _os
+
+    _bwd_sync_probe = _os.environ.get("MIMO_BWD_SYNC_PROBE", "0") == "1"
+
     # Perform backward pass for each module.
     for module_name in output_tensor.keys():
         output_tensor_module = output_tensor[module_name]
@@ -567,13 +576,19 @@ def backward_step_multimodule(
         # In multi-modal models like VLM, some batches may not have images.
         # In such cases, skip backward while preserving zero gradients.
         if output_tensor_module is not None and output_tensor_module.requires_grad:
-            with timeline_event("autograd.backward", module=module_name):
+            if _bwd_sync_probe:
+                with timeline_event("autograd.bwd_pre_sync", module=module_name):
+                    torch.cuda.synchronize()
+            with timeline_event("autograd.backward", module=module_name, cuda=True):
                 if config.deallocate_pipeline_outputs:
                     custom_backward(output_tensor_module, output_tensor_grad_module)
                 else:
                     torch.autograd.backward(
                         output_tensor_module, grad_tensors=output_tensor_grad_module
                     )
+            if _bwd_sync_probe:
+                with timeline_event("autograd.bwd_post_sync", module=module_name):
+                    torch.cuda.synchronize()
 
     # Collect gradients for input tensors.
     input_tensor_grad = {}
