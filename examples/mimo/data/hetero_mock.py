@@ -84,27 +84,44 @@ class MockVLMIterator:
 
         if self.vision_input_mode == "pixels":
             num_tiles = self.micro_batch_size * args.num_image_tiles
-            pixel_inputs = {
-                "x": torch.randn(
-                    num_tiles,
-                    3,
-                    args.img_h,
-                    args.img_w,
-                    device="cuda",
-                    dtype=self.dtype,
-                    generator=self.generator,
-                )
-            }
-            # RADIO with --dynamic-resolution needs imgs_sizes per tile so it
-            # can compute per-tile patch counts. Without it, the encoder
-            # falls into a code path that mismatches the patch projection
-            # shape. Pass identical sizes for all mock tiles.
+            patch_dim = getattr(args, "patch_dim", 16)
             if getattr(args, "dynamic_resolution", False):
-                pixel_inputs["imgs_sizes"] = torch.tensor(
-                    [[args.img_h, args.img_w]] * num_tiles,
-                    dtype=torch.long,
-                    device="cuda",
-                )
+                # RADIO with dynamic_resolution expects x already patchified to
+                # [B, num_patches, channels*patch_dim^2]. The production energon
+                # path does this preprocessing upstream; the mock has to
+                # reproduce the same einops rearrange:
+                #   b c (py yy) (px xx) -> b (py px) (c yy xx)
+                py = args.img_h // patch_dim
+                px = args.img_w // patch_dim
+                num_patches = py * px
+                patch_features = 3 * patch_dim * patch_dim
+                pixel_inputs = {
+                    "x": torch.randn(
+                        num_tiles,
+                        num_patches,
+                        patch_features,
+                        device="cuda",
+                        dtype=self.dtype,
+                        generator=self.generator,
+                    ),
+                    "imgs_sizes": torch.tensor(
+                        [[args.img_h, args.img_w]] * num_tiles,
+                        dtype=torch.long,
+                        device="cuda",
+                    ),
+                }
+            else:
+                pixel_inputs = {
+                    "x": torch.randn(
+                        num_tiles,
+                        3,
+                        args.img_h,
+                        args.img_w,
+                        device="cuda",
+                        dtype=self.dtype,
+                        generator=self.generator,
+                    )
+                }
             encoder_inputs = {self.vision_encoder_key: pixel_inputs}
         else:
             encoder_hidden_states = torch.randn(
