@@ -1,18 +1,15 @@
 # NMFW-478 Iter-Jitter Experiments — Run Guide
 
-## Repo
-
-Branch: `ykarnati/nmfw-464-boundary-mb-experiments` on
-https://github.com/yashaswikarnati/Megatron-LM
+## Use the pre-synced workspace on cw-dfw (no clone needed)
 
 ```
-git fetch origin
-git checkout ykarnati/nmfw-464-boundary-mb-experiments
-cog sync-workspace --cluster-name cw-dfw
+ssh cw-dfw-cs-001-vscode-01
+cd /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/ykarnati/cog-scratch/workspaces/megatron_lm/c7a6bc8d421a1a19/repo
 ```
 
-After sync, your workspace lives at:
-`/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/ykarnati/cog-scratch/workspaces/megatron_lm/<HASH>/repo`
+This is a synced snapshot of branch `ykarnati/nmfw-464-boundary-mb-experiments`
+(commit `aa3e6c12f7`) at https://github.com/yashaswikarnati/Megatron-LM.
+Everything is in place — sbatch directly from here.
 
 ## Launch scripts (cw-dfw)
 
@@ -25,9 +22,9 @@ Both go to `coreai_dlalgo_llm` partition (use `-A coreai_dlalgo_llm` for better 
 
 ## Baseline launch — best-known config
 
-```
-cd <workspace>/repo
+From the synced repo path:
 
+```
 NUM_WORKERS=4 \
 HETERO_DISABLE_AUTO_GC=1 \
 HETERO_GC_INTERVAL=30 \
