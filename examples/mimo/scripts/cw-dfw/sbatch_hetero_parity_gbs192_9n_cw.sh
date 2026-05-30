@@ -45,7 +45,7 @@ RUN_DIR="${SCRATCH_ROOT}/runs/${RUN_NAME}/${SLURM_JOB_ID:-local}"
 
 # ---- topology: TP=2 EP=16 LLM (8n DP=32) + TP=1 DP=8 encoder (1n) ----
 ENCODER_TP=1;  ENCODER_CP=1;  ENCODER_PP=1;  ENCODER_DP=8;   ENCODER_EP=1
-LLM_TP="${LLM_TP:-2}";      LLM_CP="${LLM_CP:-1}";      LLM_PP="${LLM_PP:-1}";      LLM_DP="${LLM_DP:-32}";      LLM_EP="${LLM_EP:-16}";   LLM_EXPT_TP="${LLM_EXPT_TP:-1}"
+LLM_TP="${LLM_TP:-2}";      LLM_CP="${LLM_CP:-1}";      LLM_PP="${LLM_PP:-1}";      LLM_DP="${LLM_DP:-32}";      LLM_EP="${LLM_EP:-8}";   LLM_EXPT_TP="${LLM_EXPT_TP:-1}"
 LLM_ONLY=0
 
 MICRO_BATCH_SIZE=1
