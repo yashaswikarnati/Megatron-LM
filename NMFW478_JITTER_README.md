@@ -21,20 +21,17 @@ sbatch directly from here.
 
 Both go to `coreai_dlalgo_llm` partition (use `-A coreai_dlalgo_llm` for better fair-share).
 
-## Baseline launch — best-known config
+## Baseline launch
 
-From the synced repo path:
+From the synced repo path, just sbatch — best-known knobs are already
+the script defaults (`NUM_WORKERS=4`, `HETERO_DISABLE_AUTO_GC=1`,
+`HETERO_GC_INTERVAL=30`, `DDP_NUM_BUCKETS=4`, `NCCL_PROTO=LL128`):
 
 ```
-NUM_WORKERS=4 \
-HETERO_DISABLE_AUTO_GC=1 \
-HETERO_GC_INTERVAL=30 \
-DDP_NUM_BUCKETS=4 \
-NCCL_PROTO=LL128 \
-sbatch -A coreai_dlalgo_llm \
-  --export=ALL,NUM_WORKERS=4,HETERO_DISABLE_AUTO_GC=1,HETERO_GC_INTERVAL=30,DDP_NUM_BUCKETS=4,NCCL_PROTO=LL128 \
-  examples/mimo/scripts/cw-dfw/sbatch_hetero_jitter_gbs768_34n_cw.sh
+sbatch -A coreai_dlalgo_llm examples/mimo/scripts/cw-dfw/sbatch_hetero_jitter_gbs768_34n_cw.sh
 ```
+
+For 9n: same command, swap the script name.
 
 Replace the script path with the 9n one for 9-node runs. 9n defaults to `LLM_TP=2, LLM_DP=32, LLM_EP=8` matching 34n's MoE topology.
 
