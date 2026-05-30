@@ -72,6 +72,28 @@ def run_train_loop(args: argparse.Namespace) -> None:
 
         debug_rank("building MIMO model")
         model = build_mimo_runtime(args, topology)
+        # Print per-rank parameter count so we have ground truth for NCCL
+        # back-of-envelope math (per-GPU bytes shipped in allgather/reducescatter).
+        try:
+            local_total = sum(p.numel() for p in model.parameters())
+            local_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(
+                f"[rank {torch.distributed.get_rank()}] "
+                f"local_params total={local_total:,} ({local_total/1e9:.3f}B) "
+                f"trainable={local_trainable:,} ({local_trainable/1e9:.3f}B)",
+                flush=True,
+            )
+            # Cross-rank aggregate so we can also see total cluster params.
+            t = torch.tensor([local_total, local_trainable], device="cuda", dtype=torch.int64)
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+            print_rank_0(
+                f"GLOBAL params: total_sum_across_ranks={t[0].item():,} "
+                f"({t[0].item()/1e9:.2f}B) trainable_sum={t[1].item():,} "
+                f"({t[1].item()/1e9:.2f}B)  [sum is NOT model size — each shard"
+                f" counted by its owner; useful for sanity-checking sharding]"
+            )
+        except Exception as _e:
+            debug_rank(f"param count print failed: {_e}")
         debug_rank("configuring gradient sync")
         configure_grad_sync(args, model, topology)
 
