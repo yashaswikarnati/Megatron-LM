@@ -100,7 +100,8 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     grid.create_pg(["tp", "pp"])
     grid.create_pg(["tp", "ep", "pp"])
     grid.create_pg(["dp", "ep"])
-    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+    # Dense distributed-optimizer grad-stats group (excludes the expert ep axis).
+    grid.create_pg(["tp", "cp", "dp", "pp"])
     _active_grids.append(grid)
     return grid
 
