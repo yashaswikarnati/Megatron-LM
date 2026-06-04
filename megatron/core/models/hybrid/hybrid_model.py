@@ -12,7 +12,11 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
-from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.common.language_module.language_module import (
+    LanguageModule,
+    ce_pg_debug_enabled,
+    describe_pg,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -601,6 +605,44 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
+
+        # DIAGNOSTIC (CE-loss process-group investigation): the logits were
+        # sharded over `self.output_layer.tp_group` (which ColumnParallelLinear
+        # canonicalizes via get_tensor_model_parallel_group_if_none). The fused CE
+        # will instead reduce over `self.pg_collection.tp` (raw). If these two
+        # groups disagree, the vocab-parallel reduction does not match the
+        # vocab-parallel sharding and the loss is silently wrong. No-op unless
+        # MCORE_CE_PG_DEBUG=1.
+        if ce_pg_debug_enabled() and not getattr(self, "_hybrid_ce_pg_logged", False):
+            self._hybrid_ce_pg_logged = True
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            out_tp_group = getattr(self.output_layer, "tp_group", None)
+            ce_tp_group = self.pg_collection.tp
+            try:
+                out_ranks = (
+                    None
+                    if out_tp_group is None
+                    else torch.distributed.get_process_group_ranks(out_tp_group)
+                )
+                ce_ranks = (
+                    None
+                    if ce_tp_group is None
+                    else torch.distributed.get_process_group_ranks(ce_tp_group)
+                )
+                groups_agree = out_ranks == ce_ranks
+            except Exception:  # pragma: no cover - diagnostic best-effort
+                groups_agree = "<unavailable>"
+            logger.warning(
+                "[CE-PG-DEBUG] hybrid_model.forward rank=%d\n"
+                "  output_layer.tp_group (logits SHARDED over): %s\n"
+                "  pg_collection.tp      (fused CE REDUCES over): %s\n"
+                "  sharding_matches_reduction=%s  logits.shape=%s",
+                rank,
+                describe_pg(out_tp_group),
+                describe_pg(ce_tp_group),
+                groups_agree,
+                tuple(logits.shape),
+            )
 
         loss = self.compute_language_model_loss(labels, logits)
 

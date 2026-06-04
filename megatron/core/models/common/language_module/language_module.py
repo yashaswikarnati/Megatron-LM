@@ -33,6 +33,128 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
 )
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# DIAGNOSTIC INSTRUMENTATION  (CE-loss process-group investigation)
+#
+# Enable with environment variable  MCORE_CE_PG_DEBUG=1.
+# Logs (once per (call-site, rank)) the tensor-parallel group actually handed
+# to the cross-entropy loss and compares it against the global parallel_state
+# TP group.
+#
+# Why this matters: the *fused* CE (fused_vocab_parallel_cross_entropy /
+# te_parallel_cross_entropy) derives BOTH the vocab partition range
+# (tp_group.rank()/size()) AND the all-reduce group *solely* from the passed-in
+# group. The *non-fused* CE (vocab_parallel_cross_entropy) ignores any passed
+# group and re-queries parallel_state. Therefore, if `pg_collection.tp` is ever
+# None or a wrong group while parallel_state's TP group is correct, turning
+# `--cross-entropy-loss-fusion` on/off silently changes the loss. This logger
+# surfaces exactly that mismatch.
+#
+# Remove this block (and its call sites) once the investigation is closed.
+# ---------------------------------------------------------------------------
+_CE_PG_DEBUG_LOGGED = set()
+
+
+def ce_pg_debug_enabled() -> bool:
+    """True when CE process-group diagnostics are enabled via env var."""
+    return os.environ.get("MCORE_CE_PG_DEBUG", "0") == "1"
+
+
+def describe_pg(pg) -> str:
+    """One-line, exception-safe description of a process group."""
+    if pg is None:
+        return "None"
+    try:
+        ranks = torch.distributed.get_process_group_ranks(pg)
+    except Exception:  # pragma: no cover - diagnostic best-effort
+        ranks = "<unavailable>"
+    try:
+        return f"id=0x{id(pg):x} size={pg.size()} rank={pg.rank()} global_ranks={ranks}"
+    except Exception:  # pragma: no cover - diagnostic best-effort
+        return f"id=0x{id(pg):x} <introspection-failed>"
+
+
+def log_ce_pg_diagnostics(tag, raw_tp_group, canonical_tp_group, logits, labels, config) -> None:
+    """Compare the group fused CE will use against parallel_state's TP group.
+
+    Args:
+        tag: call-site identifier (so multiple sites don't dedup against each other).
+        raw_tp_group: the value actually passed to the fused CE (``pg_collection.tp``).
+        canonical_tp_group: the canonicalized group the rest of the module uses
+            (``self.tp_group`` = ``get_tensor_model_parallel_group_if_none(...)``).
+        logits, labels: tensors entering the loss (shapes/dtype logged).
+        config: model config (fusion flags logged).
+    """
+    if not ce_pg_debug_enabled():
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    key = (tag, rank)
+    if key in _CE_PG_DEBUG_LOGGED:
+        return
+    _CE_PG_DEBUG_LOGGED.add(key)
+
+    try:
+        ps_tp = parallel_state.get_tensor_model_parallel_group(check_initialized=False)
+    except Exception:  # pragma: no cover - diagnostic best-effort
+        ps_tp = None
+
+    def _ranks(pg):
+        if pg is None:
+            return None
+        try:
+            return torch.distributed.get_process_group_ranks(pg)
+        except Exception:  # pragma: no cover - diagnostic best-effort
+            return "<unavailable>"
+
+    raw_ranks, canon_ranks, ps_ranks = (
+        _ranks(raw_tp_group),
+        _ranks(canonical_tp_group),
+        _ranks(ps_tp),
+    )
+    # As of the fix, the fused CE consumes the *canonical* self.tp_group, so that
+    # is the group whose agreement with parallel_state determines correctness.
+    fused_matches_parallel_state = canon_ranks == ps_ranks
+    raw_matches_canonical = raw_ranks == canon_ranks
+
+    logger.warning(
+        "[CE-PG-DEBUG] %s rank=%d fusion=%s/%s\n"
+        "  raw pg_collection.tp                  : %s\n"
+        "  canonical self.tp_group (USED BY FUSED CE): %s\n"
+        "  parallel_state TP group (used by non-fused CE): %s\n"
+        "  fused_matches_parallel_state=%s  raw_matches_canonical=%s\n"
+        "  logits.shape=%s logits.dtype=%s labels.shape=%s",
+        tag,
+        rank,
+        getattr(config, 'cross_entropy_loss_fusion', None),
+        getattr(config, 'cross_entropy_fusion_impl', None),
+        describe_pg(raw_tp_group),
+        describe_pg(canonical_tp_group),
+        describe_pg(ps_tp),
+        fused_matches_parallel_state,
+        raw_matches_canonical,
+        tuple(logits.shape),
+        logits.dtype,
+        tuple(labels.shape),
+    )
+    if not raw_matches_canonical:
+        logger.warning(
+            "[CE-PG-DEBUG] %s rank=%d NOTE: raw pg_collection.tp != canonical self.tp_group "
+            "(raw=%s). Pre-fix this would have corrupted the fused loss; the fix routes "
+            "the canonical group to the fused CE so it now matches the output-layer sharding.",
+            tag,
+            rank,
+            "None" if raw_tp_group is None else "wrong-group",
+        )
+    elif not fused_matches_parallel_state:
+        logger.warning(
+            "[CE-PG-DEBUG] %s rank=%d MISMATCH: fused CE reduces over a DIFFERENT group "
+            "than the non-fused CE (parallel_state). Loss will change when fusion is toggled.",
+            tag,
+            rank,
+        )
+
 
 class LanguageModule(MegatronModule):
     """Base language module that has common helper functions used across GPT, BERT etc.
@@ -153,6 +275,17 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
+        # DIAGNOSTIC (CE-loss process-group investigation): surface the group the
+        # fused CE will use vs. parallel_state / the canonicalized self.tp_group.
+        # No-op unless MCORE_CE_PG_DEBUG=1. Remove with the helper block above.
+        log_ce_pg_diagnostics(
+            "language_module.compute_language_model_loss",
+            self.pg_collection.tp,
+            self.tp_group,
+            logits,
+            labels,
+            self.config,
+        )
         if self.config.cross_entropy_loss_fusion:
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
@@ -173,12 +306,12 @@ class LanguageModule(MegatronModule):
                         )
 
                     loss = te_parallel_cross_entropy(
-                        logits, labels, self.pg_collection.tp, is_cg_capturable
+                        logits, labels, self.tp_group, is_cg_capturable
                     )
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
-                loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
+                loss = fused_vocab_parallel_cross_entropy(logits, labels, self.tp_group)
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 
