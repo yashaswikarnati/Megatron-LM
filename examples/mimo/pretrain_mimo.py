@@ -310,6 +310,27 @@ def _install_mimo_grad_finalize(model) -> None:
     training_module.finalize_model_grads = mimo_finalize
 
 
+def _install_safe_flops() -> None:
+    """Neutralize stock throughput/FLOPs accounting for the hetero MIMO model.
+
+    ``num_floating_point_operations`` derives a single homogeneous model's FLOPs
+    from the global (language) args and runs on every rank. That is ill-defined
+    for the disjoint encoder(RADIO)+language(hybrid-MoE) layout: encoder ranks
+    IndexError parsing the language MoE/hybrid pattern, and the hybrid path trips
+    on MTP. FLOPs/throughput is cosmetic for the smoke milestone, so wrap it to
+    return 0 on failure. TODO(NMFW-516): proper per-module hetero FLOPs accounting.
+    """
+    _orig = training_module.num_floating_point_operations
+
+    def _safe(*args, **kwargs):
+        try:
+            return _orig(*args, **kwargs)
+        except Exception:
+            return 0
+
+    training_module.num_floating_point_operations = _safe
+
+
 def _set_mpu_data_parallel_world_size(args: argparse.Namespace) -> None:
     """Pin the MPU DP world size to llm_dp for train()'s sample accounting.
 
@@ -350,6 +371,9 @@ def main() -> None:
 
     # Keep the MIMO grad-finalization hook alive past stock train()'s reassign.
     _install_mimo_grad_finalize(rt.model)
+
+    # Neutralize stock FLOPs/throughput accounting (ill-defined for the hetero model).
+    _install_safe_flops()
 
     # Bookkeeping fields stock train() reads that setup_model_and_optimizer /
     # the dataset builder would normally set.
