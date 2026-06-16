@@ -146,6 +146,13 @@ class BridgeCommunicator:
             self.src_grid_broadcast_ranks = next(
                 (ranks for ranks in src_grid_broadcast_ranks_list if self.current_rank in ranks), []
             )
+            # Eagerly init this rank's src broadcast subgroup while all its members
+            # are synchronized at construction, so the first schedule-time
+            # ``dist.broadcast`` does not pay a lazy NCCL-init rendezvous. The
+            # barrier is scoped to the subgroup this rank belongs to; non-members
+            # (empty src_grid_broadcast_ranks) must not enter it.
+            if self.src_grid_broadcast_ranks:
+                dist.barrier(group=self.src_grid_broadcast_pg)
 
         self.dest_grid_broadcast_ranks = []
         if dest_grid_broadcast_ranks_list:
@@ -156,6 +163,10 @@ class BridgeCommunicator:
                 (ranks for ranks in dest_grid_broadcast_ranks_list if self.current_rank in ranks),
                 [],
             )
+            # Same eager init for this rank's dest broadcast subgroup. Gated on
+            # membership so non-members do not enter the subgroup-scoped barrier.
+            if self.dest_grid_broadcast_ranks:
+                dist.barrier(group=self.dest_grid_broadcast_pg)
 
         self.src_tp_leaders, self.src_local_leader_rank = self.get_leader_rank(
             self.src_grid, is_src=True
@@ -201,11 +212,39 @@ class BridgeCommunicator:
 
     @classmethod
     def _get_or_create_broadcast_pg(cls, ranks_list: List[List[int]]):
-        """Get or create a broadcast PG, caching to avoid duplicate NCCL communicators."""
+        """Get or create a broadcast PG, caching to avoid duplicate NCCL communicators.
+
+        The broadcast PGs (src_grid_broadcast_pg / dest_grid_broadcast_pg) only ever
+        carry ``dist.broadcast`` traffic. Like the bridge PG, a NCCL PG first touched
+        by a collective is initialized lazily, and that lazy init is itself a
+        collective over all members. In the 1F1B schedule the broadcast members
+        (a leader plus its broadcast peers) reach their first ``dist.broadcast`` at
+        desynchronized points across the warmup/steady skew, so the lazy init
+        rendezvous can stall and surface as a hang inside ``dist.broadcast`` (the
+        NCCL bootstrap broadcast).
+
+        Mirror the bridge-PG treatment: build the subgroups with explicit per-group
+        ``new_group`` calls binding ``device_id`` so each NCCL communicator is
+        initialized eagerly inside the (world-collective) creation, rather than
+        lazily mid-schedule. Every world rank calls ``new_group`` for every subgroup
+        in the same deterministic order (replicating ``new_subgroups_by_enumeration``
+        semantics), so creation stays a symmetric world collective; only the
+        member-scoped barrier in ``__init__`` is gated on membership.
+        """
         cache_key = str(sorted([tuple(r) for r in ranks_list]))
         if cache_key not in cls._broadcast_pg_cache:
-            pg, _ = dist.new_subgroups_by_enumeration(ranks_list, backend='nccl')
-            cls._broadcast_pg_cache[cache_key] = pg
+            device_id = None
+            if torch.cuda.is_available():
+                device_id = torch.device('cuda', torch.cuda.current_device())
+            current_rank = dist.get_rank()
+            cur_subgroup = None
+            # Every world rank must call new_group for every subgroup, in the same
+            # order, even when it is not a member (the call is a world collective).
+            for ranks in ranks_list:
+                subgroup = dist.new_group(ranks=ranks, backend='nccl', device_id=device_id)
+                if current_rank in ranks:
+                    cur_subgroup = subgroup
+            cls._broadcast_pg_cache[cache_key] = cur_subgroup
         return cls._broadcast_pg_cache[cache_key]
 
     @classmethod
