@@ -107,6 +107,7 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 )
 from examples.mimo.training.args import add_hetero_grid_args, validate_hetero_grid_args
 from examples.mimo.training.bootstrap import build_mimo_runtime
+from examples.mimo.training.data import add_data_args
 from examples.mimo.training.distributed import (
     initialize_distributed,
     print_rank_0,
@@ -140,6 +141,7 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     """
     parser = add_model_provider_args(parser)
     parser = add_hetero_grid_args(parser)
+    parser = add_data_args(parser)
     parser.add_argument(
         "--num-microbatches",
         type=int,

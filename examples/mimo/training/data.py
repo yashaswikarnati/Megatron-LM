@@ -14,9 +14,25 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 
 
+def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Register the MIMO data-selection args (stock extra_args_provider compatible).
+
+    Only the mock provider is supported for now; energon/mistral backends are
+    deferred to a later PR.
+    """
+    group = parser.add_argument_group("mimo data")
+    group.add_argument(
+        "--dataset-provider",
+        choices=["mock"],
+        default="mock",
+        help="Which MIMO dataset backend to build (mock only for now).",
+    )
+    return parser
+
+
 def select_data_iterator(args: argparse.Namespace, topology: HeteroTopology) -> Optional[object]:
     """Create the per-role data iterator this rank needs, or None if it consumes no data."""
-    if args.dataset_provider != "mock":
+    if getattr(args, "dataset_provider", "mock") != "mock":
         # Energon/mistral provider backends are deferred to a later PR.
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
     return select_mock_data_iterator(args, topology)
