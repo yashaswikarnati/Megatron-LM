@@ -59,6 +59,7 @@ from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -579,12 +580,16 @@ def iter_vision_projection_modules(vision_submodule):
 
 def nemotron_projection_layer_spec() -> ModuleSpec:
     """Return the Nemotron VLM RADIO-to-language projector layer spec."""
-    if TELayerNormColumnParallelLinear is None or TERowParallelLinear is None:
-        raise RuntimeError("TELayerNormColumnParallelLinear and TERowParallelLinear are required")
+    if TERowParallelLinear is None:
+        raise RuntimeError("TERowParallelLinear is required")
+    # MultimodalProjector's "affine" path instantiates linear_fc1 with
+    # gather_output=True, which TE column-parallel linears reject. Use the core
+    # ColumnParallelLinear for fc1 (matches pre-vlm-07, whose MultimodalProjector
+    # hardcoded ColumnParallelLinear for the affine projector).
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            linear_fc1=ColumnParallelLinear, linear_fc2=TERowParallelLinear
         ),
     )
 
