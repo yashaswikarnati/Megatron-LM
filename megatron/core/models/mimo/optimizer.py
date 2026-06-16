@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -183,6 +184,20 @@ class MimoOptimizer(MegatronOptimizer):
                     _extract_param_groups(sub_sd, name, suffix, replica_id)
                     _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
+
+                # Namespace every internal ShardedBase key with the submodule name
+                # so two module optimizers (e.g. 'language' + the encoder) don't
+                # collide on identical inner DistributedOptimizer keys like
+                # 'chained_0.optimizer.distributed.dp_group_idx_0.optimizer/shard_0_1',
+                # 'per_bucket_numel', 'per_bucket_numel_unpadded'. On encoder-grid
+                # ranks these name the encoder optimizer; on language-grid ranks the
+                # SAME key names the language optimizer, so in the global world union
+                # they would duplicate and fail validate_sharding_integrity. The
+                # extract helpers above already namespace param_groups / grad_scaler /
+                # param_state_sharding_type; this covers the optimizer's MAIN state.
+                # Load applies the identical prefix (MimoOptimizer.sharded_state_dict
+                # runs with is_loading=True), so save/load keys stay symmetric.
+                add_prefix_for_sharding(module_sd, f'mimo.{name}.')
 
                 sharded_state[name] = module_sd
             else:
