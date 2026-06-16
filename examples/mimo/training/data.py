@@ -111,6 +111,14 @@ class MockVLMIterator:
         self.encoder_name = encoder_name
         self.image_seq_length = args.image_seq_length or args.seq_length // 2
         self.vision_encoder_key = getattr(args, "vision_encoder_key", "clip_encoder")
+        # Pixel-input encoders (e.g. the Nemotron RADIO provider sets
+        # ``vision_input_mode="pixels"``) take a raw image tensor as the
+        # positional ``x`` arg of their wrapper's forward. Hidden-state encoders
+        # (the CLIP/mock path) instead receive a precomputed ``hidden_states``
+        # tensor. Feeding the wrong key/shape makes ``ModalitySubmodules.encode``
+        # call the encoder with kwargs its forward never accepts, which aborts
+        # the encoder forward before it reaches send_forward.
+        self.vision_input_mode = getattr(args, "vision_input_mode", "hidden_states")
         self.dtype = torch.float32 if args.fp32 else torch.bfloat16
         self.generator = torch.Generator(device="cuda")
         self.generator.manual_seed(seed)
@@ -140,22 +148,45 @@ class MockVLMIterator:
         labels[:, :-1] = input_ids[:, 1:]
         labels[(labels == args.image_token_id)] = -100
         loss_mask = (labels != -100).to(dtype=torch.float32)
-        encoder_hidden_states = torch.randn(
-            self.image_seq_length,
-            self.micro_batch_size,
-            args.hidden_size,
-            device="cuda",
-            dtype=self.dtype,
-            generator=self.generator,
-        )
         modality_inputs = {}
         if self.encoder_name is not None:
-            modality_inputs[self.encoder_name] = {
-                self.vision_encoder_key: {
-                    "hidden_states": encoder_hidden_states,
-                    "attention_mask": None,
+            if self.vision_input_mode == "pixels":
+                # Pixel encoders (RADIO) take a positional ``x`` image tensor of
+                # shape (micro_batch_size * num_image_tiles, 3, img_h, img_w);
+                # the wrapper's forward computes the image-token embeddings.
+                num_image_tiles = getattr(args, "num_image_tiles", 1)
+                encoder_inputs = {
+                    self.vision_encoder_key: {
+                        "x": torch.randn(
+                            self.micro_batch_size * num_image_tiles,
+                            3,
+                            args.img_h,
+                            args.img_w,
+                            device="cuda",
+                            dtype=self.dtype,
+                            generator=self.generator,
+                        )
+                    }
                 }
-            }
+            else:
+                # Hidden-state encoders (CLIP/mock) consume a precomputed
+                # encoder hidden-state tensor of shape (image_seq_length,
+                # micro_batch_size, hidden_size).
+                encoder_hidden_states = torch.randn(
+                    self.image_seq_length,
+                    self.micro_batch_size,
+                    args.hidden_size,
+                    device="cuda",
+                    dtype=self.dtype,
+                    generator=self.generator,
+                )
+                encoder_inputs = {
+                    self.vision_encoder_key: {
+                        "hidden_states": encoder_hidden_states,
+                        "attention_mask": None,
+                    }
+                }
+            modality_inputs[self.encoder_name] = encoder_inputs
         return {
             "input_ids": input_ids,
             "labels": labels,
