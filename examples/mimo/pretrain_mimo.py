@@ -320,6 +320,14 @@ def _set_mpu_data_parallel_world_size(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """Program entrypoint: stock-args MIMO run on the stock train() loop."""
+    if os.environ.get("MIMO_BRIDGE_DEBUG"):
+        import logging
+
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format=f"[rank{os.environ.get('RANK', '?')}] %(message)s",
+            force=True,
+        )
     args = _parse_and_validate()
 
     # Non-MPU global setup, then torch.distributed bring-up (no MPU init).
