@@ -2391,8 +2391,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if is_last_stage:
-        # Average loss across microbatches.
+    if is_last_stage and losses_reduced:
+        # Average loss across microbatches. ``losses_reduced`` is empty on ranks
+        # that produce no loss (e.g. MIMO encoder-grid ranks, which are their own
+        # module's last PP stage but never compute the language loss), so guard the
+        # ``losses_reduced[0]`` access.
         loss_reduced = {}
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]

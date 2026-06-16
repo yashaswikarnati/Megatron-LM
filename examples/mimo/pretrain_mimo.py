@@ -375,6 +375,14 @@ def main() -> None:
     # Neutralize stock FLOPs/throughput accounting (ill-defined for the hetero model).
     _install_safe_flops()
 
+    # Pin this rank's parallel_state model-parallel group to its module's mp group so
+    # stock training_log's cosmetic mp-group reductions (e.g. the LR gather in
+    # reduce_max_stat_across_model_parallel_group) work without full mpu init. The
+    # MIMO schedule/grad reductions use the threaded pg_collection; this only
+    # satisfies stock logging-path reads of mpu.get_model_parallel_group().
+    if getattr(rt.pg_collection, "mp", None) is not None:
+        parallel_state._MODEL_PARALLEL_GROUP = rt.pg_collection.mp
+
     # Bookkeeping fields stock train() reads that setup_model_and_optimizer /
     # the dataset builder would normally set.
     args.iteration = 0
