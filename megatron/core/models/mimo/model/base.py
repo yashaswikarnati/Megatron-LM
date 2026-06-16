@@ -418,9 +418,25 @@ class MimoModel(MegatronModule):
                 packing_kwargs,
             )
 
+        import os as _os
+
+        _dbg = bool(_os.environ.get("MIMO_BRIDGE_DEBUG"))
+        _r = _os.environ.get("RANK", "?")
+        if _dbg:
+            print(
+                f"[rank{_r}] MimoModel.forward mode={self.role.mode} "
+                f"has_modality={self.role.has_modality_modules} has_lang={self.role.has_language_module}",
+                flush=True,
+            )
+
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
-                return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
+                if _dbg:
+                    print(f"[rank{_r}] -> _forward_encoders", flush=True)
+                _enc_out = self._forward_encoders(input_ids, modality_inputs, input_tensors)
+                if _dbg:
+                    print(f"[rank{_r}] <- _forward_encoders done keys={list(_enc_out.keys())}", flush=True)
+                return _enc_out, loss_mask
 
             if self.role.has_language_module:
                 return self._forward_language_module(
@@ -461,7 +477,23 @@ class MimoModel(MegatronModule):
             submodule = self.modality_submodules[encoder_name]
             encoder_inputs = modality_inputs.get(encoder_name) if modality_inputs else None
             hidden_states = input_tensors.get(encoder_name) if input_tensors else None
+            import os as _os
+
+            if _os.environ.get("MIMO_BRIDGE_DEBUG"):
+                _r = _os.environ.get("RANK", "?")
+                _ek = list(encoder_inputs.keys()) if isinstance(encoder_inputs, dict) else encoder_inputs
+                print(
+                    f"[rank{_r}] encode '{encoder_name}': enc_inputs={_ek} "
+                    f"hidden={None if hidden_states is None else tuple(hidden_states.shape)} -> calling submodule.forward",
+                    flush=True,
+                )
             output = submodule.forward(encoder_inputs=encoder_inputs, hidden_states=hidden_states)
+            if _os.environ.get("MIMO_BRIDGE_DEBUG"):
+                print(
+                    f"[rank{_os.environ.get('RANK', '?')}] encode '{encoder_name}' DONE "
+                    f"out={None if output is None else tuple(output.shape)}",
+                    flush=True,
+                )
             if output is None and encoder_inputs is None and hidden_states is None:
                 if self._has_encoder_tokens(input_ids, encoder_name):
                     raise RuntimeError(

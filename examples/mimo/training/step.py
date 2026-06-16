@@ -85,8 +85,20 @@ def mimo_forward_step(data_iterator, model):
 
     Returns ``(output_tensor, loss_func_closure)`` as the schedule expects.
     """
+    import os as _os
+
+    _dbg = bool(_os.environ.get("MIMO_BRIDGE_DEBUG"))
+    _r = _os.environ.get("RANK", "?")
+    if _dbg:
+        print(f"[rank{_r}] STEP: pulling batch (iter={'None' if data_iterator is None else 'set'})", flush=True)
     batch = next(data_iterator) if data_iterator is not None else {"input_ids": None}
+    if _dbg:
+        _keys = list(batch.keys()) if isinstance(batch, dict) else type(batch).__name__
+        _mi = batch.get("modality_inputs") if isinstance(batch, dict) else None
+        print(f"[rank{_r}] STEP: got batch keys={_keys} modality={list(_mi.keys()) if _mi else _mi}", flush=True)
     batch = move_batch_to_cuda(batch)
+    if _dbg:
+        print(f"[rank{_r}] STEP: batch on cuda, calling model(**batch)", flush=True)
 
     # Tag per-rank modality participation before the model forward so the
     # grad-finalization hook can correct encoder grads for partial DP
@@ -102,6 +114,8 @@ def mimo_forward_step(data_iterator, model):
         pass
 
     output_tensor, loss_mask = model(**batch)
+    if _dbg:
+        print(f"[rank{_r}] STEP: model(**batch) RETURNED output={type(output_tensor).__name__}", flush=True)
     return output_tensor, partial(loss_func, loss_mask=loss_mask)
 
 
