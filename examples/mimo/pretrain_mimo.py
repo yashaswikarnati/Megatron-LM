@@ -331,61 +331,291 @@ def _install_safe_flops() -> None:
     training_module.num_floating_point_operations = _safe
 
 
-def _install_per_branch_rng_keying(topology) -> None:
-    """Namespace the RNG ShardedObject key per MIMO branch to avoid cross-grid collision.
+def _mimo_branch_name(topology) -> str:
+    """Return this rank's MIMO branch name ("language" or the encoder grid name).
 
-    Stock ``get_rng_state`` builds a single ``ShardedObject('rng_state', ...,
-    (pp_size, tp_size), (pp_rank, tp_rank), replica_id=dp_rank)`` keyed on the
-    rank's pinned parallel_state (pp, tp) groups. In the disjoint hetero layout the
-    encoder grid and the language grid can have the SAME (pp, tp) factorization
-    (e.g. both tp2/pp1), so encoder-rank (pp=0,tp=0,dp=0) and language-rank
-    (pp=0,tp=0,dp=0) would emit ShardedObjects with an IDENTICAL key, global offset,
-    and replica_id but DIFFERENT RNG payloads. torch_dist treats those as replicas
-    of one object: one branch's RNG silently overwrites the other's at save, and at
-    load both branches restore the same (wrong-for-one-branch) RNG.
-
-    Mirroring the prototype's ``checkpointing.py::_collect_rng_state`` per-branch key
-    namespacing, we wrap stock ``get_rng_state`` so each branch publishes its RNG
-    under ``mimo.<branch>.rng_state`` instead of the bare ``rng_state``. The two
-    branches then live under distinct keys and round-trip independently. On load,
-    stock ``load_checkpoint`` requests the same per-branch key (the wrapper is
-    installed before train(), which owns both save and load), so resume restores
-    each branch's own RNG.
+    Uses grid membership (the same source of truth bootstrap.py uses) to namespace
+    per-branch checkpoint state (e.g. the RNG ShardedObject key).
     """
-    from megatron.core.dist_checkpointing.mapping import ShardedObject
     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
-    # Determine this rank's branch name from grid membership (the same source of
-    # truth bootstrap.py uses). Language ranks key on "language"; encoder ranks key
-    # on the encoder grid name.
     if topology.grids[MIMO_LANGUAGE_MODULE_KEY].is_current_rank_in_grid():
-        branch_name = "language"
-    else:
-        branch_name = next(
-            (
-                name
-                for name, grid in topology.grids.items()
-                if name != MIMO_LANGUAGE_MODULE_KEY and grid.is_current_rank_in_grid()
-            ),
-            "language",
-        )
+        return "language"
+    return next(
+        (
+            name
+            for name, grid in topology.grids.items()
+            if name != MIMO_LANGUAGE_MODULE_KEY and grid.is_current_rank_in_grid()
+        ),
+        "language",
+    )
+
+
+def _install_mimo_checkpointing(topology) -> None:
+    """Replace stock save_checkpoint / load_checkpoint with a hetero-symmetric path.
+
+    Why stock save_checkpoint hangs in a WORLD collective
+    =====================================================
+    Stock ``save_checkpoint`` (with the default ``--ckpt-fully-parallel-save``)
+    wraps the torch_dist save strategy in ``FullyParallelSaveStrategyWrapper`` keyed
+    on ``mpu.get_data_parallel_group(with_context_parallel=True)`` -- which, after
+    the entry pins parallel_state to this rank's own grid, is only the rank's own
+    2-rank branch DP group. ``apply_saving_parallelization`` then exchanges the save
+    distribution over that per-branch DP group while the underlying torch DCP save
+    planner runs its coordination collectives (gather_object / all_reduce / broadcast
+    in state_dict_saver.py) over the WORLD default group. Layering a per-branch
+    distribution under world-level DCP coordination across two structurally-different
+    grids (encoder ranks contribute a RADIO encoder sharded dict; language ranks a
+    Mamba LM + dist-optimizer sharded dict) desynchronizes the world collective:
+    the watchdog fires on a fixed-size ALLGATHER on default_pg that not all 8 ranks
+    reach symmetrically.
+
+    The prototype's approach (the fix)
+    ==================================
+    ``examples/mimo/training/hetero/checkpointing.py`` does NOT use stock
+    save_checkpoint. It assembles ONE unified sharded state dict (model + optimizer +
+    scheduler + per-branch RNG) and calls ``dist_checkpointing.save`` DIRECTLY with
+    the default (plain) ``TorchDistSaveShardedStrategy`` -- no FullyParallel DP-group
+    wrapper. Every rank contributes only its own branch's shards, but the GLOBAL set
+    of ShardedTensors/ShardedObjects is the symmetric union, and ALL coordination
+    (``determine_global_metadata``'s world ``all_gather_object`` and the DCP planner's
+    world collectives) runs over the world group symmetrically. Variable per-rank
+    metadata is exactly what ``all_gather_object`` is built to handle, so disjoint
+    per-branch structure is fine as long as no per-DP-group fully-parallel wrapper is
+    interposed.
+
+    This installer ports that approach onto the stock train() loop while reusing
+    stock ``generate_state_dict`` (which already produces per-rank-symmetric model /
+    optimizer / scheduler sharded dicts, and -- with args.use_distributed_optimizer
+    pinned True -- selects the ``dp_reshardable`` optimizer format). It monkeypatches
+    the ``save_checkpoint`` / ``load_checkpoint`` symbols imported into
+    ``megatron.training.training`` so train() drives the hetero-symmetric path.
+    """
+    import os
 
     import megatron.training.checkpointing as ckpt_module
+    from megatron.core import dist_checkpointing
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
+    from megatron.core.dist_checkpointing.utils import _clean_metadata_for_serialization
+    from megatron.training.checkpointing import (
+        _build_sharded_state_dict_metadata,
+        generate_state_dict,
+        get_rng_state,
+    )
 
-    _orig_get_rng_state = ckpt_module.get_rng_state
-    key = f"mimo.{branch_name}.rng_state"
+    branch_name = _mimo_branch_name(topology)
+    _TRACKER = "latest_checkpointed_iteration.txt"
 
-    def _branch_keyed_get_rng_state(*args, **kwargs):
-        rng = _orig_get_rng_state(*args, **kwargs)
-        # torch_dist path returns a ShardedObject keyed 'rng_state'; rewrite its key
-        # so the two branches don't collide. Other ckpt formats are pass-through.
+    def _iter_dir(root, iteration):
+        return os.path.join(root, f"iter_{iteration:07d}")
+
+    def _tracker_path(root):
+        return os.path.join(root, _TRACKER)
+
+    def _branch_keyed_rng_state(ckpt_format):
+        """Per-branch RNG ShardedObject to avoid cross-grid key collision.
+
+        Stock ``get_rng_state`` keys a single ``ShardedObject('rng_state', ...,
+        (pp,tp), (pp_rank,tp_rank), replica_id=dp_rank)`` on the rank's pinned
+        parallel_state groups. The encoder and language grids can share a (pp,tp)
+        factorization, so their RNG objects would collide on an identical
+        key+offset+replica_id with different payloads. Rewrite the key to
+        ``mimo.<branch>.rng_state`` (mirrors the prototype's _collect_rng_state) so
+        the two branches round-trip independently.
+        """
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        rng = get_rng_state(ckpt_format, tp_group, pp_group)
         if isinstance(rng, ShardedObject):
+            key = f"mimo.{branch_name}.rng_state"
             rng = ShardedObject(
                 key, rng.data, rng.global_shape, rng.global_offset, replica_id=rng.replica_id
             )
         return rng
 
-    ckpt_module.get_rng_state = _branch_keyed_get_rng_state
+    def _mimo_save_checkpoint(
+        iteration,
+        model,
+        optimizer,
+        opt_param_scheduler,
+        num_floating_point_operations_so_far,
+        checkpointing_context=None,
+        non_persistent_ckpt=False,
+        train_data_iterator=None,
+        preprocess_common_state_dict_fn=None,
+        **_unused,
+    ):
+        from megatron.training.global_vars import get_args
+
+        args = get_args()
+        if not args.save:
+            return
+        assert (
+            args.ckpt_format == "torch_dist"
+        ), f"hetero MIMO checkpointing supports only --ckpt-format torch_dist, got {args.ckpt_format}"
+
+        target_dir = _iter_dir(args.save, iteration)
+        if torch.distributed.get_rank() == 0:
+            os.makedirs(target_dir, exist_ok=True)
+        torch.distributed.barrier()
+
+        print_rank_0(f"saving hetero MIMO checkpoint at iteration {iteration} to {target_dir}")
+
+        rng_state = None if args.no_save_rng else _branch_keyed_rng_state(args.ckpt_format)
+        sharded_sd_metadata = _build_sharded_state_dict_metadata(args)
+        state_dict = generate_state_dict(
+            args,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            rng_state,
+            iteration=iteration,
+            optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+        )
+        state_dict["num_floating_point_operations_so_far"] = num_floating_point_operations_so_far
+
+        # Default strategy => plain TorchDistSaveShardedStrategy: world-symmetric
+        # coordination, NO FullyParallel DP-group wrapper. This is the key to
+        # coordinating the disjoint encoder/language grids (see installer docstring).
+        dist_checkpointing.save(
+            state_dict,
+            target_dir,
+            content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
+        )
+
+        if torch.distributed.get_rank() == 0:
+            tmp = _tracker_path(args.save) + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(str(iteration))
+            os.replace(tmp, _tracker_path(args.save))
+        torch.distributed.barrier()
+        print_rank_0(f"hetero MIMO checkpoint at iteration {iteration} saved")
+
+    def _read_tracker(load_root):
+        tracker = _tracker_path(load_root)
+        local_iter = -1
+        if os.path.isfile(tracker):
+            with open(tracker) as f:
+                contents = f.read().strip()
+            if contents:
+                local_iter = int(contents)
+        iters = torch.tensor([local_iter], dtype=torch.long, device="cuda")
+        torch.distributed.all_reduce(iters, op=torch.distributed.ReduceOp.MAX)
+        max_iter = int(iters.item())
+        return max_iter if max_iter >= 0 else None
+
+    def _mimo_load_checkpoint(
+        model,
+        optimizer,
+        opt_param_scheduler,
+        load_arg="load",
+        strict=True,
+        checkpointing_context=None,
+        skip_load_to_model_and_opt=False,
+        **_unused,
+    ):
+        from megatron.training.global_vars import get_args
+
+        args = get_args()
+        load_root = getattr(args, load_arg, None)
+        if not load_root:
+            return 0, 0
+
+        iteration = _read_tracker(load_root)
+        if iteration is None:
+            print_rank_0(f"no MIMO checkpoint at {load_root}; starting from iteration 0")
+            return 0, 0
+        source_dir = _iter_dir(load_root, iteration)
+        if not os.path.isdir(source_dir):
+            raise RuntimeError(
+                f"tracker at {load_root} points to iteration {iteration} but {source_dir} is missing"
+            )
+
+        is_finetune = bool(args.finetune)
+        include_optim = (not args.no_load_optim) and not is_finetune
+        include_sched = (not getattr(args, "no_load_scheduler", False)) and not is_finetune
+        include_rng = (not args.no_load_rng) and not is_finetune
+
+        print_rank_0(
+            f"loading hetero MIMO checkpoint from {source_dir}"
+            f" (optimizer={include_optim}, scheduler={include_sched},"
+            f" rng={include_rng}, finetune={is_finetune})"
+        )
+
+        rng_state = _branch_keyed_rng_state(args.ckpt_format) if include_rng else None
+        sharded_sd_metadata = _build_sharded_state_dict_metadata(args)
+        request = generate_state_dict(
+            args,
+            model,
+            optimizer if include_optim else None,
+            opt_param_scheduler if include_sched else None,
+            rng_state,
+            iteration=iteration,
+            optim_sd_kwargs=dict(metadata=sharded_sd_metadata, is_loading=True),
+            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+        )
+        # ``args`` is common (rank-0) state; it round-trips via common.pt on disk
+        # (returned in ``loaded`` below), so don't request it back as a load target.
+        request.pop("args", None)
+
+        loaded = dist_checkpointing.load(request, source_dir)
+
+        # Apply the loaded state to model / optimizer / scheduler (the symmetric
+        # union assembled by every rank reconstructs into each rank's own shards).
+        if not skip_load_to_model_and_opt:
+            model[0].load_state_dict(loaded["model"], strict=strict)
+            if (
+                include_optim
+                and optimizer is not None
+                and not optimizer.is_stub_optimizer
+                and "optimizer" in loaded
+            ):
+                optimizer.load_state_dict(loaded["optimizer"])
+        if include_sched and opt_param_scheduler is not None and "opt_param_scheduler" in loaded:
+            opt_param_scheduler.load_state_dict(loaded["opt_param_scheduler"])
+
+        if include_rng and loaded.get("rng_state") is not None:
+            _restore_rng_from_loaded(loaded["rng_state"])
+
+        # Restore sample accounting from the checkpoint's args (consumed by stock
+        # train()'s batch-size / microbatch bookkeeping).
+        ckpt_args = loaded.get("args")
+        if ckpt_args is not None and not is_finetune:
+            getter = ckpt_args.get if isinstance(ckpt_args, dict) else lambda k, d: getattr(ckpt_args, k, d)
+            args.consumed_train_samples = getter("consumed_train_samples", 0)
+            args.skipped_train_samples = getter("skipped_train_samples", 0)
+            args.consumed_valid_samples = getter("consumed_valid_samples", 0)
+
+        nfpo = int(loaded.get("num_floating_point_operations_so_far", 0))
+        resume_iter = 0 if is_finetune else int(loaded.get("iteration", iteration))
+        print_rank_0(f"resuming hetero MIMO training at iteration {resume_iter}")
+        return resume_iter, nfpo
+
+    # Patch the symbols train() resolved at import time.
+    training_module.save_checkpoint = _mimo_save_checkpoint
+    training_module.load_checkpoint = _mimo_load_checkpoint
+    ckpt_module.save_checkpoint = _mimo_save_checkpoint
+    ckpt_module.load_checkpoint = _mimo_load_checkpoint
+
+
+def _restore_rng_from_loaded(rng_obj) -> None:
+    """Apply RNG state loaded from a per-branch rng ShardedObject (prototype parity)."""
+    from megatron.core import tensor_parallel
+
+    payload = rng_obj
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        rng = payload[0]
+    elif isinstance(payload, dict):
+        rng = payload
+    else:
+        return
+    random.setstate(rng["random_rng_state"])
+    np.random.set_state(rng["np_rng_state"])
+    torch.set_rng_state(rng["torch_rng_state"])
+    torch.cuda.set_rng_state(rng["cuda_rng_state"])
+    if rng.get("rng_tracker_states"):
+        tensor_parallel.get_cuda_rng_tracker().set_states(rng["rng_tracker_states"])
 
 
 def _set_mpu_data_parallel_world_size(args: argparse.Namespace) -> None:
@@ -432,10 +662,12 @@ def main() -> None:
     # Neutralize stock FLOPs/throughput accounting (ill-defined for the hetero model).
     _install_safe_flops()
 
-    # Namespace the RNG ShardedObject key per branch so the encoder grid and the
-    # language grid (which can share a (pp, tp) factorization) don't collide on an
-    # identically-keyed RNG object during torch_dist save/load.
-    _install_per_branch_rng_keying(rt.topology)
+    # Replace stock save/load_checkpoint with a hetero-symmetric path: assemble one
+    # unified sharded state dict and call dist_checkpointing.save/load directly with
+    # the plain (world-coordinated) torch_dist strategy -- NO FullyParallel DP-group
+    # wrapper (which deadlocks a world collective across the disjoint grids). Also
+    # namespaces the RNG ShardedObject key per branch. See _install_mimo_checkpointing.
+    _install_mimo_checkpointing(rt.topology)
 
     # Pin this rank's parallel_state model-parallel group to its module's mp group so
     # stock training_log's cosmetic mp-group reductions (e.g. the LR gather in
