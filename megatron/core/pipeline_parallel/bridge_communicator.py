@@ -713,34 +713,33 @@ class BridgeCommunicator:
                 f"received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
             )
 
-            # Prepare simultaneous send/receive operations
-            if num_sends > 0:
-                # Prepare gradient receive tensors
-                received_gradients_list = []
-                for i, recv_grad_shape in enumerate(recv_grad_shapes):
-                    grad_tensor = torch.empty(
-                        recv_grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
-                    )
-                    received_gradients_list.append(grad_tensor)
+            # Prepare gradient receive tensors
+            received_gradients_list = []
+            for i, recv_grad_shape in enumerate(recv_grad_shapes):
+                grad_tensor = torch.empty(
+                    recv_grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+                )
+                received_gradients_list.append(grad_tensor)
 
-                # Create batch P2P operations for simultaneous send/receive
-                ops = []
-                for dest_rank, activation_split, grad_tensor in zip(
-                    rank_info.send_to_ranks, activation_splits, received_gradients_list
-                ):
-                    # Send activation
-                    ops.append(
-                        torch.distributed.P2POp(
-                            torch.distributed.isend, activation_split, dest_rank, self.bridge_pg
-                        )
+            # Create batch P2P operations for simultaneous send/receive
+            ops = []
+            for dest_rank, activation_split, grad_tensor in zip(
+                rank_info.send_to_ranks, activation_splits, received_gradients_list
+            ):
+                # Send activation
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, activation_split, dest_rank, self.bridge_pg
                     )
-                    # Receive gradient
-                    ops.append(
-                        torch.distributed.P2POp(
-                            torch.distributed.irecv, grad_tensor, dest_rank, self.bridge_pg
-                        )
+                )
+                # Receive gradient
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, grad_tensor, dest_rank, self.bridge_pg
                     )
+                )
 
+            if ops:
                 logging.debug(
                     f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
                     f"executing {len(ops)} simultaneous P2P operations"
@@ -749,27 +748,34 @@ class BridgeCommunicator:
                 for req in reqs:
                     req.wait()
 
-                # Concatenate received gradients
+            # Concatenate received gradients. As in send_backward_recv_forward, the
+            # SENDER leader must broadcast unconditionally to mirror the MEMBER
+            # branch below; gating on num_sends would desync the src broadcast group.
+            if received_gradients_list:
                 aggregated_gradient = torch.cat(received_gradients_list, dim=self._batch_dim)
-                logging.debug(
-                    f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
-                    f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
+            else:
+                aggregated_gradient = torch.empty(
+                    (0,) * self.tensor_ndim,
+                    device=torch.cuda.current_device(),
+                    dtype=self.comm_dtype,
                 )
-                # Broadcast tensor shape to all ranks in scatter_pg
-                tensor_shape_to_broadcast = aggregated_gradient.shape
-                shape_tensor = torch.tensor(
-                    tensor_shape_to_broadcast, device=torch.cuda.current_device(), dtype=torch.int64
-                )
-                dist.broadcast(
-                    shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
-                )
+            logging.debug(
+                f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
+                f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
+            )
+            # Broadcast tensor shape to all ranks in scatter_pg
+            tensor_shape_to_broadcast = aggregated_gradient.shape
+            shape_tensor = torch.tensor(
+                tensor_shape_to_broadcast, device=torch.cuda.current_device(), dtype=torch.int64
+            )
+            dist.broadcast(shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg)
 
-                # Broadcast the tensors to all ranks in the group
-                dist.broadcast(
-                    aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
-                )
+            # Broadcast the tensors to all ranks in the group
+            dist.broadcast(
+                aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
+            )
 
-                return aggregated_gradient
+            return aggregated_gradient
 
         elif (
             rank_info.role == CommRole.MEMBER and self.current_rank in self.src_grid_broadcast_ranks
@@ -834,39 +840,38 @@ class BridgeCommunicator:
                 f"received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
             )
 
-            # Prepare simultaneous send/receive operations
-            if num_receives > 0:
-                # Prepare activation receive tensors
-                received_activations_list = []
-                for i, recv_forward_shape in enumerate(recv_forward_shapes):
-                    activation_tensor = torch.empty(
-                        recv_forward_shape,
-                        device=torch.cuda.current_device(),
-                        dtype=self.comm_dtype,
-                        requires_grad=True,
-                    )
-                    received_activations_list.append(activation_tensor)
+            # Prepare activation receive tensors
+            received_activations_list = []
+            for i, recv_forward_shape in enumerate(recv_forward_shapes):
+                activation_tensor = torch.empty(
+                    recv_forward_shape,
+                    device=torch.cuda.current_device(),
+                    dtype=self.comm_dtype,
+                    requires_grad=True,
+                )
+                received_activations_list.append(activation_tensor)
 
-                # Create batch P2P operations for simultaneous send/receive
-                ops = []
-                for src_rank, gradient_split, activation_tensor in zip(
-                    rank_info.recv_from_ranks, gradient_splits, received_activations_list
-                ):
-                    # Send gradient
-                    ops.append(
-                        torch.distributed.P2POp(
-                            torch.distributed.isend, gradient_split, src_rank, self.bridge_pg
-                        )
+            # Create batch P2P operations for simultaneous send/receive
+            ops = []
+            for src_rank, gradient_split, activation_tensor in zip(
+                rank_info.recv_from_ranks, gradient_splits, received_activations_list
+            ):
+                # Send gradient
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, gradient_split, src_rank, self.bridge_pg
                     )
+                )
 
-                    # Receive activation
-                    ops.append(
-                        torch.distributed.P2POp(
-                            torch.distributed.irecv, activation_tensor, src_rank, self.bridge_pg
-                        )
+                # Receive activation
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, activation_tensor, src_rank, self.bridge_pg
                     )
+                )
 
-                # Execute all operations simultaneously
+            # Execute all operations simultaneously
+            if ops:
                 logging.debug(
                     f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
                     f"executing {len(ops)} simultaneous P2P operations"
@@ -875,27 +880,39 @@ class BridgeCommunicator:
                 for req in reqs:
                     req.wait()
 
-                # Concatenate received activations
+            # Concatenate received activations. When there are no receives the leader
+            # still owns the dest broadcast, so fall back to an empty tensor rather
+            # than skipping the broadcast: the MEMBER branch below broadcasts
+            # unconditionally, and gating the leader's broadcast on num_receives
+            # would desync the broadcast group (MEMBER waits on a broadcast the
+            # leader never issues -> NCCL collective hang).
+            if received_activations_list:
                 aggregated_activation = torch.cat(received_activations_list, dim=self._batch_dim)
-                logging.debug(
-                    f"[Bridge Communicator] [send_backward_recv_forward] Rank {self.current_rank} "
-                    f"agg act shape {aggregated_activation.shape} sum {aggregated_activation.sum()}"
+            else:
+                aggregated_activation = torch.empty(
+                    (0,) * self.tensor_ndim,
+                    device=torch.cuda.current_device(),
+                    dtype=self.comm_dtype,
+                    requires_grad=True,
                 )
+            logging.debug(
+                f"[Bridge Communicator] [send_backward_recv_forward] Rank {self.current_rank} "
+                f"agg act shape {aggregated_activation.shape} sum {aggregated_activation.sum()}"
+            )
 
-                # Broadcast tensor shape to all ranks in scatter_pg
-                tensor_shape_to_scatter = aggregated_activation.shape
-                shape_tensor = torch.tensor(
-                    tensor_shape_to_scatter, device=torch.cuda.current_device(), dtype=torch.int64
-                )
-                dist.broadcast(
-                    shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
-                )
+            # Broadcast tensor shape to all ranks in scatter_pg (unconditional:
+            # must mirror the MEMBER branch's unconditional broadcasts).
+            tensor_shape_to_scatter = aggregated_activation.shape
+            shape_tensor = torch.tensor(
+                tensor_shape_to_scatter, device=torch.cuda.current_device(), dtype=torch.int64
+            )
+            dist.broadcast(shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg)
 
-                # Scatter the tensors to all ranks in the group
-                dist.broadcast(
-                    aggregated_activation, src=self.current_rank, group=self.dest_grid_broadcast_pg
-                )
-                return aggregated_activation
+            # Scatter the tensors to all ranks in the group
+            dist.broadcast(
+                aggregated_activation, src=self.current_rank, group=self.dest_grid_broadcast_pg
+            )
+            return aggregated_activation
 
         elif (
             rank_info.role == CommRole.MEMBER
