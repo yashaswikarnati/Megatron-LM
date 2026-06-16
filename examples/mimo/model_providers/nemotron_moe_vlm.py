@@ -58,8 +58,8 @@ from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.tensor_parallel import ColumnParallelLinear
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -526,13 +526,37 @@ class RADIOEncoderWrapper(torch.nn.Module):
         packed_seq_params=None,
     ) -> torch.Tensor:
         """Run RADIO, drop class tokens, and apply pixel shuffle."""
+        # TEMP debug instrumentation (NMFW-516): localize the RADIO encode hang.
+        # Gated on MIMO_BRIDGE_DEBUG; strip once the hang is root-caused.
+        _dbg = os.environ.get("MIMO_BRIDGE_DEBUG")
+        _rank = os.environ.get("RANK", "?")
+
+        def _log(stage):
+            if _dbg:
+                print(f"[rank{_rank}] RADIO {stage}", flush=True)
+
+        if _dbg:
+            _img_shape = (
+                tuple(imgs_sizes.shape) if torch.is_tensor(imgs_sizes) else imgs_sizes
+            )
+            _img_dev = imgs_sizes.device if torch.is_tensor(imgs_sizes) else None
+            print(
+                f"[rank{_rank}] RADIO wrapper.forward ENTER x.shape={tuple(x.shape)} "
+                f"x.device={x.device} dynamic_resolution={self.dynamic_resolution} "
+                f"imgs_sizes.shape={_img_shape} imgs_sizes.device={_img_dev} "
+                f"packed_seq_params={'present' if packed_seq_params is not None else None}",
+                flush=True,
+            )
         context = torch.no_grad() if self.force_eval_mode else nullcontext()
         with context:
             x = x.to(dtype=self.radio_model.embedder.weight.dtype)
+            _log("before radio_model.forward")
             embeddings = self.radio_model(
                 x, imgs_sizes=imgs_sizes, packed_seq_params=packed_seq_params
             )
+            _log(f"after radio_model.forward embeddings.shape={tuple(embeddings.shape)}")
         if self.drop_class_token:
+            _log("before class-token drop")
             if self.dynamic_resolution and imgs_sizes is not None and self.class_token_len > 0:
                 # Class tokens are interleaved between tiles; build mask to remove them.
                 remove_mask = torch.full(
@@ -552,13 +576,17 @@ class RADIOEncoderWrapper(torch.nn.Module):
                 embeddings = embeddings[:, remove_mask, :]
             else:
                 embeddings = embeddings[:, self.class_token_len :, :]
+            _log(f"after class-token drop embeddings.shape={tuple(embeddings.shape)}")
         if self.apply_pixel_shuffle:
+            _log("before pixel_shuffle")
             if self.dynamic_resolution and imgs_sizes is not None:
                 embeddings = _pixel_shuffle_dynamic_res(
                     embeddings, imgs_sizes, self.radio_model.patch_dim
                 )
             else:
                 embeddings = pixel_shuffle(embeddings, scale_factor=0.5)
+            _log(f"after pixel_shuffle embeddings.shape={tuple(embeddings.shape)}")
+        _log("wrapper.forward RETURN")
         return embeddings
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):

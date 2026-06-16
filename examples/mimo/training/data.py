@@ -278,22 +278,31 @@ class MockVLMIterator:
         )
 
         n_images_total = self.micro_batch_size * num_images
+        # imgs_sizes and the packed-seq cu_seqlens/max_seqlen are *metadata*, not
+        # data, and must live on CPU to match the prototype's energon tiling
+        # strategy (DynamicResolutionImageTilingStrategy.stack builds plain CPU
+        # tensors). RADIOViTModel.forward iterates imgs_sizes in Python and uses
+        # the per-image patch counts as slice bounds and as the THD cu_seqlens fed
+        # to TE attention; placing them on CUDA forces a blocking device->host
+        # sync on every iteration (and TE expects int32 cu_seqlens on CPU), which
+        # is the kind of degenerate host<->device round-trip that stalls the
+        # encode before the transformer layers. Only ``x`` (the real activation)
+        # is created on CUDA.
         imgs_sizes = torch.tensor(
-            [[h_pix, w_pix]] * n_images_total, dtype=torch.int32, device="cuda"
+            [[h_pix, w_pix]] * n_images_total, dtype=torch.int32
         )
         cu_seqlens = torch.arange(
             0,
             (n_images_total + 1) * patches_per_image,
             patches_per_image,
             dtype=torch.int32,
-            device="cuda",
         )
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=torch.tensor(patches_per_image, dtype=torch.int32, device="cuda"),
-            max_seqlen_kv=torch.tensor(patches_per_image, dtype=torch.int32, device="cuda"),
+            max_seqlen_q=torch.tensor(patches_per_image, dtype=torch.int32),
+            max_seqlen_kv=torch.tensor(patches_per_image, dtype=torch.int32),
         )
         return {
             self.vision_encoder_key: {

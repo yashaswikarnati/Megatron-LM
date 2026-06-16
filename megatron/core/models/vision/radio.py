@@ -2,6 +2,7 @@
 
 import logging
 import math
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -331,6 +332,28 @@ class RADIOViTModel(VisionModule):
                 "einops is required for RADIOViTModel, please install it with `pip install einops`"
             )
 
+        # TEMP debug instrumentation (NMFW-516): localize the RADIO encode hang.
+        # Gated on MIMO_BRIDGE_DEBUG; strip once the hang is root-caused.
+        _dbg = os.environ.get("MIMO_BRIDGE_DEBUG")
+        _rank = os.environ.get("RANK", "?")
+
+        def _vlog(stage):
+            if _dbg:
+                print(f"[rank{_rank}] RADIOViTModel.forward {stage}", flush=True)
+
+        if _dbg:
+            _is = tuple(imgs_sizes.shape) if torch.is_tensor(imgs_sizes) else imgs_sizes
+            _isd = imgs_sizes.device if torch.is_tensor(imgs_sizes) else None
+            print(
+                f"[rank{_rank}] RADIOViTModel.forward ENTER x.shape={tuple(x.shape)} "
+                f"dynamic_resolution={self.dynamic_resolution} has_cpe={self.has_cpe} "
+                f"training={self.training} add_class_token={self.add_class_token} "
+                f"class_token_len={self.class_token_len} patch_dim={self.patch_dim} "
+                f"imgs_sizes.shape={_is} imgs_sizes.device={_isd} "
+                f"max_num_rows={self.max_num_rows} max_num_cols={self.max_num_cols}",
+                flush=True,
+            )
+
         if not self.dynamic_resolution:
             input_size = x.shape[2:]
             py = x.shape[-2] // self.patch_dim
@@ -359,6 +382,7 @@ class RADIOViTModel(VisionModule):
                 skip_image_duplication=self.separate_video_embedder,
             )
 
+        _vlog("before embedder")
         if self.separate_video_embedder and self.temporal_patch_dim > 1:
             embedded_chunks = []
             for chunk, is_img in zip(x, is_image):
@@ -370,6 +394,7 @@ class RADIOViTModel(VisionModule):
             x = torch.cat(embedded_chunks, dim=1)
         else:
             x, _ = self.embedder(x)
+        _vlog(f"after embedder x.shape={tuple(x.shape)}")
 
         if self.dynamic_resolution:
             if torch.is_tensor(imgs_sizes):
@@ -378,19 +403,23 @@ class RADIOViTModel(VisionModule):
             else:
                 seq_lens = [(h // self.patch_dim) * (w // self.patch_dim) for h, w in imgs_sizes]
                 sizes_iter = imgs_sizes
+            _vlog(f"dynamic-res seq_lens(sum={sum(seq_lens)}, n={len(seq_lens)}) x.shape[1]={x.shape[1]}")
 
             assert sum(seq_lens) == x.shape[1], f"{sum(seq_lens)} != {x.shape[1]}"
 
             chunks = torch.split(x, seq_lens, dim=1)
+            _vlog(f"after split n_chunks={len(chunks)}; before per-chunk apply_pos_enc (has_cpe={self.has_cpe})")
             chunks = [
                 self.apply_pos_enc(chunk, input_size=size)[0]
                 for chunk, size in zip(chunks, sizes_iter)
             ]
             x = torch.cat(chunks, dim=1)
+            _vlog(f"after apply_pos_enc+concat x.shape={tuple(x.shape)}")
         else:
             x, pos_enc = self.apply_pos_enc(x, input_size=input_size)
 
         if self.add_class_token:
+            _vlog("before class-token insertion")
             class_token = self.class_token.expand(x.shape[0], -1, -1)
             if self.dynamic_resolution:
                 out = []
@@ -416,6 +445,7 @@ class RADIOViTModel(VisionModule):
                 )
             else:
                 x = torch.cat([class_token, x], dim=1)
+            _vlog(f"after class-token insertion x.shape={tuple(x.shape)}")
 
         if not self.dynamic_resolution:
             assert x.shape[1] == self.seq_length, f"{x.shape[1]} != {self.seq_length}"
@@ -426,7 +456,9 @@ class RADIOViTModel(VisionModule):
         x = x.permute(1, 0, 2)  # [b, s, h] -> [s, b, h]
         x = x.contiguous()
 
+        _vlog(f"before decoder (transformer layers) x.shape={tuple(x.shape)}")
         x = self.decoder(x, attention_mask=attention_mask, packed_seq_params=packed_seq_params)
+        _vlog("after decoder (transformer layers)")
 
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
