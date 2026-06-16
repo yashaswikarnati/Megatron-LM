@@ -382,6 +382,12 @@ def main() -> None:
     # satisfies stock logging-path reads of mpu.get_model_parallel_group().
     if getattr(rt.pg_collection, "mp", None) is not None:
         parallel_state._MODEL_PARALLEL_GROUP = rt.pg_collection.mp
+    # Same for the data-parallel group: stock training_log -> report_memory reads
+    # mpu.get_data_parallel_rank() to gate DP-rank-0 logging.
+    if getattr(rt.pg_collection, "dp", None) is not None:
+        parallel_state._DATA_PARALLEL_GROUP = rt.pg_collection.dp
+        if getattr(rt.pg_collection, "dp_cp", None) is not None:
+            parallel_state._DATA_PARALLEL_GROUP_WITH_CP = rt.pg_collection.dp_cp
 
     # Bookkeeping fields stock train() reads that setup_model_and_optimizer /
     # the dataset builder would normally set.
