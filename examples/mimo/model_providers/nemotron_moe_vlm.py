@@ -244,11 +244,12 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider.add_argument(
         "--training-stage", choices=["stage1", "stage2", "stage3"], default=None
     )
-    # Hetero grid sizes the build functions read as fallbacks when no
-    # pg_collection is supplied. These mirror the prototype's --llm-* flags but
-    # are namespaced so they don't collide with stock parallelism args.
-    provider.add_argument("--llm-ep", type=int, default=1)
-    provider.add_argument("--llm-expt-tp", type=int, default=None)
+    # NB: --llm-ep / --llm-expt-tp are *topology* knobs and are declared by the
+    # hetero grid-arg provider (examples/mimo/training/args.py::add_hetero_grid_args),
+    # not here -- declaring them in both groups would raise an argparse
+    # "conflicting option" error when the two providers compose. The build
+    # functions below still read them via getattr(args, "llm_ep"/"llm_expt_tp", ...)
+    # fallbacks, which tolerate their absence (default 1 / None).
     return parser
 
 
@@ -756,7 +757,7 @@ def language_model_spec(
     tp_size = get_group_size_or(tp_pg, fallback_tp_size)
     ep_size = get_group_size_or(ep_pg, getattr(args, "llm_ep", 1))
     expt_tp_size = get_group_size_or(
-        expt_tp_pg, getattr(args, "llm_expt_tp", None) or fallback_tp_size
+        expt_tp_pg, getattr(args, "llm_expt_tp", None) or 1
     )
 
     if is_nemotron_moe_vlm(args):
