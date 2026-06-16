@@ -182,6 +182,11 @@ def _parse_and_validate() -> argparse.Namespace:
     # accounting reflect the disjoint hetero layout.
     args.data_parallel_size = args.llm_dp
 
+    # Stock throughput/FLOPs logging does ``1 + args.mtp_num_layers``; the Nemotron
+    # preset leaves it None (MTP off), which TypeErrors. Default to 0 (no MTP).
+    if getattr(args, "mtp_num_layers", None) is None:
+        args.mtp_num_layers = 0
+
     return args
 
 
