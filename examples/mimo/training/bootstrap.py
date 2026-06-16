@@ -151,8 +151,7 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
     encoder_name = _encoder_module_name(topology)
     rank_in_language = topology.grids[MIMO_LANGUAGE_MODULE_KEY].is_current_rank_in_grid()
     rank_in_encoder = (
-        encoder_name is not None
-        and topology.grids[encoder_name].is_current_rank_in_grid()
+        encoder_name is not None and topology.grids[encoder_name].is_current_rank_in_grid()
     )
 
     language_pg = topology.module_pgs.get(MIMO_LANGUAGE_MODULE_KEY)
@@ -173,9 +172,7 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
     special_token_ids = {}
     if encoder_name is not None:
         modality_submodules_spec[encoder_name] = vision_submodules_spec(
-            args,
-            encoder_pg if rank_in_encoder else None,
-            topology.grids[encoder_name],
+            args, encoder_pg if rank_in_encoder else None, topology.grids[encoder_name]
         )
         special_token_ids[encoder_name] = args.image_token_id
 
@@ -196,10 +193,12 @@ def build_mimo_runtime(args: argparse.Namespace) -> MimoRuntime:
         tp_group=language_pg.tp if rank_in_language else None,
     )
     mimo_model.to(torch.device("cuda"))
-    if not getattr(args, "fp32", False):
-        mimo_model.to(torch.bfloat16)
+    # No blanket .to(bfloat16) here: precision is now owned by the per-submodule
+    # Float16Module wrap inside wrap_active_modules_with_ddp (mirroring stock
+    # get_model, which builds fp32 and lets Float16Module cast params). Casting
+    # here as well would be redundant.
 
-    # --- 5. DDP-wrap the active submodules (per-submodule DDP). ------------
+    # --- 5. Float16Module- and DDP-wrap the active submodules (per-submodule). ----
     wrap_active_modules_with_ddp(args, mimo_model, topology)
 
     # --- 6. Attach this rank's per-module PGC for the stock train() path. --
