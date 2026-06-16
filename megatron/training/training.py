@@ -2234,8 +2234,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 
-        if has_nvidia_modelopt:
-            # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
+        if has_nvidia_modelopt and p2p_communicator is None:
+            # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors.
+            # Skipped on the MIMO cross-grid path (p2p_communicator present): MIMO does not
+            # use distillation, and this helper reads parallel_state pp groups that are not
+            # initialized without mpu. The MIMO bridge schedule handles its own tensor shapes.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
