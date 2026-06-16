@@ -364,6 +364,8 @@ def apply_training_stage(args: argparse.Namespace) -> None:
     if not is_nemotron_moe_vlm(args):
         return
 
+    # The projector is the bridge being learned, so it trains in every stage:
+    # --freeze-projection stays at its default False here (exposed only for manual use).
     stage = args.training_stage or NEMOTRON_20L_DEFAULT_STAGE
     if stage == "stage1":
         args.freeze_vit = True
