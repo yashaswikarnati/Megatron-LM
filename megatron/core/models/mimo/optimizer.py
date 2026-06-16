@@ -356,16 +356,19 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
 
-    # Expert groups
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.expt_dp = grid.get_pg(["dp", "ep"])
+    # Expert groups. The expert dims (expt_tp/ep/expt_dp) live in the registered
+    # "expert" layout view, not the dense base view, so they must be requested with
+    # view="expert". This matches the pre-vlm-07 optimizer semantics (expt_tp*ep*pp,
+    # expt_dp) rather than mixing the dense tp/dp dims with ep.
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view="expert")
+    pg.expt_dp = grid.get_pg("expt_dp", view="expert")
 
     # Distributed optimizer grad stats group: must span all dimensions so grad norm
     # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
     # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
     # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
     # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
 
     return pg
 

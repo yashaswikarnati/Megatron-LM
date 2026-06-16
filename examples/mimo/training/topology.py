@@ -135,7 +135,7 @@ def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
         for dims in (
             ["tp"], ["cp"], ["pp"], ["dp"],
             ["dp", "cp"], ["tp", "cp"], ["tp", "pp"],
-            ["tp", "dp"], ["tp", "dp", "cp"],
+            ["tp", "dp"], ["tp", "dp", "cp"], ["tp", "cp", "dp", "pp"],
         ):
             grid.create_pg(dims)
         for dims in (["ep"], ["expt_tp"], ["expt_dp"], ["expt_tp", "ep"], ["expt_tp", "ep", "pp"]):
