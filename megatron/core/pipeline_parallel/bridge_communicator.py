@@ -167,6 +167,14 @@ class BridgeCommunicator:
         bridge_ranks = sorted(set(self.src_tp_leaders) | set(self.dest_tp_leaders))
         self.bridge_pg = self._get_or_create_bridge_pg(bridge_ranks)
 
+        # Force the bridge PG's NCCL communicator to initialize now, while every
+        # member is synchronized at construction, rather than lazily on the first
+        # P2P inside the (skewed) 1F1B schedule. Only bridge members may enter this
+        # collective; ``barrier`` over ``bridge_pg`` is scoped to its members, so
+        # non-members must not call it. See ``_get_or_create_bridge_pg``.
+        if self.current_rank in bridge_ranks:
+            dist.barrier(group=self.bridge_pg)
+
         log_msg = (
             f"[Rank {self.current_rank}] "
             f"srcLeader={self.src_local_leader_rank} "
@@ -202,11 +210,30 @@ class BridgeCommunicator:
 
     @classmethod
     def _get_or_create_bridge_pg(cls, ranks: List[int]):
-        """Get or create a bridge PG, caching to avoid duplicate NCCL communicators."""
+        """Get or create a bridge PG, caching to avoid duplicate NCCL communicators.
+
+        The bridge PG only ever carries point-to-point traffic (leader<->leader
+        send/recv and batch_isend_irecv in ``_communicate_shapes``). A NCCL PG that
+        is first touched by P2P is initialized lazily, and that lazy init is a
+        collective over *all* members of the group. In the 1F1B schedule the
+        members reach their first bridge P2P at desynchronized points -- source-grid
+        senders issue it during their warmup forward, destination-grid receivers
+        only after their (often zero-length) warmup -- so the lazy init rendezvous
+        can stall and surface as a hang inside the first ``_communicate_shapes``
+        ``batch_isend_irecv`` (NCCL bootstrap broadcast). Bind ``device_id`` so the
+        communicator is initialized eagerly inside this already-collective
+        ``new_group`` call, while every world rank is synchronized at construction,
+        instead of mid-schedule.
+        """
         ranks = sorted(ranks)
         cache_key = str(ranks)
         if cache_key not in cls._bridge_pg_cache:
-            cls._bridge_pg_cache[cache_key] = dist.new_group(ranks, backend='nccl')
+            device_id = None
+            if torch.cuda.is_available():
+                device_id = torch.device('cuda', torch.cuda.current_device())
+            cls._bridge_pg_cache[cache_key] = dist.new_group(
+                ranks, backend='nccl', device_id=device_id
+            )
         return cls._bridge_pg_cache[cache_key]
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
