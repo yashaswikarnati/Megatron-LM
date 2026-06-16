@@ -331,6 +331,63 @@ def _install_safe_flops() -> None:
     training_module.num_floating_point_operations = _safe
 
 
+def _install_per_branch_rng_keying(topology) -> None:
+    """Namespace the RNG ShardedObject key per MIMO branch to avoid cross-grid collision.
+
+    Stock ``get_rng_state`` builds a single ``ShardedObject('rng_state', ...,
+    (pp_size, tp_size), (pp_rank, tp_rank), replica_id=dp_rank)`` keyed on the
+    rank's pinned parallel_state (pp, tp) groups. In the disjoint hetero layout the
+    encoder grid and the language grid can have the SAME (pp, tp) factorization
+    (e.g. both tp2/pp1), so encoder-rank (pp=0,tp=0,dp=0) and language-rank
+    (pp=0,tp=0,dp=0) would emit ShardedObjects with an IDENTICAL key, global offset,
+    and replica_id but DIFFERENT RNG payloads. torch_dist treats those as replicas
+    of one object: one branch's RNG silently overwrites the other's at save, and at
+    load both branches restore the same (wrong-for-one-branch) RNG.
+
+    Mirroring the prototype's ``checkpointing.py::_collect_rng_state`` per-branch key
+    namespacing, we wrap stock ``get_rng_state`` so each branch publishes its RNG
+    under ``mimo.<branch>.rng_state`` instead of the bare ``rng_state``. The two
+    branches then live under distinct keys and round-trip independently. On load,
+    stock ``load_checkpoint`` requests the same per-branch key (the wrapper is
+    installed before train(), which owns both save and load), so resume restores
+    each branch's own RNG.
+    """
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
+    from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+
+    # Determine this rank's branch name from grid membership (the same source of
+    # truth bootstrap.py uses). Language ranks key on "language"; encoder ranks key
+    # on the encoder grid name.
+    if topology.grids[MIMO_LANGUAGE_MODULE_KEY].is_current_rank_in_grid():
+        branch_name = "language"
+    else:
+        branch_name = next(
+            (
+                name
+                for name, grid in topology.grids.items()
+                if name != MIMO_LANGUAGE_MODULE_KEY and grid.is_current_rank_in_grid()
+            ),
+            "language",
+        )
+
+    import megatron.training.checkpointing as ckpt_module
+
+    _orig_get_rng_state = ckpt_module.get_rng_state
+    key = f"mimo.{branch_name}.rng_state"
+
+    def _branch_keyed_get_rng_state(*args, **kwargs):
+        rng = _orig_get_rng_state(*args, **kwargs)
+        # torch_dist path returns a ShardedObject keyed 'rng_state'; rewrite its key
+        # so the two branches don't collide. Other ckpt formats are pass-through.
+        if isinstance(rng, ShardedObject):
+            rng = ShardedObject(
+                key, rng.data, rng.global_shape, rng.global_offset, replica_id=rng.replica_id
+            )
+        return rng
+
+    ckpt_module.get_rng_state = _branch_keyed_get_rng_state
+
+
 def _set_mpu_data_parallel_world_size(args: argparse.Namespace) -> None:
     """Pin the MPU DP world size to llm_dp for train()'s sample accounting.
 
@@ -375,6 +432,11 @@ def main() -> None:
     # Neutralize stock FLOPs/throughput accounting (ill-defined for the hetero model).
     _install_safe_flops()
 
+    # Namespace the RNG ShardedObject key per branch so the encoder grid and the
+    # language grid (which can share a (pp, tp) factorization) don't collide on an
+    # identically-keyed RNG object during torch_dist save/load.
+    _install_per_branch_rng_keying(rt.topology)
+
     # Pin this rank's parallel_state model-parallel group to its module's mp group so
     # stock training_log's cosmetic mp-group reductions (e.g. the LR gather in
     # reduce_max_stat_across_model_parallel_group) work without full mpu init. The
@@ -406,6 +468,24 @@ def main() -> None:
     args.do_train = True
     args.do_valid = False
     args.do_test = False
+
+    # Every MIMO submodule optimizer is a DistributedOptimizer (see
+    # _build_optimizer -> get_mimo_optimizer, and runtime.py's per-submodule DDP
+    # wrap with use_distributed_optimizer=True). The top-level ``args`` flag,
+    # however, defaults to False because we never run stock setup_model_and_optimizer.
+    # Stock checkpointing.py keys two things off it:
+    #   1. save -> _build_sharded_state_dict_metadata: only sets
+    #      ``distrib_optim_sharding_type`` when this is True. Without it the
+    #      per-submodule DistributedOptimizer.sharded_state_dict falls back to the
+    #      deprecated 'fully_sharded_model_space' format, which emits ShardedTensors
+    #      with ``flattened_range`` and crashes torch_dist's
+    #      validate_metadata_integrity ("flattened_range is not supported").
+    #   2. The 'Storing distributed optimizer sharded state of type ...' log line.
+    # Pinning it True makes the metadata builder select 'dp_reshardable' (the stock
+    # default and the format the hetero prototype used), which round-trips cleanly
+    # through torch_dist save/load and is persisted in the checkpoint's
+    # content_metadata so resume mirrors it.
+    args.use_distributed_optimizer = True
 
     config = rt.model[0].config
 
