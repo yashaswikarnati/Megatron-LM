@@ -174,6 +174,7 @@ class RADIOViTModel(VisionModule):
                 gather_output=True,
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
+                tp_group=pg_collection.tp if pg_collection is not None else None,
             )
             self.video_embedder = ColumnParallelLinear(
                 input_size=3 * self.temporal_patch_dim * self.patch_dim * self.patch_dim,
@@ -183,6 +184,7 @@ class RADIOViTModel(VisionModule):
                 gather_output=True,
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
+                tp_group=pg_collection.tp if pg_collection is not None else None,
             )
         else:
             self.embedder = ColumnParallelLinear(
@@ -193,6 +195,7 @@ class RADIOViTModel(VisionModule):
                 gather_output=True,
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
+                tp_group=pg_collection.tp if pg_collection is not None else None,
             )
         transformer_config.sequence_parallel = orig_sequence_parallel
 
