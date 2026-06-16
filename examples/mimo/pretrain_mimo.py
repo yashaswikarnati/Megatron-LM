@@ -380,14 +380,22 @@ def main() -> None:
     # reduce_max_stat_across_model_parallel_group) work without full mpu init. The
     # MIMO schedule/grad reductions use the threaded pg_collection; this only
     # satisfies stock logging-path reads of mpu.get_model_parallel_group().
-    if getattr(rt.pg_collection, "mp", None) is not None:
-        parallel_state._MODEL_PARALLEL_GROUP = rt.pg_collection.mp
-    # Same for the data-parallel group: stock training_log -> report_memory reads
-    # mpu.get_data_parallel_rank() to gate DP-rank-0 logging.
-    if getattr(rt.pg_collection, "dp", None) is not None:
-        parallel_state._DATA_PARALLEL_GROUP = rt.pg_collection.dp
-        if getattr(rt.pg_collection, "dp_cp", None) is not None:
-            parallel_state._DATA_PARALLEL_GROUP_WITH_CP = rt.pg_collection.dp_cp
+    # Pin this rank's parallel_state groups to its module's per-module groups so the
+    # stock logging + checkpoint paths (which read mpu.get_*_group()) work without
+    # full mpu init. The MIMO schedule/grad reductions use the threaded pg_collection;
+    # these pins only satisfy stock-path reads (training_log, report_memory,
+    # save_checkpoint shard/RNG bookkeeping).
+    _pgc = rt.pg_collection
+    if getattr(_pgc, "mp", None) is not None:
+        parallel_state._MODEL_PARALLEL_GROUP = _pgc.mp
+    if getattr(_pgc, "tp", None) is not None:
+        parallel_state._TENSOR_MODEL_PARALLEL_GROUP = _pgc.tp
+    if getattr(_pgc, "pp", None) is not None:
+        parallel_state._PIPELINE_MODEL_PARALLEL_GROUP = _pgc.pp
+    if getattr(_pgc, "dp", None) is not None:
+        parallel_state._DATA_PARALLEL_GROUP = _pgc.dp
+        if getattr(_pgc, "dp_cp", None) is not None:
+            parallel_state._DATA_PARALLEL_GROUP_WITH_CP = _pgc.dp_cp
 
     # Bookkeeping fields stock train() reads that setup_model_and_optimizer /
     # the dataset builder would normally set.
