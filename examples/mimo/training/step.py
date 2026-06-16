@@ -153,3 +153,5 @@ def move_batch_to_cuda(value):
                 setattr(value, attr, sub.cuda(non_blocking=True))
         return value
     return value
+
+# nmfw516 e2e trace run
