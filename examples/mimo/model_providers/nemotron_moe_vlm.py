@@ -243,6 +243,9 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     provider.add_argument(
         "--training-stage", choices=["stage1", "stage2", "stage3"], default=None
     )
+    # Stock declares --bf16/--fp16 but not --fp32; the provider/data path uses fp32
+    # as the "force full precision" toggle (matches the prototype). Default bf16.
+    provider.add_argument("--fp32", action="store_true", help="Use float32 instead of bfloat16.")
     # NB: --llm-ep / --llm-expt-tp are *topology* knobs and are declared by the
     # hetero grid-arg provider (examples/mimo/training/args.py::add_hetero_grid_args),
     # not here -- declaring them in both groups would raise an argparse
