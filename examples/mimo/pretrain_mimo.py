@@ -351,8 +351,12 @@ def _mimo_branch_name(topology) -> str:
     )
 
 
-def _install_mimo_checkpointing(topology) -> None:
+def _install_mimo_checkpointing(topology):
     """Replace stock save_checkpoint / load_checkpoint with a hetero-symmetric path.
+
+    Returns the patched ``load_checkpoint`` callable; the caller must invoke it
+    explicitly before train() to drive the resume LOAD (see the note at the end of
+    this function for why train() does not call it itself).
 
     Why stock save_checkpoint hangs in a WORLD collective
     =====================================================
@@ -592,11 +596,21 @@ def _install_mimo_checkpointing(topology) -> None:
         print_rank_0(f"resuming hetero MIMO training at iteration {resume_iter}")
         return resume_iter, nfpo
 
-    # Patch the symbols train() resolved at import time.
+    # Patch the symbols train() resolved at import time. This routes the
+    # mid-training periodic SAVE (save_checkpoint_and_time -> save_checkpoint)
+    # through the hetero-symmetric path.
     training_module.save_checkpoint = _mimo_save_checkpoint
     training_module.load_checkpoint = _mimo_load_checkpoint
     ckpt_module.save_checkpoint = _mimo_save_checkpoint
     ckpt_module.load_checkpoint = _mimo_load_checkpoint
+
+    # The resume LOAD is NOT driven by train(): stock load_checkpoint runs inside
+    # setup_model_and_optimizer, which this entry bypasses (it builds the MimoModel /
+    # MimoOptimizer itself and calls train() directly). So the caller (main()) must
+    # invoke this returned load function explicitly BEFORE train() and seed
+    # args.iteration so train() resumes at iteration+1. Mirrors the prototype loop,
+    # which calls load_checkpoint() explicitly and starts at start_iteration + 1.
+    return _mimo_load_checkpoint
 
 
 def _restore_rng_from_loaded(rng_obj) -> None:
@@ -667,7 +681,9 @@ def main() -> None:
     # the plain (world-coordinated) torch_dist strategy -- NO FullyParallel DP-group
     # wrapper (which deadlocks a world collective across the disjoint grids). Also
     # namespaces the RNG ShardedObject key per branch. See _install_mimo_checkpointing.
-    _install_mimo_checkpointing(rt.topology)
+    # Returns the load fn; train() never calls it (resume load normally lives in the
+    # bypassed setup_model_and_optimizer), so we invoke it explicitly below.
+    mimo_load_checkpoint = _install_mimo_checkpointing(rt.topology)
 
     # Pin this rank's parallel_state model-parallel group to its module's mp group so
     # stock training_log's cosmetic mp-group reductions (e.g. the LR gather in
@@ -718,6 +734,21 @@ def main() -> None:
     # through torch_dist save/load and is persisted in the checkpoint's
     # content_metadata so resume mirrors it.
     args.use_distributed_optimizer = True
+
+    # Resume LOAD (must run after parallel_state pins + args.use_distributed_optimizer
+    # so the load request's model/optimizer/RNG sharded keys match what was saved).
+    # train() does not call load_checkpoint (the entry bypasses
+    # setup_model_and_optimizer), so we drive it here. All 8 ranks call this with the
+    # identical world-symmetric load request, mirroring the world-symmetric save.
+    # On success it returns the saved iteration (e.g. 2); seeding args.iteration makes
+    # stock train() resume the loop at iteration+1 (e.g. 3). consumed-sample / FLOPs
+    # accounting is restored inside the load fn.
+    if args.load:
+        resume_iter, resume_nfpo = mimo_load_checkpoint(
+            rt.model, optimizer, opt_param_scheduler
+        )
+        args.iteration = resume_iter
+        args.num_floating_point_operations_so_far = resume_nfpo
 
     config = rt.model[0].config
 
