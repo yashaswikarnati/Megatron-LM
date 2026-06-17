@@ -81,20 +81,41 @@ def _is_token_source_rank(language_pg) -> bool:
     )
 
 
-def _global_token_count(num_tokens, language_pg) -> float:
+def _token_source_global_rank(language_grid) -> int:
+    """Global rank of the single LLM token-source coordinate (tp=0, cp=0, dp=0, pp=last).
+
+    Derived statically from ``get_rank_enum("pp")`` (the grid's authoritative rank
+    enumeration, identical on every rank), so encoder-grid ranks in no LLM group can name
+    it. The global minimum rank is (tp=0, cp=0, dp=0), so its PP line is the source line
+    and that line's last entry is the (pp=last) source rank.
+    """
+    pp_lines = language_grid.get_rank_enum("pp")
+    min_rank = min(rank for line in pp_lines for rank in line)
+    for line in pp_lines:
+        if min_rank in line:
+            return int(line[-1])
+    raise RuntimeError(
+        f"Could not derive token-source global rank from language grid pp_lines={pp_lines}"
+    )
+
+
+def _global_token_count(num_tokens, language_pg, src_global_rank) -> float:
     """Total non-padded tokens in the global batch, visible on every rank.
 
-    Only the LLM token-source ranks contribute: they sum over the LLM DP/CP group;
-    a world MAX then publishes that N_global to every rank, including the
-    non-colocated encoder grid (where ``language_pg`` is None and the count is 0).
+    Only the LLM token-source rank computes the count by summing over the LLM DP/CP
+    group; it then broadcasts that N_global from its global rank to every rank in the
+    world (including the non-colocated encoder grid, where ``language_pg`` is None) so
+    both modules divide by the same per-token mean.
     """
     global_num_tokens = torch.zeros(1, dtype=torch.float32, device="cuda")
     if _is_token_source_rank(language_pg):
+        # Collective over DP/CP: every (pp_last, tp0) rank participates so the all-reduce
+        # does not hang; only DP/CP rank 0 keeps the result and is the broadcast root.
         token_count = num_tokens.to(dtype=torch.float32).sum().view(1)
         dist.all_reduce(token_count, group=language_pg.dp_cp, op=dist.ReduceOp.SUM)
         if dist.get_rank(group=language_pg.dp_cp) == 0:
             global_num_tokens.copy_(token_count)
-    dist.all_reduce(global_num_tokens, op=dist.ReduceOp.MAX)
+    dist.broadcast(global_num_tokens, src=src_global_rank)
     return float(global_num_tokens.item())
 
 
@@ -113,6 +134,9 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
     """
     module_pgs = topology.module_pgs
     language_pg = module_pgs.get(MIMO_LANGUAGE_MODULE_KEY)
+    # Broadcast root for N_global; derived statically so encoder-grid ranks (in no LLM
+    # group) can still name it.
+    src_global_rank = _token_source_global_rank(topology.grids[MIMO_LANGUAGE_MODULE_KEY])
     correct_vision_grad = bool(
         getattr(args, "correct_encoder_grad_for_partial_participation", False)
     )
@@ -127,7 +151,7 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
 
         # N_global is the global token count, published to every rank (including the
         # non-colocated encoder grid) so both modules divide by the same per-token mean.
-        n_global = _global_token_count(num_tokens, language_pg)
+        n_global = _global_token_count(num_tokens, language_pg, src_global_rank)
         inv = 1.0 / n_global if n_global > 0 else 0.0
 
         if mimo_model.language_model is not None:
