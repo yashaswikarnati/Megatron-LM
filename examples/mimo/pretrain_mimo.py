@@ -100,11 +100,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import megatron.training.training as training_module
-from examples.mimo.model_providers.nemotron_moe_vlm import (
-    add_model_provider_args,
-    prepare_model_provider_args,
-    validate_model_provider_args,
-)
+from examples.mimo.model_providers.nemotron_moe_vlm import add_model_provider_args
 from examples.mimo.training.args import add_hetero_grid_args, validate_hetero_grid_args
 from examples.mimo.training.bootstrap import build_mimo_runtime
 from examples.mimo.training.data import add_data_args
@@ -153,26 +149,16 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 
 
 def _parse_and_validate() -> argparse.Namespace:
-    """Run the stock arg pipeline plus the MIMO preset/validation hooks.
+    """Run the stock arg pipeline plus the hetero grid validation.
 
-    Sequence (handoff section 2):
-      parse_args(extra) -> prepare_model_provider_args (preset, BEFORE validate)
-      -> stock validate_args -> validate_model_provider_args
-      -> validate_hetero_grid_args -> data_parallel_size fix.
+    Sequence: parse_args(extra) -> stock validate_args -> validate_hetero_grid_args
+    -> data_parallel_size fix. Architecture flows from CLI flags (no preset).
     """
     args = parse_args(extra_args_provider)
-
-    # Apply the Nemotron preset BEFORE stock validation so preset-derived sizes
-    # (num_layers, hybrid pattern, seq_length, num_experts, image_seq_length, ...)
-    # flow into validate_args.
-    prepare_model_provider_args(args)
 
     # Stock validation. ``defaults`` fills only args the user left at default.
     validate_args(args, _ARGS_DEFAULTS)
 
-    # MIMO-specific validation (runs after stock so padded_vocab_size / num_experts
-    # are populated).
-    validate_model_provider_args(args)
     world_size = int(os.environ.get("WORLD_SIZE", args.world_size))
     validate_hetero_grid_args(args, world_size)
 

@@ -10,6 +10,7 @@ from typing import Optional
 
 import torch
 
+from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.training.topology import HeteroTopology
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -28,6 +29,22 @@ def add_data_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         choices=["mock"],
         default="mock",
         help="Which MIMO dataset backend to build (mock only for now).",
+    )
+    # Image-token / tiling / tokenizer knobs the data path + model token-scatter
+    # consume (moved here from the model provider).
+    group.add_argument("--image-seq-length", type=int, default=None,
+                       help="Total image tokens per sample (default: derived from seq length).")
+    group.add_argument("--image-token-id", type=int, default=511,
+                       help="Vocab id of the placeholder image token.")
+    group.add_argument("--pad-token-id", type=int, default=0)
+    group.add_argument("--image-token", type=str, default="<image>")
+    group.add_argument("--tokenizer-prompt-format", type=str, default="nemotron6-moe")
+    group.add_argument("--num-image-tiles", type=int, default=12)
+    group.add_argument(
+        "--vision-input-mode",
+        choices=["pixels", "hidden_states"],
+        default="pixels",
+        help="Encoder input type: raw pixels (RADIO) or precomputed hidden states (CLIP/mock).",
     )
     return parser
 
@@ -133,7 +150,7 @@ class MockVLMIterator:
         self.micro_batch_size = micro_batch_size
         self.encoder_name = encoder_name
         self.image_seq_length = args.image_seq_length or args.seq_length // 2
-        self.vision_encoder_key = getattr(args, "vision_encoder_key", "clip_encoder")
+        self.vision_encoder_key = getattr(args, "vision_encoder_key", RADIO_ENCODER_MODULE_NAME)
         # Pixel-input encoders (e.g. the Nemotron RADIO provider sets
         # ``vision_input_mode="pixels"``) take a raw image tensor as the
         # positional ``x`` arg of their wrapper's forward. Hidden-state encoders
