@@ -586,6 +586,17 @@ def _install_mimo_checkpointing(topology):
 
         nfpo = int(loaded.get("num_floating_point_operations_so_far", 0))
         resume_iter = 0 if is_finetune else int(loaded.get("iteration", iteration))
+
+        # Free the loaded-checkpoint buffers + load request before training starts.
+        # The model is restored in-place and the optimizer has copied its state into its
+        # own (pre-allocated) buffers, so the loaded optimizer state (~full optimizer
+        # size) and the load scratch are now dead duplicates. Releasing them back to the
+        # OS via empty_cache restores step headroom to match the from-scratch path —
+        # otherwise the retained buffers leave too little for the step's NCCL/activation
+        # allocations and the first resumed iteration OOMs.
+        del loaded, request, rng_state, ckpt_args
+        torch.cuda.empty_cache()
+
         print_rank_0(f"resuming hetero MIMO training at iteration {resume_iter}")
         return resume_iter, nfpo
 
