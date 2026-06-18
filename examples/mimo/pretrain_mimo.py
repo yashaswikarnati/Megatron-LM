@@ -549,12 +549,19 @@ def _install_mimo_checkpointing(topology):
         # (returned in ``loaded`` below), so don't request it back as a load target.
         request.pop("args", None)
 
+        # dist_checkpointing.load fills the request's ShardedTensors IN-PLACE: the
+        # model request comes from model.sharded_state_dict() whose ShardedTensors
+        # reference the live param storage, so model params are restored here directly.
         loaded = dist_checkpointing.load(request, source_dir)
 
-        # Apply the loaded state to model / optimizer / scheduler (the symmetric
-        # union assembled by every rank reconstructs into each rank's own shards).
+        # Do NOT re-apply the model via model[0].load_state_dict(loaded["model"]): the
+        # sharded keys carry one ``module.`` level (mcore DDP has no sharded_state_dict
+        # so it inherits MegatronModule's, which names its child ``module.``; Float16Module
+        # strips its own), but a plain load_state_dict on the outer MimoModel walks the real
+        # DDP->Float16 hierarchy (two ``module.`` levels) and mismatches — which breaks the
+        # frozen encoder (the trainable language model is also carried by the optimizer load).
+        # The in-place dist_checkpointing.load above already restored model params.
         if not skip_load_to_model_and_opt:
-            model[0].load_state_dict(loaded["model"], strict=strict)
             if (
                 include_optim
                 and optimizer is not None
