@@ -10,7 +10,6 @@ from typing import Optional
 
 import torch
 
-from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from examples.mimo.training.topology import HeteroTopology
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -150,7 +149,6 @@ class MockVLMIterator:
         self.micro_batch_size = micro_batch_size
         self.encoder_name = encoder_name
         self.image_seq_length = args.image_seq_length or args.seq_length // 2
-        self.vision_encoder_key = getattr(args, "vision_encoder_key", RADIO_ENCODER_MODULE_NAME)
         # Pixel-input encoders (e.g. the Nemotron RADIO provider sets
         # ``vision_input_mode="pixels"``) take a raw image tensor as the
         # positional ``x`` arg of their wrapper's forward. Hidden-state encoders
@@ -211,7 +209,7 @@ class MockVLMIterator:
                 # Fixed-tile RADIO (``--no-dynamic-resolution``): the wrapper's
                 # forward patchifies a raw (N, 3, img_h, img_w) image tensor.
                 encoder_inputs = {
-                    self.vision_encoder_key: {
+                    self.encoder_name: {
                         "x": torch.randn(
                             self.micro_batch_size * self.num_image_tiles,
                             3,
@@ -236,7 +234,7 @@ class MockVLMIterator:
                     generator=self.generator,
                 )
                 encoder_inputs = {
-                    self.vision_encoder_key: {
+                    self.encoder_name: {
                         "hidden_states": encoder_hidden_states,
                         "attention_mask": None,
                     }
@@ -265,7 +263,7 @@ class MockVLMIterator:
         so per-image patches = 4 * (image_seq_length / num_image_tiles).
 
         Returns the encoder-input dict with ``x``/``imgs_sizes``/
-        ``packed_seq_params`` keyed under ``vision_encoder_key``, matching
+        ``packed_seq_params`` keyed under ``encoder_name``, matching
         DynamicResolutionImageTilingStrategy.stack.
         """
         num_images = self.num_image_tiles
@@ -322,7 +320,7 @@ class MockVLMIterator:
             max_seqlen_kv=torch.tensor(patches_per_image, dtype=torch.int32),
         )
         return {
-            self.vision_encoder_key: {
+            self.encoder_name: {
                 "x": x,
                 "imgs_sizes": imgs_sizes,
                 "packed_seq_params": packed_seq_params,
