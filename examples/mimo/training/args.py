@@ -31,7 +31,6 @@ once stacked.
 from __future__ import annotations
 
 import argparse
-import math
 from typing import List
 
 from examples.mimo.training.topology import ModuleGridSpec
@@ -105,8 +104,6 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
       * CP must be 1 on both grids (Phase-2 limitation).
       * MoE: ``num_experts % llm_ep == 0`` (resolves PR-E1 open-Q3 -- the
         EP-divisibility check belongs here, not in the provider).
-      * Global batch is keyed on ``llm_dp``: ``mbs * num_microbatches * llm_dp``.
-      * Sample-vs-iter scheduler resolution when ``--train-samples`` is present.
       * ``--llm-only``: language grid must cover ``[0, world_size)`` exactly.
       * Fan-out divisibility: ``mbs * llm_dp % encoder_dp == 0``.
       * Encoder + LLM rank spans are DISJOINT and COVERING over ``world_size``.
@@ -122,16 +119,6 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             f"--num-experts ({num_experts}) must be divisible by --llm-ep ({args.llm_ep})"
         )
 
-    # Sample-based scheduler resolution: derive --train-iters from --train-samples
-    # using the llm_dp-keyed global batch size.
-    if getattr(args, "train_samples", None) is not None:
-        derived_gbs = args.micro_batch_size * _num_microbatches(args) * args.llm_dp
-        gbs = args.global_batch_size if getattr(args, "global_batch_size", None) else derived_gbs
-        if gbs <= 0:
-            raise ValueError(
-                "--train-samples requires a positive derived/explicit --global-batch-size"
-            )
-        args.train_iters = math.ceil(args.train_samples / gbs)
 
     llm_size = args.llm_tp * args.llm_cp * args.llm_pp * args.llm_dp
 
@@ -237,11 +224,3 @@ def _num_experts(args: argparse.Namespace) -> int:
         if value:
             return int(value)
     return 0
-
-
-def _num_microbatches(args: argparse.Namespace) -> int:
-    """Resolve the per-step microbatch count from whichever arg the loop exposes."""
-    value = getattr(args, "num_microbatches", None)
-    if value:
-        return int(value)
-    return 1

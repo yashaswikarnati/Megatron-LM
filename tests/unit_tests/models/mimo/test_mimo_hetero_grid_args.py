@@ -52,9 +52,6 @@ def _layout_8gpu_20l(**overrides):
     args = _parse(argv)
     # Stock args the validator reads but the grid parser does not own.
     args.micro_batch_size = 1
-    args.num_microbatches = 2
-    args.global_batch_size = None
-    args.train_samples = None
     args.num_experts = 128
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -142,10 +139,3 @@ def test_llm_only_covers_world():
     specs = build_module_grid_specs(args, 4, encoder_module_name="radio_encoder")
     assert len(specs) == 1
     assert specs[0].name == MIMO_LANGUAGE_MODULE_KEY
-
-
-def test_train_samples_resolves_iters():
-    # gbs = mbs(1) * num_microbatches(2) * llm_dp(2) = 4; 17 samples -> ceil(17/4)=5.
-    args = _layout_8gpu_20l(train_samples=17, train_iters=999)
-    validate_hetero_grid_args(args, WORLD_SIZE_8)
-    assert args.train_iters == 5

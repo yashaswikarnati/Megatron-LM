@@ -118,6 +118,7 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import set_global_variables as _stock_set_global_variables
+from megatron.training.training import update_train_iters
 
 # args ``set_global_variables`` requires but which the script does not pass. We
 # skip the tokenizer build (mock data reads args.vocab_size directly), so no
@@ -167,6 +168,11 @@ def _parse_and_validate() -> argparse.Namespace:
     # Re-key it on the language grid's DP so get_num_microbatches() and sample
     # accounting reflect the disjoint hetero layout.
     args.data_parallel_size = args.llm_dp
+
+    # Stock owns the --train-samples -> --train-iters conversion (training.py); the
+    # custom loop bypasses get_optimizer_param_scheduler, so invoke it here.
+    if getattr(args, "train_samples", None) is not None:
+        update_train_iters(args)
 
     # Stock throughput/FLOPs logging does ``1 + args.mtp_num_layers``; the Nemotron
     # preset leaves it None (MTP off), which TypeErrors. Default to 0 (no MTP).
