@@ -185,6 +185,20 @@ def main() -> None:
                 f"branch={_mimo_branch_name(rt.topology)}",
                 flush=True,
             )
+    except BaseException as _e:  # DEBUG-ONLY; surface the masked exception before teardown.
+        if os.environ.get("MIMO_SCHED_DEBUG"):
+            import traceback as _tb
+
+            import torch.distributed as _d
+
+            print(
+                f"[MIMO-TRACE rank={_d.get_rank()}] pretrain() RAISED {type(_e).__name__}: {_e}",
+                flush=True,
+            )
+            _tb.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+        raise
     finally:
         if hasattr(rt.model[0], "destroy"):
             rt.model[0].destroy()

@@ -2344,6 +2344,12 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
+        if os.environ.get("MIMO_SCHED_DEBUG"):  # DEBUG-ONLY; remove before merge.
+            print(
+                f"[MIMO-TRACE rank={torch.distributed.get_rank()}] warmup i={i} "
+                f"before forward_step",
+                flush=True,
+            )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -2359,6 +2365,12 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             is_last_stage=p2p_communicator.is_pp_last_stage,
         )
+        if os.environ.get("MIMO_SCHED_DEBUG"):  # DEBUG-ONLY; remove before merge.
+            print(
+                f"[MIMO-TRACE rank={torch.distributed.get_rank()}] warmup i={i} "
+                f"after forward_step -> before send_forward",
+                flush=True,
+            )
         p2p_communicator.send_forward(output_tensor, p2p_communicator.is_pp_last_stage)
         total_num_tokens += num_tokens
 
