@@ -12,7 +12,6 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
-from megatron.core.utils import get_model_config
 
 # Sentinel set per modality submodule when this rank had that modality's input this step.
 _PARTICIPATED_ATTR = "_mimo_rank_processed_input"
@@ -188,18 +187,7 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
             if vision_scale != 0.0:
                 submodule.scale_gradients(vision_scale)
 
-    # Install the hook on every config the schedule may resolve via get_model_config:
-    # the MimoModel's own config and each active submodule's (build_module can give a
-    # submodule a distinct config object). The schedule calls exactly one of these once
-    # per step; the hook itself finalizes all active modules.
-    seen_config_ids = set()
-    for module in (mimo_model, mimo_model.language_model, *mimo_model.modality_submodules.values()):
-        if module is None:
-            continue
-        config = get_model_config(module)
-        if id(config) not in seen_config_ids:
-            seen_config_ids.add(id(config))
-            config.finalize_model_grads_func = finalize_grads_func
+    mimo_model.config.finalize_model_grads_func = finalize_grads_func
     # The schedule always calls grad_scale_func with a Tensor loss; the per-token
     # mean is applied in finalize_grads_func, so no extra scaling is needed here.
     mimo_model.config.grad_scale_func = lambda loss: loss
