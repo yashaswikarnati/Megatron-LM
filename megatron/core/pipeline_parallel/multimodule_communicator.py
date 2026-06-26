@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
@@ -14,6 +15,14 @@ from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+# DEBUG-ONLY cross-grid schedule trace (gated on MIMO_SCHED_DEBUG); remove before merge.
+_MIMO_TRACE = bool(os.environ.get("MIMO_SCHED_DEBUG"))
+
+
+def _mtrace(msg: str) -> None:
+    if _MIMO_TRACE:
+        print(f"[MIMO-TRACE rank={dist.get_rank()}] {msg}", flush=True)
 
 
 @dataclass
@@ -337,11 +346,16 @@ class MultiModulePipelineCommunicator:
         )
         input_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
-
+            _mtrace(
+                f"recv_forward[{module_name}] pp_rank={rank_module_info.pp_rank}/"
+                f"{rank_module_info.pp_size} dest_bridges="
+                f"{len(rank_module_info.bridge_comms_as_dest_module)}"
+            )
             if rank_module_info.pp_rank == 0:
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
+                    _mtrace(f"  -> bridge.recv_forward from {bridge_comm.src_module_name}")
                     received_tensor = bridge_comm.recv_forward()
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:
@@ -360,10 +374,16 @@ class MultiModulePipelineCommunicator:
             output_dict: A dictionary mapping module names to tensors.
         """
         for module_name, rank_module_info in self.rank_module_map.items():
+            _mtrace(
+                f"send_forward[{module_name}] pp_rank={rank_module_info.pp_rank}/"
+                f"{rank_module_info.pp_size} src_bridges="
+                f"{len(rank_module_info.bridge_comms_as_src_module)}"
+            )
             if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # If last stage, and has outgoing modules, send forward activation
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
+                    _mtrace(f"  -> bridge.send_forward to {bridge_comm.dest_module_name}")
                     bridge_comm.send_forward(output_dict[module_name])
             else:
                 # If not last stage, send forward activation by using P2P communicator.

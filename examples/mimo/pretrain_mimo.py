@@ -177,6 +177,14 @@ def main() -> None:
             p2p_communicator=rt.communicator,
             schedule_pg_collection=rt.topology.schedule_pg_collection,
         )
+        if os.environ.get("MIMO_SCHED_DEBUG"):  # DEBUG-ONLY; remove before merge.
+            import torch.distributed as _d
+
+            print(
+                f"[MIMO-TRACE rank={_d.get_rank()}] pretrain() RETURNED "
+                f"branch={_mimo_branch_name(rt.topology)}",
+                flush=True,
+            )
     finally:
         if hasattr(rt.model[0], "destroy"):
             rt.model[0].destroy()
