@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import os
 from functools import partial
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -2265,6 +2266,17 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+
+    if os.environ.get("MIMO_SCHED_DEBUG"):  # DEBUG-ONLY; remove before merge.
+        print(
+            f"[MIMO-TRACE rank={torch.distributed.get_rank()}] fbp-enter "
+            f"multimodule={is_multimodule} forward_only={forward_only} "
+            f"total_stages={getattr(p2p_communicator, 'total_stages', '?')} "
+            f"current_stage={getattr(p2p_communicator, 'current_stage', '?')} "
+            f"num_warmup={num_warmup_microbatches} num_mb={num_microbatches} "
+            f"remaining={num_microbatches_remaining}",
+            flush=True,
+        )
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
