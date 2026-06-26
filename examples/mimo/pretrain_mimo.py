@@ -177,6 +177,28 @@ def main() -> None:
             p2p_communicator=rt.communicator,
             schedule_pg_collection=rt.topology.schedule_pg_collection,
         )
+        if os.environ.get("MIMO_SCHED_DEBUG"):  # DEBUG-ONLY; remove before merge.
+            import torch.distributed as _d
+
+            print(
+                f"[MIMO-TRACE rank={_d.get_rank()}] pretrain() RETURNED "
+                f"branch={_mimo_branch_name(rt.topology)}",
+                flush=True,
+            )
+    except BaseException as _e:  # DEBUG-ONLY; surface the masked exception before teardown.
+        if os.environ.get("MIMO_SCHED_DEBUG"):
+            import traceback as _tb
+
+            import torch.distributed as _d
+
+            print(
+                f"[MIMO-TRACE rank={_d.get_rank()}] pretrain() RAISED {type(_e).__name__}: {_e}",
+                flush=True,
+            )
+            _tb.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+        raise
     finally:
         if hasattr(rt.model[0], "destroy"):
             rt.model[0].destroy()
