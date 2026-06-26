@@ -407,10 +407,15 @@ class MultiModulePipelineCommunicator:
         """
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
+            _mtrace(
+                f"send_forward_recv_backward[{module_name}] pp_rank={rank_module_info.pp_rank}/"
+                f"{rank_module_info.pp_size}"
+            )
             if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # If last stage, and has outgoing modules, send forward activation and
                 # receive backward gradient by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
+                    _mtrace(f"  -> bridge.send_forward_recv_backward to {bridge_comm.dest_module_name}")
                     grad = bridge_comm.send_forward_recv_backward(output_dict[module_name])
                     grad_dict[bridge_comm.src_module_name] = grad
             else:
@@ -440,6 +445,11 @@ class MultiModulePipelineCommunicator:
         """
         input_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
+            _mtrace(
+                f"send_backward_recv_forward[{module_name}] pp_rank={rank_module_info.pp_rank}/"
+                f"{rank_module_info.pp_size} dest_bridges="
+                f"{len(rank_module_info.bridge_comms_as_dest_module)}"
+            )
             if rank_module_info.pp_rank == 0:
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     # If first stage, and has incoming modules, send backward gradient and
@@ -475,10 +485,16 @@ class MultiModulePipelineCommunicator:
         )
         grad_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
+            _mtrace(
+                f"recv_backward[{module_name}] pp_rank={rank_module_info.pp_rank}/"
+                f"{rank_module_info.pp_size} src_bridges="
+                f"{len(rank_module_info.bridge_comms_as_src_module)}"
+            )
             if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                 # If last stage, and has incoming modules, receive backward gradient
                 # by using bridge communicator.
                 for bridge_comm in rank_module_info.bridge_comms_as_src_module:
+                    _mtrace(f"  -> bridge.recv_backward from {bridge_comm.dest_module_name}")
                     grad = bridge_comm.recv_backward()
                     grad_dict[bridge_comm.src_module_name] = grad
             else:
