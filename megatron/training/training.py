@@ -2143,6 +2143,18 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
+        # Drive per-module groups + rng prefix from the model's pg_collection (mirrors the
+        # save path); empty when absent, so non-MIMO load is byte-identical.
+        ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+        load_kwargs = {}
+        if ckpt_pgc is not None:
+            load_kwargs = {
+                "tp_group": getattr(ckpt_pgc, "tp", None),
+                "pp_group": getattr(ckpt_pgc, "pp", None),
+                "dp_group": getattr(ckpt_pgc, "dp", None),
+                "dp_cp_group": getattr(ckpt_pgc, "dp_cp", None),
+                "rng_state_key_prefix": getattr(unwrap_model(model)[0], "rng_state_key_prefix", ""),
+            }
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
@@ -2151,6 +2163,7 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
+            **load_kwargs,
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
@@ -3423,7 +3436,9 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    # Don't clobber a finalize hook a builder already installed (e.g. hetero MIMO).
+    if getattr(config, "finalize_model_grads_func", None) is None:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
