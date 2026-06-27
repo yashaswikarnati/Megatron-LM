@@ -66,6 +66,8 @@ def _parse_and_validate() -> argparse.Namespace:
         multiple = args.make_vocab_size_divisible_by * args.llm_tp
         args.padded_vocab_size = int(math.ceil(args.vocab_size / multiple) * multiple)
     args.dataloader_type = "external"  # per-rank iterator passed through
+    # MoE routing + cross-grid bridge are non-deterministic across re-runs; disable result-validation rerun.
+    args.rerun_mode = "disabled"
     # Mock data is train-only; disable eval and keep eval_interval positive (modulo guard).
     args.eval_iters = 0
     if getattr(args, "eval_interval", None) is None:
