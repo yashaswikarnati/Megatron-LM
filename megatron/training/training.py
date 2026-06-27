@@ -1095,7 +1095,13 @@ def pretrain(
         seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
     # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # Global MPU groups are absent on disjoint grids (skip_model_parallel_init); fall back to the
+    # schedule-derived collection, which the builder ignores when it supplies its own per-module groups.
+    pg_collection = (
+        ProcessGroupCollection.use_mpu_process_groups()
+        if mpu.model_parallel_is_initialized()
+        else init_pg_collection
+    )
 
     timestamp_after_initialize_megatron = time.time()
 
@@ -2183,7 +2189,12 @@ def setup_model_and_optimizer(
     # is too small for the number of data-parallel replicas.
     num_microbatches = get_num_microbatches()
     current_global_batch_size = get_current_global_batch_size()
-    data_parallel_size = mpu.get_data_parallel_world_size()
+    # Fall back to args when global parallel_state is absent (e.g. skip_model_parallel_init).
+    data_parallel_size = (
+        mpu.get_data_parallel_world_size()
+        if mpu.model_parallel_is_initialized()
+        else args.data_parallel_size
+    )
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
         f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
