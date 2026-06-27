@@ -16,6 +16,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.training.initialize import _set_random_seed
 from megatron.training.training import resolve_ddp_bucket_size, wrap_model_chunks_with_ddp
 from megatron.training.utils import print_rank_0
 
@@ -48,6 +49,24 @@ def configure_module_rng(
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(
         seed, tp_rank=tp_rank, ep_rank=ep_rank, etp_rank=expt_tp_rank, force_reset_rng=True
+    )
+
+
+def _seed_module_rng(
+    args: argparse.Namespace, pg_collection: ProcessGroupCollection, role_seed_offset: int
+) -> None:
+    """Seed host + CUDA RNG for one module role from its parallel groups (no mpu here)."""
+    _set_random_seed(
+        args.seed + role_seed_offset,
+        args.data_parallel_random_init,
+        args.te_rng_tracker,
+        args.inference_rng_tracker,
+        use_cudagraphable_rng=args.cuda_graph_impl != "none",
+        pp_group=pg_collection.pp,
+        dp_group=pg_collection.dp_cp,
+        tp_group=pg_collection.tp,
+        ep_group=pg_collection.ep,
+        etp_group=pg_collection.expt_tp,
     )
 
 
