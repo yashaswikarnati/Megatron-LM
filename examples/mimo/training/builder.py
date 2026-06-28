@@ -162,9 +162,15 @@ class MimoModelBuilder(ModelBuilder["MimoModel", MimoBuildConfig]):
         if wrap_with_ddp:
             wrap_active_modules_with_ddp(args, mimo_model, topology)
 
-        # Per-module PGC (not the multi-module schedule PGC) for train()'s DP reductions
-        # and the stock save/load group threading.
-        mimo_model.pg_collection = language_pg if rank_in_language else encoder_pg
+        # This rank's own grid PGC (language or encoder), supplying the top-level
+        # `pg_collection` that stock save/load + DP reductions read via getattr -- MimoModel
+        # is a multi-grid container and sets none itself. None on a rank in no grid.
+        if rank_in_language:
+            mimo_model.pg_collection = language_pg
+        elif rank_in_encoder:
+            mimo_model.pg_collection = encoder_pg
+        else:
+            mimo_model.pg_collection = None
         configure_grad_sync(args, mimo_model, topology)
         # Per-grid rng key namespace (read by stock save/load); torch_dist only.
         mimo_model.rng_state_key_prefix = f"mimo.{_mimo_branch_name(topology)}."
