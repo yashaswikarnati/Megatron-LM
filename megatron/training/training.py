@@ -1432,6 +1432,7 @@ def pretrain(
                 inference_model,
                 p2p_communicator=p2p_communicator,
                 schedule_pg_collection=schedule_pg_collection,
+                pg_collection=pg_collection,
             )
 
         print_datetime('after training is done')
@@ -1444,7 +1445,8 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator
+                train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
 
         one_logger and one_logger.log_metrics(
@@ -2149,9 +2151,7 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
-        # Drive per-module groups + rng prefix from the model's pg_collection (mirrors the
-        # save path); empty when absent, so non-MIMO load is byte-identical.
-        ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+        ckpt_pgc = pg_collection if pg_collection is not None else getattr(unwrap_model(model)[0], "pg_collection", None)
         load_kwargs = {}
         if ckpt_pgc is not None:
             load_kwargs = {
@@ -2945,6 +2945,7 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    pg_collection=None,
 ):
     args = get_args()
     timers = get_timers()
@@ -2979,9 +2980,7 @@ def save_checkpoint_and_time(
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
 
-    # Resolve checkpoint groups from this rank's module PGC; None for stock runs
-    # falls back to the mpu groups inside save_checkpoint (byte-identical).
-    ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+    ckpt_pgc = pg_collection if pg_collection is not None else getattr(unwrap_model(model)[0], "pg_collection", None)
     tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
     pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
     dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
@@ -3142,6 +3141,7 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    pg_collection=None,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -3163,6 +3163,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    pg_collection=pg_collection,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -3178,6 +3179,7 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            pg_collection=pg_collection,
         )
         saved_checkpoint = True
 
@@ -3195,6 +3197,7 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            pg_collection=pg_collection,
         )
         saved_checkpoint = True
 
@@ -3216,6 +3219,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    pg_collection=pg_collection,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -3238,6 +3242,7 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -3260,6 +3265,7 @@ def train(
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -3399,7 +3405,7 @@ def train(
     for model_module in model:
         model_module.train()
 
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    model_pg_collection = pg_collection if pg_collection is not None else get_attr_wrapped_model(model[0], "pg_collection")
 
     # Tracking loss.
     total_loss_dict = {}
@@ -3662,6 +3668,7 @@ def train(
                         num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
+                        pg_collection=pg_collection,
                     )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
@@ -3762,6 +3769,7 @@ def train(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
         if should_exit:
             break
@@ -3967,6 +3975,7 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            pg_collection=pg_collection,
         )
         if should_exit:
             break
