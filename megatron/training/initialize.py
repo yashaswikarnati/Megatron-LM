@@ -51,12 +51,15 @@ def initialize_megatron(
     seed_tp_group=None,
     seed_ep_group=None,
     seed_etp_group=None,
+    skip_random_seed: bool = False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
     `allow_no_cuda` should not be set unless using megatron for cpu only
     data processing. In general this arg should not be set unless you know
     what you are doing.
+    Set ``skip_random_seed`` only when model builders seed their child modules
+    independently instead of using process-global model-parallel state.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -107,20 +110,21 @@ def initialize_megatron(
             skip_model_parallel_init=skip_model_parallel_init,
         )
 
-        # Random seeds for reproducibility.
-        print_rank_0("> setting random seeds to {} ...".format(args.seed))
-        _set_random_seed(
-            args.seed,
-            args.data_parallel_random_init,
-            args.te_rng_tracker,
-            args.inference_rng_tracker,
-            use_cudagraphable_rng=args.cuda_graph_impl != "none",
-            pp_group=seed_pp_group,
-            dp_group=seed_dp_group,
-            tp_group=seed_tp_group,
-            ep_group=seed_ep_group,
-            etp_group=seed_etp_group,
-        )
+        if not skip_random_seed:
+            # Random seeds for reproducibility.
+            print_rank_0("> setting random seeds to {} ...".format(args.seed))
+            _set_random_seed(
+                args.seed,
+                args.data_parallel_random_init,
+                args.te_rng_tracker,
+                args.inference_rng_tracker,
+                use_cudagraphable_rng=args.cuda_graph_impl != "none",
+                pp_group=seed_pp_group,
+                dp_group=seed_dp_group,
+                tp_group=seed_tp_group,
+                ep_group=seed_ep_group,
+                etp_group=seed_etp_group,
+            )
 
         # Setup MoE aux loss scale value.
         if args.num_experts is not None:

@@ -265,6 +265,27 @@ def _resolve_pipeline_communicator(
     p2p_communicator: Optional[PipelineCommunicator],
     config,
 ) -> Optional[PipelineCommunicator]:
+    if pg_collection is not None and not isinstance(
+        pg_collection, (ProcessGroupCollection, MultiModuleProcessGroupCollection)
+    ):
+        raise TypeError(
+            "pg_collection must be a ProcessGroupCollection or "
+            "MultiModuleProcessGroupCollection"
+        )
+    if isinstance(pg_collection, ProcessGroupCollection):
+        for required_group in ("pp", "tp", "cp"):
+            if getattr(pg_collection, required_group, None) is None:
+                raise ValueError(
+                    f"plain pg_collection must define non-None {required_group}"
+                )
+        if isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+            raise ValueError(
+                "MultiModulePipelineCommunicator requires a "
+                "MultiModuleProcessGroupCollection"
+            )
+        if p2p_communicator is None:
+            return P2PCommunicator(pp_group=pg_collection.pp, config=config)
+        return p2p_communicator
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
         if not isinstance(p2p_communicator, MultiModulePipelineCommunicator):
             raise ValueError(
@@ -277,8 +298,6 @@ def _resolve_pipeline_communicator(
             "MultiModulePipelineCommunicator requires a "
             "MultiModuleProcessGroupCollection"
         )
-    if isinstance(pg_collection, ProcessGroupCollection) and p2p_communicator is None:
-        return P2PCommunicator(pp_group=pg_collection.pp, config=config)
     if pg_collection is None and p2p_communicator is not None:
         raise ValueError("An explicit communicator requires an explicit pg_collection")
     return p2p_communicator
@@ -1111,6 +1130,7 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
+        skip_random_seed=isinstance(pg_collection, MultiModuleProcessGroupCollection),
         seed_pp_group=getattr(bootstrap_pg_collection, "pp", None),
         seed_dp_group=getattr(bootstrap_pg_collection, "dp", None),
         seed_tp_group=getattr(bootstrap_pg_collection, "tp", None),
@@ -1133,10 +1153,15 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    _jit_tp_size = (
-        get_pg_size(bootstrap_pg_collection.tp) if bootstrap_pg_collection is not None else None
-    )
-    set_jit_fusion_options(tp_size=_jit_tp_size)
+    # Heterogeneous module-specific JIT warmup belongs at child construction,
+    # where each child has its own shapes and process groups.
+    if not isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        _jit_tp_size = (
+            get_pg_size(bootstrap_pg_collection.tp)
+            if bootstrap_pg_collection is not None
+            else None
+        )
+        set_jit_fusion_options(tp_size=_jit_tp_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
 
