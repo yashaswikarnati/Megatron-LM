@@ -668,15 +668,15 @@ def run_mimo_1f1b_test(
 
     # Build MultiModuleProcessGroupCollection (reuse pre-created pg_collections)
     module_pgs = {}
-    language_model_module_name = None
     if is_rank_in_grid(encoder_grid):
         module_pgs[encoder_name] = vision_pg
     if is_rank_in_grid(llm_grid):
         module_pgs[MIMO_LANGUAGE_MODULE_KEY] = language_pg
-        language_model_module_name = MIMO_LANGUAGE_MODULE_KEY
 
     pg_collection = MultiModuleProcessGroupCollection(
-        module_pgs=module_pgs, language_model_module_name=language_model_module_name
+        module_pgs=module_pgs,
+        loss_module_name=MIMO_LANGUAGE_MODULE_KEY,
+        module_order=tuple(module_to_grid_map),
     )
 
     def step_func(data_iterator, model):

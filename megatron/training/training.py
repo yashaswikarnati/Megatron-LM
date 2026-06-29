@@ -3497,9 +3497,7 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func(
-        schedule_pg_collection=schedule_pg_collection
-    )
+    forward_backward_func = get_forward_backward_func(pg_collection=schedule_pg_collection)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
