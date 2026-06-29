@@ -9,10 +9,17 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from examples.mimo.training.topology import ModuleGridSpec, _validate_grid_layout, create_topology
+import examples.mimo.training.topology as topology_module
+from examples.mimo.training.topology import (
+    HeteroTopology,
+    ModuleGridSpec,
+    _validate_grid_layout,
+    create_topology,
+)
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.parallel_state import default_embedding_ranks
+from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 ENCODER = "images"
@@ -23,6 +30,45 @@ def _specs():
         ModuleGridSpec(name=ENCODER, num_ranks=4, tp=2, rank_offset=0),
         ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, tp=2, pp=2, rank_offset=4),
     ]
+
+
+def test_hetero_topology_exposes_only_pg_collection_field():
+    fields = set(HeteroTopology.__dataclass_fields__)
+
+    assert "pg_collection" in fields
+    assert "schedule_pg_collection" not in fields
+    assert not hasattr(HeteroTopology, "schedule_pg_collection")
+
+
+def test_build_multi_module_pg_collection_preserves_identical_layout_modules(mocker):
+    vision_grid = mocker.Mock()
+    audio_grid = mocker.Mock()
+    language_grid = mocker.Mock()
+    for grid in (vision_grid, audio_grid):
+        grid.shape = (2, 2)
+        grid.rank_offset = 0
+        grid.size = 4
+        grid.is_current_rank_in_grid.return_value = True
+    language_grid.is_current_rank_in_grid.return_value = False
+
+    vision_pgs = ProcessGroupCollection()
+    audio_pgs = ProcessGroupCollection()
+    grids = {"vision": vision_grid, "audio": audio_grid, "language": language_grid}
+    module_pgs = {"audio": audio_pgs, "vision": vision_pgs}
+
+    collection = topology_module.build_multi_module_pg_collection(
+        grids,
+        module_pgs,
+        loss_module_name="language",
+        module_order=("vision", "audio", "language"),
+    )
+
+    assert collection.module_order == ("vision", "audio", "language")
+    assert collection.loss_module_name == "language"
+    assert list(collection.keys()) == ["vision", "audio"]
+    assert collection["vision"] is vision_pgs
+    assert collection["audio"] is audio_pgs
+    assert collection["vision"] is not collection["audio"]
 
 
 class TestModuleGridSpecResolution:
@@ -65,6 +111,20 @@ class TestHeteroTopology:
             assert encoder_ranks | llm_ranks == set(range(dist.get_world_size()))
             assert topo.grids[ENCODER].rank_offset == 0
             assert topo.grids[MIMO_LANGUAGE_MODULE_KEY].rank_offset == 4
+        finally:
+            topo.destroy()
+
+    def test_exposes_ordered_pg_collection(self):
+        specs = _specs()
+        topo = create_topology(specs)
+        try:
+            assert topo.pg_collection.module_order == tuple(spec.name for spec in specs)
+            assert topo.pg_collection.loss_module_name == MIMO_LANGUAGE_MODULE_KEY
+            assert list(topo.pg_collection.keys()) == [
+                spec.name
+                for spec in specs
+                if topo.grids[spec.name].is_current_rank_in_grid()
+            ]
         finally:
             topo.destroy()
 

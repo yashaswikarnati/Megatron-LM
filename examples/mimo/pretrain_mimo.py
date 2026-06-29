@@ -142,7 +142,7 @@ def main() -> None:
             model_provider=None,
             skip_model_parallel_init=True,
             p2p_communicator=communicator,
-            schedule_pg_collection=topology.schedule_pg_collection,
+            schedule_pg_collection=topology.pg_collection,
         )
     finally:
         topology.destroy()

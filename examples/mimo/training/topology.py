@@ -65,19 +65,11 @@ class HeteroTopology:
 
     grids: dict[str, HyperCommGrid]
     module_pgs: dict[str, ProcessGroupCollection]
-    schedule_pg_collection: MultiModuleProcessGroupCollection
+    pg_collection: MultiModuleProcessGroupCollection
 
     def destroy(self) -> None:
         """Destroy every process group owned by this topology."""
-        destroyed: set[int] = set()
-        for pgc in self.module_pgs.values():
-            for pg in (pgc.embd, pgc.pos_embd):
-                if pg is None or id(pg) in destroyed or not _is_process_group_member(pg):
-                    continue
-                dist.destroy_process_group(pg)
-                destroyed.add(id(pg))
-        for grid in self.grids.values():
-            grid.destroy()
+        _destroy_topology_resources(self.grids, self.module_pgs)
 
 
 def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
@@ -94,7 +86,7 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
             f"create_topology requires exactly one spec named {MIMO_LANGUAGE_MODULE_KEY!r} "
             f"(the language module), got {len(language_specs)}"
         )
-    language_name = MIMO_LANGUAGE_MODULE_KEY
+    module_order = tuple(spec.name for spec in specs)
 
     grids: dict[str, HyperCommGrid] = {}
     module_pgs: dict[str, ProcessGroupCollection] = {}
@@ -103,16 +95,38 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
             grids[spec.name] = _build_grid(spec)
         _validate_grid_layout(grids)
 
-        for name, grid in grids.items():
-            module_pgs[name] = pg_collection_from_grid(grid, is_language=(name == language_name))
+        for name in module_order:
+            module_pgs[name] = pg_collection_from_grid(
+                grids[name], is_language=(name == MIMO_LANGUAGE_MODULE_KEY)
+            )
 
-        schedule_pg_collection = build_schedule_pg_collection(grids, module_pgs, language_name)
+        pg_collection = build_multi_module_pg_collection(
+            grids,
+            module_pgs,
+            loss_module_name=MIMO_LANGUAGE_MODULE_KEY,
+            module_order=module_order,
+        )
         return HeteroTopology(
-            grids=grids, module_pgs=module_pgs, schedule_pg_collection=schedule_pg_collection
+            grids=grids, module_pgs=module_pgs, pg_collection=pg_collection
         )
     except Exception:
-        HeteroTopology(grids=grids, module_pgs=module_pgs, schedule_pg_collection=None).destroy()
+        _destroy_topology_resources(grids, module_pgs)
         raise
+
+
+def _destroy_topology_resources(
+    grids: dict[str, HyperCommGrid], module_pgs: dict[str, ProcessGroupCollection]
+) -> None:
+    """Destroy all process groups created while building a topology."""
+    destroyed: set[int] = set()
+    for pgc in module_pgs.values():
+        for pg in (pgc.embd, pgc.pos_embd):
+            if pg is None or id(pg) in destroyed or not _is_process_group_member(pg):
+                continue
+            dist.destroy_process_group(pg)
+            destroyed.add(id(pg))
+    for grid in grids.values():
+        grid.destroy()
 
 
 def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
@@ -227,24 +241,22 @@ def _build_language_embedding_groups(grid: HyperCommGrid, pgc: ProcessGroupColle
                 pgc.pos_embd = pos_group
 
 
-def build_schedule_pg_collection(
+def build_multi_module_pg_collection(
     grids: dict[str, HyperCommGrid],
     module_pgs: dict[str, ProcessGroupCollection],
-    language_name: str,
+    loss_module_name: str,
+    module_order: tuple[str, ...],
 ) -> MultiModuleProcessGroupCollection:
-    """Build the schedule-facing collection of the modules this rank participates in."""
-    rank_modules = {}
-    rank_language_name = None
-    for name, grid in grids.items():
-        # Include only modules this rank belongs to (colocated -> all; non-colocated -> its own),
-        # so language_model_module_name is set only when this rank is in the language module.
-        if not grid.is_current_rank_in_grid():
-            continue
-        rank_modules[name] = module_pgs[name]
-        if name == language_name:
-            rank_language_name = name
+    """Build the ordered collection of modules active on this rank."""
+    rank_modules = {
+        name: module_pgs[name]
+        for name in module_order
+        if grids[name].is_current_rank_in_grid()
+    }
     return MultiModuleProcessGroupCollection(
-        module_pgs=rank_modules, language_model_module_name=rank_language_name
+        module_pgs=rank_modules,
+        loss_module_name=loss_module_name,
+        module_order=module_order,
     )
 
 
