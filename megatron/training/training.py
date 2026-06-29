@@ -303,6 +303,25 @@ def _resolve_pipeline_communicator(
     return p2p_communicator
 
 
+def _validate_train_step_pg_collection(pg_collection: Optional[PGCollection]) -> None:
+    """Validate process groups used directly by ``train_step`` before side effects."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        loss_pg_collection = pg_collection.get_loss_module_collection()
+        if loss_pg_collection is None:
+            return
+        for required_group in ("pp", "cp", "dp_cp"):
+            if getattr(loss_pg_collection, required_group, None) is None:
+                raise ValueError(
+                    f"loss module pg_collection must define {required_group}"
+                )
+        return
+
+    if pg_collection is not None:
+        for required_group in ("mp", "dp_cp"):
+            if getattr(pg_collection, required_group, None) is None:
+                raise ValueError(f"plain pg_collection must define {required_group}")
+
+
 def set_startup_timestamps(program_start=None, main_entry=None):
     """Set startup timestamps from the entry script.
 
@@ -2350,6 +2369,7 @@ def train_step(
     p2p_communicator = _resolve_pipeline_communicator(
         pg_collection, p2p_communicator, config
     )
+    _validate_train_step_pg_collection(pg_collection)
 
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
@@ -2497,9 +2517,6 @@ def train_step(
         )
         dp_cp_group = loss_pg_collection.dp_cp if loss_pg_collection is not None else None
     else:
-        for required_group in ("mp", "pp", "dp_cp"):
-            if getattr(pg_collection, required_group, None) is None:
-                raise ValueError(f"plain pg_collection must define {required_group}")
         # When freezing sub-models, ordinary runs may have a mixture of successful and
         # unsuccessful ranks, so gather optimizer statistics across the exact MP group.
         update_successful = logical_and_across_model_parallel_group(

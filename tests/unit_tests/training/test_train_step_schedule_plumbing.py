@@ -32,10 +32,12 @@ class _Rerun:
         return False, self._exit_before_optimizer, 0
 
 
-def _multi_carrier(*, loss_local=False):
+def _multi_carrier(*, loss_local=False, loss_groups=None):
     module_pgs = {"vision": ProcessGroupCollection()}
     if loss_local:
-        module_pgs["language"] = ProcessGroupCollection(pp=object(), dp_cp=object())
+        groups = dict(pp=object(), cp=object(), dp_cp=object())
+        groups.update(loss_groups or {})
+        module_pgs["language"] = ProcessGroupCollection(**groups)
     return MultiModuleProcessGroupCollection(
         module_pgs=module_pgs,
         loss_module_name="language",
@@ -52,6 +54,7 @@ def _run_train_step(
     log_num_zeros_in_grad=False,
     exit_before_optimizer=False,
     schedule=None,
+    optimizer=None,
 ):
     args = SimpleNamespace(
         save_params_interval=None,
@@ -75,7 +78,7 @@ def _run_train_step(
     )
     captured = {}
     scheduler = mock.Mock()
-    optimizer = SimpleNamespace(
+    optimizer = optimizer or SimpleNamespace(
         zero_grad=mock.Mock(), step=mock.Mock(return_value=optimizer_values)
     )
 
@@ -273,16 +276,48 @@ def test_local_loss_child_controls_terminal_stage_and_loss_reduction_group():
     assert run.result[0]["lm loss"].item() == pytest.approx(2.0)
 
 
-def test_plain_carrier_missing_required_group_raises_value_error():
-    carrier = ProcessGroupCollection(
-        mp=None, pp=object(), dp_cp=object(), tp=object(), cp=object()
-    )
+@pytest.mark.parametrize("missing_group", ("mp", "dp_cp"))
+def test_plain_carrier_missing_required_group_fails_before_side_effects(missing_group):
+    groups = dict(mp=object(), pp=object(), dp_cp=object(), tp=object(), cp=object())
+    groups[missing_group] = None
+    carrier = ProcessGroupCollection(**groups)
+    optimizer = SimpleNamespace(zero_grad=mock.Mock(), step=mock.Mock())
+    schedule = mock.Mock(return_value=[])
 
-    with pytest.raises(ValueError, match="plain pg_collection must define mp"):
+    with pytest.raises(ValueError, match=rf"plain pg_collection must define {missing_group}"):
         _run_train_step(
             pg_collection=carrier,
             p2p_communicator=object.__new__(P2PCommunicator),
+            exit_before_optimizer=True,
+            schedule=schedule,
+            optimizer=optimizer,
         )
+
+    schedule.assert_not_called()
+    optimizer.zero_grad.assert_not_called()
+    optimizer.step.assert_not_called()
+
+
+@pytest.mark.parametrize("missing_group", ("pp", "cp", "dp_cp"))
+def test_local_loss_child_missing_required_group_fails_before_side_effects(missing_group):
+    carrier = _multi_carrier(loss_local=True, loss_groups={missing_group: None})
+    optimizer = SimpleNamespace(zero_grad=mock.Mock(), step=mock.Mock())
+    schedule = mock.Mock(return_value=[])
+
+    with pytest.raises(
+        ValueError, match=rf"loss module pg_collection must define {missing_group}"
+    ):
+        _run_train_step(
+            pg_collection=carrier,
+            p2p_communicator=object.__new__(MultiModulePipelineCommunicator),
+            exit_before_optimizer=True,
+            schedule=schedule,
+            optimizer=optimizer,
+        )
+
+    schedule.assert_not_called()
+    optimizer.zero_grad.assert_not_called()
+    optimizer.step.assert_not_called()
 
 
 def test_train_step_without_carrier_keeps_legacy_mpu_fallback():
