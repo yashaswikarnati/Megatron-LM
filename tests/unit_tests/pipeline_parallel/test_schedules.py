@@ -79,6 +79,18 @@ def test_get_forward_backward_func():
     Utils.destroy_model_parallel()
 
 
+def test_get_forward_backward_func_plain_pg_collection_uses_mpu_schedule():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
+    try:
+        expected_schedule = schedule.get_forward_backward_func()
+        assert (
+            schedule.get_forward_backward_func(pg_collection=ProcessGroupCollection())
+            is expected_schedule
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_get_forward_backward_func_selects_multimodule_schedule_from_pg_collection():
     pg_collection = MultiModuleProcessGroupCollection(
         module_pgs={"vision": ProcessGroupCollection()},
