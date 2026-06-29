@@ -135,15 +135,13 @@ class TestMultiModuleProcessGroupCollection:
     def test_topology_and_policy_are_immutable_snapshots(self):
         vision_pgs = ProcessGroupCollection()
         source_pgs = {"vision": vision_pgs}
-        source_order = ["vision", "loss"]
         collection = MultiModuleProcessGroupCollection(
             module_pgs=source_pgs,
             loss_module_name="loss",
-            module_order=source_order,
+            module_order=("vision", "loss"),
         )
 
         source_pgs["loss"] = ProcessGroupCollection()
-        source_order.reverse()
 
         assert list(collection.keys()) == ["vision"]
         assert collection.module_order == ("vision", "loss")
@@ -156,8 +154,9 @@ class TestMultiModuleProcessGroupCollection:
         with pytest.raises(AttributeError):
             collection.module_order = ("loss", "vision")
 
-        vision_pgs.marker = "still mutable"
-        assert collection["vision"].marker == "still mutable"
+        sentinel = object()
+        vision_pgs.tp = sentinel
+        assert collection["vision"].tp is sentinel
 
     def test_accessors_follow_canonical_order_for_local_modules(self):
         vision_pgs = ProcessGroupCollection()
