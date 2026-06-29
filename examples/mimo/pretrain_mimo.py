@@ -66,10 +66,6 @@ def _parse_and_validate() -> argparse.Namespace:
         multiple = args.make_vocab_size_divisible_by * args.llm_tp
         args.padded_vocab_size = int(math.ceil(args.vocab_size / multiple) * multiple)
     args.dataloader_type = "external"  # per-rank iterator passed through
-    # MoE routing + cross-grid bridge are non-deterministic across re-runs; disable result-validation rerun.
-    args.rerun_mode = "disabled"
-    # Mock data is train-only; disable eval and keep eval_interval positive (modulo guard).
-    args.eval_iters = 0
     if getattr(args, "eval_interval", None) is None:
         args.eval_interval = args.train_iters or 1
     return args
@@ -125,14 +121,15 @@ def main() -> None:
     specs = build_module_grid_specs(args, world_size, RADIO_ENCODER_MODULE_NAME)
     topology = create_topology(specs)
     communicator = build_pipeline_communicator(args, topology)
-    data_iterator = select_data_iterator(args, topology)
+    # Independent mock iterators (each owns its generator) for train/valid/test.
+    train_iter, valid_iter, test_iter = (select_data_iterator(args, topology) for _ in range(3))
 
     # Carrier: only ``builder`` is serialized; topology/args ride as underscore fields.
     model_cfg = MimoBuildConfig(_topology=topology, _args=args)
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
 
     def _dataset_provider(train_val_test_num_samples):
-        return data_iterator, None, None
+        return train_iter, valid_iter, test_iter
 
     _dataset_provider.is_distributed = True
 

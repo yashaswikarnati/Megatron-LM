@@ -1,20 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""ModelBuilder for heterogeneous MIMO (Nemotron6-MoE VLM) training.
-
-``MimoModelBuilder`` plugs the disjoint vision/language grids into the stock
-``setup_model_and_optimizer`` path: ``cfg.model.get_builder_cls()(cfg.model)``
-resolves the builder, then ``build_distributed_models`` returns the
-per-submodule-DDP ``MimoModel`` that ``get_megatron_optimizer`` (which dispatches
-on ``MimoModel``) and the train loop drive.
-
-Carrier decision: the builder is constructed as ``builder_cls(cfg.model)``, so the
-live topology/args must ride on the model config. ``MimoBuildConfig`` is a minimal
-``ModelConfig`` subclass whose only required job is the ``builder`` ClassVar; the
-non-serializable runtime objects (topology, args) are stored as underscore-prefixed
-fields, which ``ModelConfig.as_dict``/``from_dict`` skip, so nothing live is ever
-serialized into the checkpoint.
-"""
+"""ModelBuilder for heterogeneous MIMO (Nemotron6-MoE VLM) training on disjoint grids."""
 
 from __future__ import annotations
 
@@ -47,10 +33,7 @@ _ENCODER_SEED_OFFSET = 10_000
 
 @dataclass(kw_only=True)
 class MimoBuildConfig(ModelConfig):
-    """Carrier for the hetero MIMO build; only ``builder`` is serialized.
-
-    ``_topology`` and ``_args`` are live runtime objects skipped by ``as_dict``.
-    """
+    """Model config carrier; only ``builder`` serializes (``_topology``/``_args`` are runtime-only)."""
 
     builder: ClassVar[str] = "examples.mimo.training.builder.MimoModelBuilder"
     _topology: Optional[HeteroTopology] = field(default=None)

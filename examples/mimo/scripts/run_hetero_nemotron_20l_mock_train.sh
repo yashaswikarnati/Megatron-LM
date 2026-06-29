@@ -101,4 +101,6 @@ fi
   --ddp-bucket-size 0 \
   --train-iters "${TRAIN_ITERS}" \
   --log-interval "${LOG_INTERVAL}" \
+  --eval-iters 0 \
+  --rerun-mode disabled \
   "$@"

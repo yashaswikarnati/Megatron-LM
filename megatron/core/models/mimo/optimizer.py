@@ -327,7 +327,33 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
-    """Build the optimizer's ProcessGroupCollection from a grid's pre-created groups."""
+    """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
+
+    Only fetches process groups required by the optimizer. Assumes all groups
+    are pre-created in the grid via grid.create_pg() - does not create any new groups.
+
+    The following groups must be pre-created in the grid before calling this function:
+        grid.create_pg(["dp"])
+        grid.create_pg(["dp", "cp"])
+        grid.create_pg(["tp"])
+        grid.create_pg(["pp"])
+        grid.create_pg(["tp", "pp"])
+        grid.create_pg(["tp", "ep", "pp"])
+        grid.create_pg(["dp", "ep"])
+        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+
+    Args:
+        grid: HyperCommGrid with pre-created process groups.
+
+    Returns:
+        ProcessGroupCollection containing optimizer-required groups:
+        - dp: Data parallel group
+        - dp_cp: Data parallel with context parallel
+        - tp: Tensor parallel group
+        - mp: Model parallel group (tp × pp)
+        - tp_ep_pp: Expert tensor-model-pipeline group
+        - expt_dp: Expert data parallel group
+    """
     pg = ProcessGroupCollection()
 
     # Core groups needed by optimizer and checkpointing
