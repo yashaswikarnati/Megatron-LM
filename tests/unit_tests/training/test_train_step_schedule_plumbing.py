@@ -1,10 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""train_step forwards p2p_communicator and schedule pg_collection to forward_backward_func."""
+"""Tests for ``train_step`` schedule plumbing."""
 
 from types import SimpleNamespace
 from unittest import mock
 
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.training import training as training_mod
 
 
@@ -58,10 +63,18 @@ def _run(**kwargs):
     return captured
 
 
-def test_train_step_forwards_schedule_plumbing():
-    p2p, pg = object(), object()
-    captured = _run(p2p_communicator=p2p, schedule_pg_collection=pg)
-    assert captured["p2p_communicator"] is p2p and captured["pg_collection"] is pg
+def test_train_step_forwards_the_same_carrier_and_communicator():
+    carrier = MultiModuleProcessGroupCollection(
+        module_pgs={"vision": ProcessGroupCollection()},
+        loss_module_name="language",
+        module_order=("vision", "language"),
+    )
+    communicator = object.__new__(MultiModulePipelineCommunicator)
+
+    captured = _run(pg_collection=carrier, p2p_communicator=communicator)
+
+    assert captured["pg_collection"] is carrier
+    assert captured["p2p_communicator"] is communicator
 
 
 def test_train_step_defaults_to_none():

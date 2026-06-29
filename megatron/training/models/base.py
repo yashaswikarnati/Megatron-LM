@@ -2,13 +2,17 @@
 
 import abc
 import importlib
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 
@@ -213,7 +217,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
     @abc.abstractmethod
     def build_distributed_models(
         self,
-        pg_collection: ProcessGroupCollection,
+        pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection,
         ddp_config: DistributedDataParallelConfig | None = None,
         overlap_param_gather_with_optimizer_step: bool = False,
         use_megatron_fsdp: bool = False,

@@ -23,7 +23,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 # Third-party.
 import torch
@@ -96,6 +96,7 @@ from megatron.core.parallel_state import (
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -125,7 +126,6 @@ from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
-    get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_model_config,
@@ -255,6 +255,33 @@ _seqlen_stats_active: bool = False
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
+
+PGCollection = Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]
+PipelineCommunicator = Union[P2PCommunicator, MultiModulePipelineCommunicator]
+
+
+def _resolve_pipeline_communicator(
+    pg_collection: Optional[PGCollection],
+    p2p_communicator: Optional[PipelineCommunicator],
+    config,
+) -> Optional[PipelineCommunicator]:
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        if not isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+            raise ValueError(
+                "MultiModuleProcessGroupCollection requires a "
+                "MultiModulePipelineCommunicator"
+            )
+        return p2p_communicator
+    if isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+        raise ValueError(
+            "MultiModulePipelineCommunicator requires a "
+            "MultiModuleProcessGroupCollection"
+        )
+    if isinstance(pg_collection, ProcessGroupCollection) and p2p_communicator is None:
+        return P2PCommunicator(pp_group=pg_collection.pp, config=config)
+    if pg_collection is None and p2p_communicator is not None:
+        raise ValueError("An explicit communicator requires an explicit pg_collection")
+    return p2p_communicator
 
 
 def set_startup_timestamps(program_start=None, main_entry=None):
@@ -1013,8 +1040,8 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
-    p2p_communicator: Optional[P2PCommunicator] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
+    pg_collection: Optional[PGCollection] = None,
     skip_model_parallel_init=False,
 ):
     """Main training program.
@@ -1074,8 +1101,8 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    init_pg_collection = (
-        schedule_pg_collection.local_collection if schedule_pg_collection is not None else None
+    bootstrap_pg_collection = (
+        pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None
     )
 
     # Initalize and get arguments, timers, and Tensorboard writer.
@@ -1084,16 +1111,14 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
-        seed_pp_group=getattr(init_pg_collection, "pp", None),
-        seed_dp_group=getattr(init_pg_collection, "dp", None),
-        seed_tp_group=getattr(init_pg_collection, "tp", None),
-        seed_ep_group=getattr(init_pg_collection, "ep", None),
-        seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
+        seed_pp_group=getattr(bootstrap_pg_collection, "pp", None),
+        seed_dp_group=getattr(bootstrap_pg_collection, "dp", None),
+        seed_tp_group=getattr(bootstrap_pg_collection, "tp", None),
+        seed_ep_group=getattr(bootstrap_pg_collection, "ep", None),
+        seed_etp_group=getattr(bootstrap_pg_collection, "expt_tp", None),
     )
-    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
-    pg_collection = (
-        init_pg_collection if init_pg_collection is not None else ProcessGroupCollection.use_mpu_process_groups()
-    )
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     timestamp_after_initialize_megatron = time.time()
 
@@ -1108,7 +1133,9 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    _jit_tp_size = get_pg_size(init_pg_collection.tp) if init_pg_collection is not None else None
+    _jit_tp_size = (
+        get_pg_size(bootstrap_pg_collection.tp) if bootstrap_pg_collection is not None else None
+    )
     set_jit_fusion_options(tp_size=_jit_tp_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
@@ -1423,7 +1450,7 @@ def pretrain(
                 non_loss_data_func,
                 inference_model,
                 p2p_communicator=p2p_communicator,
-                schedule_pg_collection=schedule_pg_collection,
+                pg_collection=pg_collection,
             )
 
         print_datetime('after training is done')
@@ -2000,7 +2027,7 @@ def setup_model_and_optimizer(
     checkpointing_context=None,
     *,
     cfg_container: PretrainConfigContainer,
-    pg_collection: ProcessGroupCollection,
+    pg_collection: PGCollection,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2275,15 +2302,23 @@ def dummy_train_step(data_iterator):
             )
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None, schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None):
+def train_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    config,
+    forward_backward_func,
+    iteration=None,
+    pg_collection: Optional[PGCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
+):
     """Single training step.
 
-    pg_collection: optional per-module :class:`ProcessGroupCollection`; None uses the mpu globals,
-        otherwise it must define mp, pp, and dp_cp.
+    pg_collection: optional process-group carrier forwarded to the schedule.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
-        cross-grid case; None preserves the default behavior.
     """
     args = get_args()
     timers = get_timers()
@@ -2360,7 +2395,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
             p2p_communicator=p2p_communicator,
-            pg_collection=schedule_pg_collection,
+            pg_collection=pg_collection,
         )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
@@ -3254,18 +3289,25 @@ def train(
     checkpointing_context,
     non_loss_data_func,
     inference_model=None,
-    p2p_communicator: Optional[P2PCommunicator] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
+    pg_collection: Optional[PGCollection] = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
-        cross-grid case; None preserves the default behavior.
+    pg_collection: optional process-group carrier forwarded to the schedule.
     """
     args = get_args()
     timers = get_timers()
+    p2p_communicator = _resolve_pipeline_communicator(
+        pg_collection, p2p_communicator, config
+    )
+    loss_pg_collection = (
+        pg_collection.get_loss_module_collection()
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection)
+        else pg_collection
+    )
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
         if hasattr(args, f.name):
@@ -3335,15 +3377,9 @@ def train(
 
             args.no_load_optim = no_load_optim
 
-    lang_pgc = (
-        schedule_pg_collection.get_language_model_collection()
-        if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
-        else None
-    )
-
     def _dp_world_size():
-        if lang_pgc is not None:
-            return lang_pgc.dp.size()
+        if loss_pg_collection is not None:
+            return loss_pg_collection.dp.size()
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
         return args.data_parallel_size
@@ -3395,11 +3431,6 @@ def train(
     for model_module in model:
         model_module.train()
 
-    pg_collection = (
-        schedule_pg_collection.local_collection
-        if schedule_pg_collection is not None
-        else get_attr_wrapped_model(model[0], "pg_collection")
-    )
     model_pg_collection = pg_collection
 
     # Tracking loss.
@@ -3497,7 +3528,7 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func(pg_collection=schedule_pg_collection)
+    forward_backward_func = get_forward_backward_func(pg_collection=pg_collection)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -3739,9 +3770,16 @@ def train(
                 num_zeros_in_grad,
                 max_attention_logit,
             ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
+                forward_step_func,
+                train_data_iterator,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                config,
+                forward_backward_func,
+                iteration=iteration,
                 pg_collection=model_pg_collection,
-                p2p_communicator=p2p_communicator, schedule_pg_collection=schedule_pg_collection
+                p2p_communicator=p2p_communicator,
             )
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
