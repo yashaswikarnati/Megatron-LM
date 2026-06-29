@@ -1074,13 +1074,9 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    init_pg_collection = None
-    if schedule_pg_collection is not None:
-        init_pg_collection = (
-            schedule_pg_collection.get_language_model_collection()
-            if schedule_pg_collection.has_language_model()
-            else next(iter(schedule_pg_collection.module_pgs.values()))
-        )
+    init_pg_collection = (
+        schedule_pg_collection.local_collection if schedule_pg_collection is not None else None
+    )
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -1095,11 +1091,8 @@ def pretrain(
         seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
     # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
-    # Global MPU groups absent on disjoint grids; fall back to the schedule-derived collection.
     pg_collection = (
-        ProcessGroupCollection.use_mpu_process_groups()
-        if mpu.model_parallel_is_initialized()
-        else init_pg_collection
+        init_pg_collection if init_pg_collection is not None else ProcessGroupCollection.use_mpu_process_groups()
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -1431,7 +1424,6 @@ def pretrain(
                 inference_model,
                 p2p_communicator=p2p_communicator,
                 schedule_pg_collection=schedule_pg_collection,
-                pg_collection=pg_collection,
             )
 
         print_datetime('after training is done')
@@ -3264,7 +3256,6 @@ def train(
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
-    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -3404,7 +3395,12 @@ def train(
     for model_module in model:
         model_module.train()
 
-    model_pg_collection = pg_collection if pg_collection is not None else get_attr_wrapped_model(model[0], "pg_collection")
+    pg_collection = (
+        schedule_pg_collection.local_collection
+        if schedule_pg_collection is not None
+        else get_attr_wrapped_model(model[0], "pg_collection")
+    )
+    model_pg_collection = pg_collection
 
     # Tracking loss.
     total_loss_dict = {}

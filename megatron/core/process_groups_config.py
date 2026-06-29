@@ -683,6 +683,14 @@ class MultiModuleProcessGroupCollection:
             )
         return self.module_pgs[module_name]
 
+    @property
+    def local_collection(self) -> ProcessGroupCollection:
+        """This rank's single-module collection; one module per rank (non-colocated)."""
+        assert (
+            len(self.module_pgs) == 1
+        ), f"local_collection requires one module per rank; got {list(self.module_pgs.keys())}"
+        return next(iter(self.module_pgs.values()))
+
     def __len__(self):
         """Return the number of modules in this wrapper."""
         return len(self.module_pgs)
