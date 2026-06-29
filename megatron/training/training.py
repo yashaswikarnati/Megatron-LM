@@ -2347,6 +2347,9 @@ def train_step(
     """
     args = get_args()
     timers = get_timers()
+    p2p_communicator = _resolve_pipeline_communicator(
+        pg_collection, p2p_communicator, config
+    )
 
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
@@ -2486,23 +2489,32 @@ def train_step(
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    for _required in ("mp", "pp", "dp_cp"):
-        assert getattr(pg_collection, _required, None) is not None, (
-            f"pg_collection passed to train_step must define {_required}"
+
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        loss_pg_collection = pg_collection.get_loss_module_collection()
+        is_last_stage = (
+            loss_pg_collection is not None and is_pp_last_stage(loss_pg_collection.pp)
         )
-    mp_group = pg_collection.mp
-    dp_cp_group = pg_collection.dp_cp
-    is_last_stage = is_pp_last_stage(pg_collection.pp)
-    # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
-    # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
-    # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
-    # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if args.log_num_zeros_in_grad:
-        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
-            num_zeros_in_grad, group=mp_group
+        dp_cp_group = loss_pg_collection.dp_cp if loss_pg_collection is not None else None
+    else:
+        for required_group in ("mp", "pp", "dp_cp"):
+            if getattr(pg_collection, required_group, None) is None:
+                raise ValueError(f"plain pg_collection must define {required_group}")
+        # When freezing sub-models, ordinary runs may have a mixture of successful and
+        # unsuccessful ranks, so gather optimizer statistics across the exact MP group.
+        update_successful = logical_and_across_model_parallel_group(
+            update_successful, group=pg_collection.mp
         )
+        # grad_norm and num_zeros_in_grad may be None on ranks without trainable params.
+        grad_norm = reduce_max_stat_across_model_parallel_group(
+            grad_norm, group=pg_collection.mp
+        )
+        if args.log_num_zeros_in_grad:
+            num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
+                num_zeros_in_grad, group=pg_collection.mp
+            )
+        is_last_stage = is_pp_last_stage(pg_collection.pp)
+        dp_cp_group = pg_collection.dp_cp
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
