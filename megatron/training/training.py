@@ -1095,8 +1095,7 @@ def pretrain(
         seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
     # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
-    # Global MPU groups are absent on disjoint grids (skip_model_parallel_init); fall back to the
-    # schedule-derived collection, which the builder ignores when it supplies its own per-module groups.
+    # Global MPU groups absent on disjoint grids; fall back to the schedule-derived collection.
     pg_collection = (
         ProcessGroupCollection.use_mpu_process_groups()
         if mpu.model_parallel_is_initialized()

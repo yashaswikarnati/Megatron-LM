@@ -137,12 +137,8 @@ class MockVLMIterator:
         self.micro_batch_size = micro_batch_size
         self.encoder_name = encoder_name
         self.image_seq_length = args.image_seq_length or args.seq_length // 2
-        # Key the encoder inputs by the encoder module name so they match the modality
-        # submodule's inner encoders dict (keyed by the module name in the provider).
+        # Key encoder inputs by module name to match the modality submodule's inner encoders dict.
         self.vision_encoder_key = getattr(args, "vision_encoder_key", None) or encoder_name
-        # "pixels" encoders take a raw image tensor; hidden-state encoders take precomputed states.
-        # RADIO is a pixel encoder; default to pixel inputs (dynamic-resolution path
-        # below sizes them to image_seq_length when --dynamic-resolution is set).
         self.vision_input_mode = getattr(args, "vision_input_mode", "pixels")
         self.dynamic_resolution = bool(getattr(args, "dynamic_resolution", False))
         self.patch_dim = getattr(args, "patch_dim", 16)
@@ -189,8 +185,7 @@ class MockVLMIterator:
                 # Dynamic-resolution RADIO consumes packed-patch inputs (x/imgs_sizes/packed_seq_params).
                 encoder_inputs = self._build_dynamic_resolution_pixels(args)
             elif self.vision_input_mode == "pixels":
-                # Fixed-tile RADIO (``--no-dynamic-resolution``): the wrapper's
-                # forward patchifies a raw (N, 3, img_h, img_w) image tensor.
+                # Fixed-tile RADIO: wrapper forward patchifies a raw (N, 3, img_h, img_w) tensor.
                 encoder_inputs = {
                     self.vision_encoder_key: {
                         "x": torch.randn(
@@ -205,9 +200,7 @@ class MockVLMIterator:
                     }
                 }
             else:
-                # Hidden-state encoders (CLIP/mock) consume a precomputed
-                # encoder hidden-state tensor of shape (image_seq_length,
-                # micro_batch_size, hidden_size).
+                # Hidden-state encoders consume precomputed (image_seq_length, mbs, hidden_size) states.
                 encoder_hidden_states = torch.randn(
                     self.image_seq_length,
                     self.micro_batch_size,
@@ -261,8 +254,7 @@ class MockVLMIterator:
         )
 
         n_images_total = self.micro_batch_size * num_images
-        # imgs_sizes and cu_seqlens/max_seqlen are CPU metadata (TE expects int32 cu_seqlens
-        # on CPU); only ``x`` is created on CUDA.
+        # cu_seqlens/imgs_sizes are CPU int32 metadata (TE requirement); only x is on CUDA.
         imgs_sizes = torch.tensor(
             [[h_pix, w_pix]] * n_images_total, dtype=torch.int32
         )
