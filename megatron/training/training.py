@@ -1547,7 +1547,9 @@ def pretrain(
                 valid_data_iterator, model,
                 iteration, process_non_loss_data_func, model_cfg,
                 verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
-                non_loss_data_func=non_loss_data_func
+                non_loss_data_func=non_loss_data_func,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
 
     if args.do_test:
@@ -1563,6 +1565,8 @@ def pretrain(
             verbose=True,
             write_to_tensorboard=not cfg_container.validation.skip_train,
             non_loss_data_func=non_loss_data_func,
+            pg_collection=pg_collection,
+            p2p_communicator=p2p_communicator,
         )
 
     wandb_writer = get_wandb_writer()
@@ -3485,8 +3489,6 @@ def train(
     for model_module in model:
         model_module.train()
 
-    model_pg_collection = pg_collection
-
     # Tracking loss.
     total_loss_dict = {}
 
@@ -3832,7 +3834,7 @@ def train(
                 config,
                 forward_backward_func,
                 iteration=iteration,
-                pg_collection=model_pg_collection,
+                pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
             )
             ft_integration.on_training_step_end()
@@ -3972,7 +3974,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
-            pg_collection=model_pg_collection,
+            pg_collection=pg_collection,
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
@@ -4019,7 +4021,9 @@ def train(
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, verbose=False, write_to_tensorboard=True,
-                                       non_loss_data_func=non_loss_data_func)
+                                       non_loss_data_func=non_loss_data_func,
+                                       pg_collection=pg_collection,
+                                       p2p_communicator=p2p_communicator)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -4133,10 +4137,37 @@ def evaluate(
     verbose=False,
     non_loss_data_func=None,
     eval_iters=None,
+    pg_collection: Optional[PGCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
 ):
     """Evaluation."""
     args = get_args()
     timers = get_timers()
+    p2p_communicator = _resolve_pipeline_communicator(
+        pg_collection, p2p_communicator, config
+    )
+
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        loss_pg_collection = pg_collection.get_loss_module_collection()
+        if loss_pg_collection is None:
+            is_loss_terminal = False
+            loss_dp_cp_group = None
+        else:
+            for required_group in ("pp", "cp", "dp_cp"):
+                if getattr(loss_pg_collection, required_group, None) is None:
+                    raise ValueError(
+                        f"loss module pg_collection must define {required_group}"
+                    )
+            is_loss_terminal = is_pp_last_stage(loss_pg_collection.pp)
+            loss_dp_cp_group = loss_pg_collection.dp_cp
+    elif isinstance(pg_collection, ProcessGroupCollection):
+        if pg_collection.dp_cp is None:
+            raise ValueError("plain pg_collection must define dp_cp")
+        is_loss_terminal = is_pp_last_stage(pg_collection.pp)
+        loss_dp_cp_group = pg_collection.dp_cp
+    else:
+        is_loss_terminal = mpu.is_pipeline_last_stage(ignore_virtual=True)
+        loss_dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
 
     timers('evaluate', log_level=0).start(barrier=True)
 
@@ -4155,7 +4186,7 @@ def evaluate(
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
-    forward_backward_func = get_forward_backward_func()
+    forward_backward_func = get_forward_backward_func(pg_collection=pg_collection)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -4209,6 +4240,8 @@ def evaluate(
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
@@ -4217,7 +4250,7 @@ def evaluate(
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            if is_loss_terminal:
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
@@ -4232,10 +4265,10 @@ def evaluate(
                             val = val.mean()
                             torch.distributed.all_reduce(
                                 val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                                group=loss_dp_cp_group,
                             )
                             val /= torch.distributed.get_world_size(
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                                group=loss_dp_cp_group,
                             )
                             total_loss_dict[key][0] += val
                             total_loss_dict[key][1] += 1
@@ -4243,7 +4276,7 @@ def evaluate(
                             val = torch.vstack(val).sum(dim=0)
                             torch.distributed.all_reduce(
                                 val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                                group=loss_dp_cp_group,
                             )
                             total_loss_dict[key] += val
                     elif val[0].numel() == 1:
@@ -4260,7 +4293,11 @@ def evaluate(
                 done_cuda = torch.tensor(
                     [train_time > args.exit_duration_in_mins], dtype=torch.int, device='cuda'
                 )
-                torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
+                torch.distributed.all_reduce(
+                    done_cuda,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=torch.distributed.group.WORLD,
+                )
                 done = done_cuda.item()
                 if done:
                     rerun_state_machine.set_mode(rerun_mode)
@@ -4270,18 +4307,24 @@ def evaluate(
         collected_non_loss_data = None
         if non_loss_data_func is not None:
             collected_non_loss_data = non_loss_data_func(model)
-        elif process_non_loss_data_func is not None and is_last_rank():
-            collected_non_loss_data = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=eval_micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=True,
-                collect_non_loss_data=True,
-            )
+        elif process_non_loss_data_func is not None:
+            report_rank = is_last_rank()
+            if isinstance(pg_collection, MultiModuleProcessGroupCollection) or report_rank:
+                non_loss_data = forward_backward_func(
+                    forward_step_func=forward_step_func,
+                    data_iterator=data_iterator,
+                    model=model,
+                    num_microbatches=eval_num_microbatches,
+                    seq_length=args.seq_length,
+                    micro_batch_size=eval_micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True,
+                    collect_non_loss_data=True,
+                    pg_collection=pg_collection,
+                    p2p_communicator=p2p_communicator,
+                )
+                if report_rank:
+                    collected_non_loss_data = non_loss_data
 
     # Move model back to the train mode.
     for model_module in model:
@@ -4310,9 +4353,14 @@ def evaluate_and_print_results(
     verbose=False,
     write_to_tensorboard=True,
     non_loss_data_func=None,
+    pg_collection: Optional[PGCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
 ):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
+    p2p_communicator = _resolve_pipeline_communicator(
+        pg_collection, p2p_communicator, config
+    )
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
     else:
@@ -4331,7 +4379,12 @@ def evaluate_and_print_results(
         assert len(eval_iters) == len(data_iterators)
 
         # with full validation we need to distribute eval_iters to all ranks
-        if mpu.get_tensor_model_parallel_rank() == 0:
+        is_source_rank = (
+            torch.distributed.get_rank() == 0
+            if isinstance(pg_collection, MultiModuleProcessGroupCollection)
+            else mpu.get_tensor_model_parallel_rank() == 0
+        )
+        if is_source_rank:
             eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
@@ -4366,6 +4419,8 @@ def evaluate_and_print_results(
             verbose,
             non_loss_data_func,
             eval_iters=iterations,
+            pg_collection=pg_collection,
+            p2p_communicator=p2p_communicator,
         )
         # Timelimit hit during evaluation
         if timelimit:

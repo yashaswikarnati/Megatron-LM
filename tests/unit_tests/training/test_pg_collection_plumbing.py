@@ -2,7 +2,9 @@
 
 """Tests for process-group and pipeline-communicator training API plumbing."""
 
+import ast
 import inspect
+import textwrap
 from types import SimpleNamespace
 from unittest import mock
 
@@ -44,6 +46,36 @@ def test_training_entrypoints_expose_only_pg_collection():
         parameters = inspect.signature(entrypoint).parameters
         assert "pg_collection" in parameters
         assert "schedule_pg_collection" not in parameters
+
+
+def test_evaluation_entrypoints_expose_optional_exact_pair():
+    for entrypoint in (training_mod.evaluate, training_mod.evaluate_and_print_results):
+        parameters = inspect.signature(entrypoint).parameters
+        assert parameters["pg_collection"].default is None
+        assert parameters["p2p_communicator"].default is None
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "expected_calls"),
+    ((training_mod.pretrain, 2), (training_mod.train, 1)),
+)
+def test_training_callers_forward_exact_pair_to_evaluation(entrypoint, expected_calls):
+    tree = ast.parse(textwrap.dedent(inspect.getsource(entrypoint)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "evaluate_and_print_results"
+    ]
+
+    assert len(calls) == expected_calls
+    for call in calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert isinstance(keywords["pg_collection"], ast.Name)
+        assert keywords["pg_collection"].id == "pg_collection"
+        assert isinstance(keywords["p2p_communicator"], ast.Name)
+        assert keywords["p2p_communicator"].id == "p2p_communicator"
 
 
 @pytest.mark.parametrize(
