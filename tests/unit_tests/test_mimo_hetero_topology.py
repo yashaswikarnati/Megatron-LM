@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Real-distributed (8-GPU, no mocks) tests for the hetero MIMO grid topology.
+"""Construction and real-distributed tests for the hetero MIMO grid topology.
 
 Layout under test: encoder grid tp=2,dp=2 at ranks 0-3, language grid tp=2,pp=2 at ranks 4-7.
 """
@@ -40,7 +40,71 @@ def test_hetero_topology_exposes_only_pg_collection_field():
     assert not hasattr(HeteroTopology, "schedule_pg_collection")
 
 
-def test_build_multi_module_pg_collection_preserves_identical_layout_modules(mocker):
+def test_create_topology_rejects_duplicate_module_names_before_grid_build(mocker):
+    build_grid = mocker.patch.object(topology_module, "_build_grid")
+    specs = [
+        ModuleGridSpec(name="vision", num_ranks=4, tp=2),
+        ModuleGridSpec(name="vision", num_ranks=4, tp=2),
+        ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, tp=2),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate module names"):
+        create_topology(specs)
+
+    build_grid.assert_not_called()
+
+
+def test_create_topology_preserves_distinct_module_resources(mocker):
+    specs = [
+        ModuleGridSpec(name="vision", num_ranks=4, tp=2),
+        ModuleGridSpec(name="audio", num_ranks=4, tp=2),
+        ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, tp=2, rank_offset=4),
+    ]
+    vision_grid = mocker.Mock(name="vision_grid")
+    audio_grid = mocker.Mock(name="audio_grid")
+    language_grid = mocker.Mock(name="language_grid")
+    for grid in (vision_grid, audio_grid):
+        grid.is_current_rank_in_grid.return_value = True
+    language_grid.is_current_rank_in_grid.return_value = False
+    build_grid = mocker.patch.object(
+        topology_module, "_build_grid", side_effect=[vision_grid, audio_grid, language_grid]
+    )
+    mocker.patch.object(topology_module, "_validate_grid_layout")
+
+    vision_pgs = ProcessGroupCollection()
+    audio_pgs = ProcessGroupCollection()
+    language_pgs = ProcessGroupCollection()
+    for pgc in (vision_pgs, audio_pgs, language_pgs):
+        pgc.embd = None
+        pgc.pos_embd = None
+    mocker.patch.object(
+        topology_module,
+        "pg_collection_from_grid",
+        side_effect=[vision_pgs, audio_pgs, language_pgs],
+    )
+
+    topology = create_topology(specs)
+    try:
+        assert [call.args[0] for call in build_grid.call_args_list] == specs
+        assert topology.grids["vision"] is vision_grid
+        assert topology.grids["audio"] is audio_grid
+        assert topology.grids[MIMO_LANGUAGE_MODULE_KEY] is language_grid
+        assert topology.module_pgs["vision"] is vision_pgs
+        assert topology.module_pgs["audio"] is audio_pgs
+        assert topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY] is language_pgs
+        assert topology.pg_collection.module_order == (
+            "vision",
+            "audio",
+            MIMO_LANGUAGE_MODULE_KEY,
+        )
+        assert list(topology.pg_collection.keys()) == ["vision", "audio"]
+        assert topology.pg_collection["vision"] is vision_pgs
+        assert topology.pg_collection["audio"] is audio_pgs
+    finally:
+        topology.destroy()
+
+
+def test_build_multi_module_pg_collection_filters_in_canonical_order(mocker):
     vision_grid = mocker.Mock()
     audio_grid = mocker.Mock()
     language_grid = mocker.Mock()
@@ -53,8 +117,9 @@ def test_build_multi_module_pg_collection_preserves_identical_layout_modules(moc
 
     vision_pgs = ProcessGroupCollection()
     audio_pgs = ProcessGroupCollection()
+    language_pgs = ProcessGroupCollection()
     grids = {"vision": vision_grid, "audio": audio_grid, "language": language_grid}
-    module_pgs = {"audio": audio_pgs, "vision": vision_pgs}
+    module_pgs = {"language": language_pgs, "audio": audio_pgs, "vision": vision_pgs}
 
     collection = topology_module.build_multi_module_pg_collection(
         grids,
@@ -69,6 +134,31 @@ def test_build_multi_module_pg_collection_preserves_identical_layout_modules(moc
     assert collection["vision"] is vision_pgs
     assert collection["audio"] is audio_pgs
     assert collection["vision"] is not collection["audio"]
+
+
+@pytest.mark.parametrize(
+    ("grid_names", "pg_names", "module_order"),
+    [
+        (("vision",), ("vision", "language"), ("vision", "language")),
+        (("vision", "language"), ("vision",), ("vision", "language")),
+        (("vision", "language"), ("vision", "language"), ("vision",)),
+    ],
+)
+def test_build_multi_module_pg_collection_rejects_module_name_mismatch(
+    mocker, grid_names, pg_names, module_order
+):
+    grids = {name: mocker.Mock() for name in grid_names}
+    for grid in grids.values():
+        grid.is_current_rank_in_grid.return_value = True
+    module_pgs = {name: ProcessGroupCollection() for name in pg_names}
+
+    with pytest.raises(ValueError, match="same declared module names"):
+        topology_module.build_multi_module_pg_collection(
+            grids,
+            module_pgs,
+            loss_module_name="language",
+            module_order=module_order,
+        )
 
 
 class TestModuleGridSpecResolution:

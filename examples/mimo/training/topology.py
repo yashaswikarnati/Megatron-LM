@@ -80,13 +80,21 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
     """
     if not specs:
         raise ValueError("create_topology requires at least one ModuleGridSpec")
+    module_order = tuple(spec.name for spec in specs)
+    duplicate_names = tuple(
+        name for name in dict.fromkeys(module_order) if module_order.count(name) > 1
+    )
+    if duplicate_names:
+        raise ValueError(
+            f"create_topology requires unique module names; duplicate module names: "
+            f"{duplicate_names}"
+        )
     language_specs = [spec for spec in specs if spec.name == MIMO_LANGUAGE_MODULE_KEY]
     if len(language_specs) != 1:
         raise ValueError(
             f"create_topology requires exactly one spec named {MIMO_LANGUAGE_MODULE_KEY!r} "
             f"(the language module), got {len(language_specs)}"
         )
-    module_order = tuple(spec.name for spec in specs)
 
     grids: dict[str, HyperCommGrid] = {}
     module_pgs: dict[str, ProcessGroupCollection] = {}
@@ -248,6 +256,11 @@ def build_multi_module_pg_collection(
     module_order: tuple[str, ...],
 ) -> MultiModuleProcessGroupCollection:
     """Build the ordered collection of modules active on this rank."""
+    declared_names = set(module_order)
+    if set(grids) != declared_names or set(module_pgs) != declared_names:
+        raise ValueError(
+            "grids, module_pgs, and module_order must describe the same declared module names"
+        )
     rank_modules = {
         name: module_pgs[name]
         for name in module_order
