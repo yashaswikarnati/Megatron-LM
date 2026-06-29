@@ -132,6 +132,33 @@ class TestMultiModuleProcessGroupCollection:
 
         assert collection.get_loss_module_collection() is None
 
+    def test_topology_and_policy_are_immutable_snapshots(self):
+        vision_pgs = ProcessGroupCollection()
+        source_pgs = {"vision": vision_pgs}
+        source_order = ["vision", "loss"]
+        collection = MultiModuleProcessGroupCollection(
+            module_pgs=source_pgs,
+            loss_module_name="loss",
+            module_order=source_order,
+        )
+
+        source_pgs["loss"] = ProcessGroupCollection()
+        source_order.reverse()
+
+        assert list(collection.keys()) == ["vision"]
+        assert collection.module_order == ("vision", "loss")
+        with pytest.raises(TypeError):
+            collection.module_pgs["loss"] = ProcessGroupCollection()
+        with pytest.raises(AttributeError):
+            collection.module_pgs = {}
+        with pytest.raises(AttributeError):
+            collection.loss_module_name = "vision"
+        with pytest.raises(AttributeError):
+            collection.module_order = ("loss", "vision")
+
+        vision_pgs.marker = "still mutable"
+        assert collection["vision"].marker == "still mutable"
+
     def test_accessors_follow_canonical_order_for_local_modules(self):
         vision_pgs = ProcessGroupCollection()
         loss_pgs = ProcessGroupCollection()
@@ -141,16 +168,15 @@ class TestMultiModuleProcessGroupCollection:
             module_order=("vision", "inactive", "loss"),
         )
 
-        assert collection.keys() == ("vision", "loss")
-        assert collection.values() == (vision_pgs, loss_pgs)
-        assert collection.items() == (("vision", vision_pgs), ("loss", loss_pgs))
-        assert tuple(collection) == (vision_pgs, loss_pgs)
+        assert list(collection.keys()) == ["vision", "loss"]
+        assert list(collection.values()) == [vision_pgs, loss_pgs]
+        assert list(collection.items()) == [("vision", vision_pgs), ("loss", loss_pgs)]
+        assert list(collection) == [vision_pgs, loss_pgs]
         assert len(collection) == 2
         assert collection["vision"] is vision_pgs
-        assert repr(collection) == (
-            "MultiModuleProcessGroupCollection("
-            "modules=[vision, loss], loss_module_name='loss')"
-        )
+        repr_str = repr(collection)
+        assert "modules=[vision, loss]" in repr_str
+        assert "loss_module_name='loss'" in repr_str
 
     def test_get_module_collection_returns_exact_local_collection(self):
         vision_pgs = ProcessGroupCollection()

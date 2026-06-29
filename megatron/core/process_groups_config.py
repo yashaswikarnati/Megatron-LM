@@ -4,7 +4,8 @@
 
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import Dict, List, Optional
+from types import MappingProxyType
+from typing import Iterator, List, Mapping, Optional
 
 import torch
 
@@ -581,15 +582,24 @@ class ProcessGroupCollection:
             return result
 
 
-@dataclass
+@dataclass(frozen=True)
 class MultiModuleProcessGroupCollection:
-    """Ordered process group collections for modules active on this rank."""
+    """Immutable module topology and process groups active on this rank.
 
-    module_pgs: Dict[str, ProcessGroupCollection]
+    ``module_order`` and ``loss_module_name`` are global policy shared across ranks, while
+    ``module_pgs`` contains only the modules active on this rank. The loss module need not be
+    locally active. Ordered accessors filter the global order to the rank-local mapping, and
+    iteration preserves the existing behavior of yielding process group collection values.
+    """
+
+    module_pgs: Mapping[str, ProcessGroupCollection]
     loss_module_name: str
     module_order: tuple[str, ...]
 
     def __post_init__(self):
+        object.__setattr__(self, 'module_pgs', MappingProxyType(dict(self.module_pgs)))
+        object.__setattr__(self, 'module_order', tuple(self.module_order))
+
         if not self.module_pgs:
             raise ValueError("module_pgs cannot be empty")
         if len(set(self.module_order)) != len(self.module_order):
@@ -622,27 +632,27 @@ class MultiModuleProcessGroupCollection:
             raise ValueError(f"Module '{module_name}' is not active on this rank")
         return self.module_pgs[module_name]
 
-    def __len__(self):
+    def __len__(self) -> int:
         """Return the number of modules in this wrapper."""
         return len(self.module_pgs)
 
-    def __getitem__(self, module_name: str):
+    def __getitem__(self, module_name: str) -> ProcessGroupCollection:
         """Get process group collection for a module using dict-like access."""
         return self.module_pgs[module_name]
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[ProcessGroupCollection]:
         """Iterate over all process group collections."""
         return iter(self.values())
 
-    def keys(self):
+    def keys(self) -> tuple[str, ...]:
         """Return local module names in canonical order."""
         return tuple(name for name in self.module_order if name in self.module_pgs)
 
-    def values(self):
+    def values(self) -> tuple[ProcessGroupCollection, ...]:
         """Return local process group collections in canonical order."""
         return tuple(self.module_pgs[name] for name in self.keys())
 
-    def items(self):
+    def items(self) -> tuple[tuple[str, ProcessGroupCollection], ...]:
         """Return local module and collection pairs in canonical order."""
         return tuple((name, self.module_pgs[name]) for name in self.keys())
 
