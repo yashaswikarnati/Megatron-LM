@@ -583,86 +583,28 @@ class ProcessGroupCollection:
 
 @dataclass
 class MultiModuleProcessGroupCollection:
-    """Process group collection for multi-module pipelines.
-
-    Used when a rank participates in multiple modules (e.g., colocated encoder + LLM).
-    The language_model_module_name identifies which module is the language model (used for
-    CP size extraction, loss computation, and other LLM-specific operations).
-
-    Attributes:
-        module_pgs: Dict mapping module names to ProcessGroupCollection objects
-        language_model_module_name: Key identifying the language model module
-            (None if no LLM on this rank)
-
-    Example:
-        # Colocated rank with encoder and LLM
-        pg_collection = MultiModuleProcessGroupCollection(
-            module_pgs={"encoder": encoder_pg, "llm": llm_pg},
-            language_model_module_name="llm"
-        )
-
-        # Rank with dual encoders (no LLM)
-        pg_collection = MultiModuleProcessGroupCollection(
-            module_pgs={"encoder_1": encoder_1_pg, "encoder_2": encoder_2_pg},
-            language_model_module_name=None
-        )
-
-        # Single module (can also use ProcessGroupCollection directly)
-        pg_collection = MultiModuleProcessGroupCollection(
-            module_pgs={"llm": llm_pg},
-            language_model_module_name="llm"
-        )
-
-        # Usage
-        cp_size = pg_collection.get_language_model_cp_size()
-        encoder_pg = pg_collection["encoder_1"]  # Dict-like access
-        has_llm = pg_collection.has_language_model()
-    """
+    """Ordered process group collections for modules active on this rank."""
 
     module_pgs: Dict[str, ProcessGroupCollection]
-    language_model_module_name: Optional[str] = None
+    loss_module_name: str
+    module_order: tuple[str, ...]
 
     def __post_init__(self):
         if not self.module_pgs:
-            raise ValueError("module_pgs dict cannot be empty")
-        if self.language_model_module_name is not None:
-            if self.language_model_module_name not in self.module_pgs:
-                raise ValueError(
-                    f"language_model_module_name '{self.language_model_module_name}' not found in "
-                    f"module_pgs keys: {list(self.module_pgs.keys())}"
-                )
+            raise ValueError("module_pgs cannot be empty")
+        if len(set(self.module_order)) != len(self.module_order):
+            raise ValueError("module_order contains duplicate module names")
+        if self.loss_module_name not in self.module_order:
+            raise ValueError(
+                f"loss_module_name '{self.loss_module_name}' is not present in module_order"
+            )
+        for module_name in self.module_pgs:
+            if module_name not in self.module_order:
+                raise ValueError(f"Local module '{module_name}' is not present in module_order")
 
-    def get_language_model_collection(self) -> ProcessGroupCollection:
-        """Get the language model's process group collection.
-
-        Returns:
-            ProcessGroupCollection for the language model.
-
-        Raises:
-            ValueError: If no language model is specified for this collection.
-        """
-        if self.language_model_module_name is None:
-            raise ValueError("No language model specified for this collection")
-        return self.module_pgs[self.language_model_module_name]
-
-    def get_language_model_cp_size(self) -> int:
-        """Get context parallel size for the language model.
-
-        Returns:
-            Context parallel size for the language model.
-
-        Raises:
-            ValueError: If no language model is specified for this collection.
-        """
-        return self.get_language_model_collection().cp.size()
-
-    def has_language_model(self) -> bool:
-        """Check if this rank has a language model.
-
-        Returns:
-            True if this rank has a language model, False otherwise.
-        """
-        return self.language_model_module_name is not None
+    def get_loss_module_collection(self) -> Optional[ProcessGroupCollection]:
+        """Return the loss module collection when it is active on this rank."""
+        return self.module_pgs.get(self.loss_module_name)
 
     def get_module_collection(self, module_name: str) -> ProcessGroupCollection:
         """Get process group collection for a specific module.
@@ -674,22 +616,11 @@ class MultiModuleProcessGroupCollection:
             ProcessGroupCollection for the specified module.
 
         Raises:
-            ValueError: If module_name is not found in collections.
+            ValueError: If module_name is not active on this rank.
         """
         if module_name not in self.module_pgs:
-            raise ValueError(
-                f"Module '{module_name}' not found in collections. "
-                f"Available: {list(self.module_pgs.keys())}"
-            )
+            raise ValueError(f"Module '{module_name}' is not active on this rank")
         return self.module_pgs[module_name]
-
-    @property
-    def local_collection(self) -> ProcessGroupCollection:
-        """This rank's single-module collection; one module per rank (non-colocated)."""
-        assert (
-            len(self.module_pgs) == 1
-        ), f"local_collection requires one module per rank; got {list(self.module_pgs.keys())}"
-        return next(iter(self.module_pgs.values()))
 
     def __len__(self):
         """Return the number of modules in this wrapper."""
@@ -701,26 +632,24 @@ class MultiModuleProcessGroupCollection:
 
     def __iter__(self):
         """Iterate over all process group collections."""
-        return iter(self.module_pgs.values())
+        return iter(self.values())
 
     def keys(self):
-        """Return module names."""
-        return self.module_pgs.keys()
+        """Return local module names in canonical order."""
+        return tuple(name for name in self.module_order if name in self.module_pgs)
 
     def values(self):
-        """Return process group collections."""
-        return self.module_pgs.values()
+        """Return local process group collections in canonical order."""
+        return tuple(self.module_pgs[name] for name in self.keys())
 
     def items(self):
-        """Return (module_name, collection) pairs."""
-        return self.module_pgs.items()
+        """Return local module and collection pairs in canonical order."""
+        return tuple((name, self.module_pgs[name]) for name in self.keys())
 
     def __repr__(self):
-        """Return a concise representation showing modules and their language model status."""
-        modules_str = ', '.join(self.module_pgs.keys())
-        lm_str = (
-            f", language_model_module_name='{self.language_model_module_name}'"
-            if self.language_model_module_name
-            else ""
+        """Return a concise representation of local modules and the loss module policy."""
+        modules_str = ', '.join(self.keys())
+        return (
+            f"MultiModuleProcessGroupCollection(modules=[{modules_str}], "
+            f"loss_module_name='{self.loss_module_name}')"
         )
-        return f"MultiModuleProcessGroupCollection(modules=[{modules_str}]{lm_str})"
