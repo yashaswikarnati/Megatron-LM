@@ -5,6 +5,8 @@
 Layout under test: encoder grid tp=2,dp=2 at ranks 0-3, language grid tp=2,pp=2 at ranks 4-7.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -17,12 +19,20 @@ from examples.mimo.training.topology import (
     create_topology,
 )
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout
 from megatron.core.parallel_state import default_embedding_ranks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 ENCODER = "images"
+
+
+def _mock_grid(mocker, rank_offset, size, pp_rank_groups=()):
+    grid = mocker.Mock()
+    grid.rank_offset = rank_offset
+    grid.size = size
+    grid.get_rank_enum.return_value = [list(ranks) for ranks in pp_rank_groups]
+    return grid
 
 
 def _specs():
@@ -102,6 +112,60 @@ def test_create_topology_preserves_distinct_module_resources(mocker):
         assert topology.pg_collection["audio"] is audio_pgs
     finally:
         topology.destroy()
+
+
+def test_grid_layout_allows_identical_encoder_spans_disjoint_from_language(mocker):
+    grids = {
+        "vision": _mock_grid(mocker, 0, 4),
+        "audio": _mock_grid(mocker, 0, 4),
+        MIMO_LANGUAGE_MODULE_KEY: _mock_grid(mocker, 4, 4, ((4, 6), (5, 7))),
+    }
+    mocker.patch.object(topology_module.dist, "get_world_size", return_value=8)
+    mocker.patch.object(
+        topology_module.RankRole,
+        "build",
+        return_value=SimpleNamespace(mode=ModuleLayout.NON_COLOCATED),
+    )
+
+    _validate_grid_layout(grids)
+
+
+def test_grid_layout_rejects_partial_encoder_overlap(mocker):
+    grids = {
+        "vision": _mock_grid(mocker, 0, 4),
+        "audio": _mock_grid(mocker, 2, 4),
+        MIMO_LANGUAGE_MODULE_KEY: _mock_grid(mocker, 6, 2, ((6, 7),)),
+    }
+    mocker.patch.object(topology_module.dist, "get_world_size", return_value=8)
+
+    with pytest.raises(ValueError, match="encoder grids must be identical or disjoint"):
+        _validate_grid_layout(grids)
+
+
+def test_grid_layout_accepts_world_last_on_language_terminal_stage(mocker):
+    grids = {
+        "vision": _mock_grid(mocker, 0, 4),
+        MIMO_LANGUAGE_MODULE_KEY: _mock_grid(mocker, 4, 4, ((4, 6), (5, 7))),
+    }
+    mocker.patch.object(topology_module.dist, "get_world_size", return_value=8)
+    mocker.patch.object(
+        topology_module.RankRole,
+        "build",
+        return_value=SimpleNamespace(mode=ModuleLayout.NON_COLOCATED),
+    )
+
+    _validate_grid_layout(grids)
+
+
+def test_grid_layout_rejects_world_last_outside_language_terminal_stage(mocker):
+    grids = {
+        MIMO_LANGUAGE_MODULE_KEY: _mock_grid(mocker, 0, 4, ((0, 2), (1, 3))),
+        "vision": _mock_grid(mocker, 4, 4),
+    }
+    mocker.patch.object(topology_module.dist, "get_world_size", return_value=8)
+
+    with pytest.raises(ValueError, match="world-last rank 7.*terminal pipeline stage"):
+        _validate_grid_layout(grids)
 
 
 def test_build_multi_module_pg_collection_filters_in_canonical_order(mocker):

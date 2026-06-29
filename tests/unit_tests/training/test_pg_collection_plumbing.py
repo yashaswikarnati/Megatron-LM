@@ -78,6 +78,23 @@ def test_training_callers_forward_exact_pair_to_evaluation(entrypoint, expected_
         assert keywords["p2p_communicator"].id == "p2p_communicator"
 
 
+def test_pretrain_forwards_exact_carrier_to_data_iterator_builders():
+    tree = ast.parse(textwrap.dedent(inspect.getsource(training_mod.pretrain)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "build_train_valid_test_data_iterators"
+    ]
+
+    assert len(calls) == 2
+    for call in calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert isinstance(keywords["pg_collection"], ast.Name)
+        assert keywords["pg_collection"].id == "pg_collection"
+
+
 @pytest.mark.parametrize(
     ("carrier", "communicator"),
     [

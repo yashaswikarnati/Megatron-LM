@@ -169,23 +169,31 @@ def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
 
 
 def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
-    """Assert grids tile the world disjointly (non-colocated) XOR fully share ranks (colocated),
-    with no gaps. Colocated-vs-not is decided via the core ``RankRole.build`` path.
-    """
+    """Validate module placement and the current world-last reporting contract."""
     spans = {name: (g.rank_offset, g.rank_offset + g.size) for name, g in grids.items()}
     names = list(spans)
     all_same = all(spans[n] == spans[names[0]] for n in names)
-    pairwise_disjoint = all(
-        spans[a][1] <= spans[b][0] or spans[b][1] <= spans[a][0]
-        for i, a in enumerate(names)
-        for b in names[i + 1 :]
-    )
-    if not (all_same or pairwise_disjoint):
-        raise ValueError(
-            f"Module grids must either fully share ranks or be pairwise disjoint, got {spans}"
-        )
 
-    # Disjoint spans must also leave no rank uncovered (their union == [0, world_size)).
+    def disjoint(left: tuple[int, int], right: tuple[int, int]) -> bool:
+        return left[1] <= right[0] or right[1] <= left[0]
+
+    modality_names = [n for n in names if n != MIMO_LANGUAGE_MODULE_KEY]
+    if not all_same:
+        language_span = spans[MIMO_LANGUAGE_MODULE_KEY]
+        if any(not disjoint(spans[name], language_span) for name in modality_names):
+            raise ValueError(
+                f"The language grid must be disjoint from every encoder grid, got {spans}"
+            )
+        for index, name in enumerate(modality_names):
+            for other_name in modality_names[index + 1 :]:
+                if spans[name] != spans[other_name] and not disjoint(
+                    spans[name], spans[other_name]
+                ):
+                    raise ValueError(
+                        "encoder grids must be identical or disjoint, "
+                        f"got {name}={spans[name]} and {other_name}={spans[other_name]}"
+                    )
+
     world_size = dist.get_world_size()
     covered_ranks: set[int] = set()
     for start, end in spans.values():
@@ -195,7 +203,19 @@ def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
             f"Module grids must partition the world [0, {world_size}) with no gaps, got {spans}"
         )
 
-    modality_names = [n for n in names if n != MIMO_LANGUAGE_MODULE_KEY]
+    language_terminal_ranks = {
+        ranks[-1]
+        for ranks in grids[MIMO_LANGUAGE_MODULE_KEY].get_rank_enum("pp")
+        if ranks
+    }
+    reporting_rank = world_size - 1
+    if reporting_rank not in language_terminal_ranks:
+        raise ValueError(
+            f"world-last rank {reporting_rank} must belong to a terminal pipeline stage "
+            f"of the {MIMO_LANGUAGE_MODULE_KEY!r} grid; terminal ranks are "
+            f"{sorted(language_terminal_ranks)}"
+        )
+
     role = RankRole.build(modality_names, grids)
     expected = ModuleLayout.COLOCATED if all_same else ModuleLayout.NON_COLOCATED
     if role.mode is not expected:

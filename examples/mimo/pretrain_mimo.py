@@ -55,10 +55,9 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
 def _parse_and_validate() -> argparse.Namespace:
     """Parse/validate args; architecture flags come from the CLI (run script)."""
     args = parse_args(extra_args_provider)
-    validate_args(args, {})
     validate_hetero_grid_args(args, int(os.environ.get("WORLD_SIZE", args.world_size)))
+    validate_args(args, {}, data_parallel_size_override=args.llm_dp)
 
-    args.data_parallel_size = args.llm_dp
     if getattr(args, "mtp_num_layers", None) is None:
         args.mtp_num_layers = 0
     if getattr(args, "padded_vocab_size", None) is None:
