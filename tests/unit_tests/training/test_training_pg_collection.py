@@ -186,9 +186,6 @@ def test_multi_bootstrap_seeds_and_configures_jit_with_strict_local_groups():
     cfg = SimpleNamespace(logger=SimpleNamespace(log_progress=False))
     args = SimpleNamespace(fine_grained_activation_offloading=False)
     with (
-        mock.patch.object(
-            carrier, "get_only_local_collection", wraps=carrier.get_only_local_collection
-        ) as get_only_local,
         mock.patch.object(training_mod.ft_integration, "setup"),
         mock.patch.object(training_mod, "initialize_megatron") as initialize,
         mock.patch.object(training_mod, "get_args", return_value=args),
@@ -214,6 +211,5 @@ def test_multi_bootstrap_seeds_and_configures_jit_with_strict_local_groups():
     assert initialize_kwargs["seed_tp_group"] is local.tp
     assert initialize_kwargs["seed_ep_group"] is local.ep
     assert initialize_kwargs["seed_etp_group"] is local.expt_tp
-    get_only_local.assert_called_once_with()
     get_pg_size.assert_called_once_with(local.tp)
     set_jit.assert_called_once_with(tp_size=4)

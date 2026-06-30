@@ -683,19 +683,6 @@ class MultiModuleProcessGroupCollection:
             )
         return self.module_pgs[module_name]
 
-    def get_only_local_collection(self) -> ProcessGroupCollection:
-        """Return the sole module process-group collection active on this rank.
-
-        Raises:
-            ValueError: If more than one module is active on this rank.
-        """
-        if len(self.module_pgs) != 1:
-            raise ValueError(
-                "Operation requires exactly one local module process-group collection"
-            )
-        (local_collection,) = self.module_pgs.values()
-        return local_collection
-
     def __len__(self):
         """Return the number of modules in this wrapper."""
         return len(self.module_pgs)

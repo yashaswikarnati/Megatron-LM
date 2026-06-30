@@ -1084,7 +1084,7 @@ def pretrain(
     timestamp_after_in_job_setup = time.time()
 
     if is_multi_module:
-        local_pg_collection = pg_collection.get_only_local_collection()
+        local_pg_collection, _ = _resolve_local_pg_collection(pg_collection)
     else:
         local_pg_collection = pg_collection
 
@@ -2014,8 +2014,11 @@ def _resolve_local_pg_collection(
     if pg_collection is None:
         return ProcessGroupCollection.use_mpu_process_groups(), ""
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
-        local_pg_collection = pg_collection.get_only_local_collection()
-        ((module_name, _),) = pg_collection.module_pgs.items()
+        if len(pg_collection) != 1:
+            raise ValueError(
+                "Operation requires exactly one local module process-group collection"
+            )
+        ((module_name, local_pg_collection),) = pg_collection.module_pgs.items()
         return local_pg_collection, f"{module_name}."
     return pg_collection, ""
 
@@ -2886,7 +2889,7 @@ def training_log(
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=(
-                    pg_collection.get_only_local_collection().dp
+                    _resolve_local_pg_collection(pg_collection)[0].dp
                     if is_multi_module
                     else pg_collection.dp if pg_collection is not None else None
                 ),
@@ -2901,7 +2904,7 @@ def training_log(
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=(
-                    pg_collection.get_only_local_collection().dp
+                    _resolve_local_pg_collection(pg_collection)[0].dp
                     if is_multi_module
                     else pg_collection.dp if pg_collection is not None else None
                 ),

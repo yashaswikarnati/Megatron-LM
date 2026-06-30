@@ -3,10 +3,7 @@
 import pytest
 import torch.distributed as dist
 
-from megatron.core.process_groups_config import (
-    MultiModuleProcessGroupCollection,
-    ProcessGroupCollection,
-)
+from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -106,30 +103,6 @@ class TestProcessGroupsConfig:
         repr_str = repr(model_pgs)
         assert "ProcessGroupCollection(" in repr_str
         assert "hcp([2, 4])" in repr_str
-
-
-class TestMultiModuleProcessGroupCollection:
-    """Tests for strict rank-local process-group resolution."""
-
-    def test_get_only_local_collection_returns_single_module_collection(self):
-        module_pg = ProcessGroupCollection()
-        multi_module_pg = MultiModuleProcessGroupCollection(
-            module_pgs={"encoder": module_pg}, language_model_module_name=None
-        )
-
-        assert multi_module_pg.get_only_local_collection() is module_pg
-
-    def test_get_only_local_collection_rejects_multiple_modules(self):
-        multi_module_pg = MultiModuleProcessGroupCollection(
-            module_pgs={
-                "encoder": ProcessGroupCollection(),
-                "language": ProcessGroupCollection(),
-            },
-            language_model_module_name="language",
-        )
-
-        with pytest.raises(ValueError, match="exactly one local module"):
-            multi_module_pg.get_only_local_collection()
 
 
 class TestPGConfigDefaultInitialization:
