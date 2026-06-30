@@ -656,6 +656,23 @@ class MultiModuleProcessGroupCollection:
         """Return local module and collection pairs in canonical order."""
         return tuple((name, self.module_pgs[name]) for name in self.keys())
 
+    def get_only_local_item(self) -> tuple[str, ProcessGroupCollection]:
+        """Return the sole module active on this rank and its process groups.
+
+        Operations that require one process-group topology, such as the current
+        checkpoint transport, must not prefer a particular module or silently pick
+        the first entry. Non-colocated layouts have exactly one local module and can
+        use this strict accessor; colocated layouts must use a module-aware operation.
+        """
+        local_items = self.items()
+        if len(local_items) != 1:
+            local_names = ", ".join(name for name, _ in local_items)
+            raise ValueError(
+                "Operation requires exactly one local module process-group collection; "
+                f"active local modules are [{local_names}]"
+            )
+        return local_items[0]
+
     def __repr__(self):
         """Return a concise representation of local modules and the loss module policy."""
         modules_str = ', '.join(self.keys())

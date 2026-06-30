@@ -85,23 +85,35 @@ def build_no_sync_func(mimo_model):
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     """Create a HyperCommGrid with specified parallelism."""
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
-        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
+        shape=[tp, cp, dp, pp],
+        dim_names=["tp", "cp", "dp", "pp"],
         rank_offset=offset,
         backend="nccl",
+    )
+    # MIMO optimizer process groups use the production topology's expert view.
+    # For these non-expert test grids, expt_tp=ep=1 and expt_dp spans every
+    # non-PP rank in the same grid.
+    grid.register_view(
+        "expert",
+        shape=[1, 1, tp * cp * dp, pp],
+        dim_names=["expt_tp", "ep", "expt_dp", "pp"],
+        shared_dims=["pp"],
     )
     grid.create_pg(["tp"])
     grid.create_pg(["cp"])
     grid.create_pg(["pp"])
     grid.create_pg(["dp"])
     grid.create_pg(["dp", "cp"])
-    grid.create_pg(["ep"])
-    grid.create_pg(["expt_dp"])
-    # Required by _get_pg_collection_for_optimizer
+    grid.create_pg(["tp", "cp"])
     grid.create_pg(["tp", "pp"])
-    grid.create_pg(["tp", "ep", "pp"])
-    grid.create_pg(["dp", "ep"])
-    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+    grid.create_pg(["tp", "dp"])
+    grid.create_pg(["tp", "dp", "cp"])
+    grid.create_pg(["tp", "cp", "dp", "pp"])
+    grid.create_pg(["ep"], view="expert")
+    grid.create_pg(["expt_tp"], view="expert")
+    grid.create_pg(["expt_dp"], view="expert")
+    grid.create_pg(["expt_tp", "ep"], view="expert")
+    grid.create_pg(["expt_tp", "ep", "pp"], view="expert")
     _active_grids.append(grid)
     return grid
 
@@ -122,10 +134,19 @@ def get_pg_collection(grid):
     pg_collection.tp = grid.get_pg("tp")
     pg_collection.cp = grid.get_pg("cp")
     pg_collection.pp = grid.get_pg("pp")
-    pg_collection.ep = grid.get_pg("ep")
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
-    pg_collection.expt_dp = grid.get_pg("expt_dp")
+    pg_collection.intra_dp_cp = pg_collection.dp_cp
+    pg_collection.tp_cp = grid.get_pg(["tp", "cp"])
+    pg_collection.tp_dp = grid.get_pg(["tp", "dp"])
+    pg_collection.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
+    pg_collection.mp = grid.get_pg(["tp", "pp"])
+    pg_collection.ep = grid.get_pg("ep", view="expert")
+    pg_collection.expt_tp = grid.get_pg("expt_tp", view="expert")
+    pg_collection.expt_dp = grid.get_pg("expt_dp", view="expert")
+    pg_collection.intra_expt_dp = pg_collection.expt_dp
+    pg_collection.tp_ep = grid.get_pg(["expt_tp", "ep"], view="expert")
+    pg_collection.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view="expert")
     return pg_collection
 
 

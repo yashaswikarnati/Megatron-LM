@@ -10,6 +10,7 @@ Run with 8 GPUs:
 import os
 import shutil
 import tempfile
+from collections import OrderedDict
 
 import pytest
 import torch
@@ -18,8 +19,12 @@ from packaging import version
 
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.distributed import DistributedDataParallel
+from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.module import Float16Module
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
     create_all_embedding_groups,
     create_hypercomm_grid,
@@ -30,6 +35,153 @@ from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
 from tests.unit_tests.test_utilities import Utils
 
 ENCODER_NAME = "images"
+
+
+class _CheckpointLeaf(torch.nn.Module):
+    """Small parameterized module for exercising nested checkpoint wrappers."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Return the logical checkpoint key for the leaf parameter."""
+        return {f'{prefix}weight': self.weight}
+
+
+class _VersionedCheckpointLeaf(_CheckpointLeaf):
+    """Leaf that records state-dict metadata forwarded by wrapper loaders."""
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        self.loaded_metadata = dict(local_metadata)
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+
+def _wrap_without_runtime_init(wrapper_type, module):
+    """Build only the registered ``module`` nesting needed by checkpoint methods."""
+    wrapper = wrapper_type.__new__(wrapper_type)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.module = module
+    return wrapper
+
+
+def _nested_checkpoint_module(leaf, with_float16=True):
+    """Build DDP with the optional mixed-precision wrapper used by production MIMO."""
+    module = _wrap_without_runtime_init(Float16Module, leaf) if with_float16 else leaf
+    ddp_module = _wrap_without_runtime_init(DistributedDataParallel, module)
+    ddp_module.tp_group = None
+    return ddp_module
+
+
+def _checkpoint_model(encoder=None, language=None):
+    """Build only the logical child structure required by MIMO checkpoint methods."""
+    model = MimoModel.__new__(MimoModel)
+    torch.nn.Module.__init__(model)
+    model.modality_submodules = torch.nn.ModuleDict(
+        {ENCODER_NAME: encoder} if encoder is not None else {}
+    )
+    model.language_model = language
+    return model
+
+
+@pytest.mark.parametrize('with_float16', [False, True])
+@pytest.mark.parametrize('module_name', [ENCODER_NAME, 'language_model'])
+def test_nested_ddp_float16_sharded_state_loads_strictly(module_name, with_float16):
+    """MIMO checkpoint keys must stay logical across nested runtime wrappers."""
+    leaf = _CheckpointLeaf()
+    ddp_module = _nested_checkpoint_module(leaf, with_float16=with_float16)
+    if module_name == ENCODER_NAME:
+        model = _checkpoint_model(encoder=ddp_module)
+    else:
+        model = _checkpoint_model(language=ddp_module)
+
+    sharded_state = model.sharded_state_dict(metadata={'dp_cp_group': object()})
+    logical_prefix = (
+        f'modality_submodules.{module_name}.'
+        if module_name == ENCODER_NAME
+        else 'language_model.'
+    )
+    assert list(sharded_state) == [f'{logical_prefix}weight']
+    loaded_state = {key: torch.full_like(value, 7) for key, value in sharded_state.items()}
+
+    model.load_state_dict(loaded_state, strict=True)
+
+    torch.testing.assert_close(leaf.weight, torch.full_like(leaf.weight, 7))
+
+
+def test_ddp_sharded_state_dict_falls_back_for_plain_module(mocker):
+    """Transparent DDP checkpointing must retain support for ordinary nn.Module children."""
+    leaf = torch.nn.Linear(2, 2)
+    ddp_module = _wrap_without_runtime_init(DistributedDataParallel, leaf)
+    ddp_module.tp_group = object()
+    metadata = {'dp_cp_group': object()}
+    sharded_offsets = ((0, 0, 1),)
+    logical_state = {'logical.weight': leaf.weight}
+    default_sharded_state = mocker.patch(
+        'megatron.core.distributed.distributed_data_parallel.sharded_state_dict_default',
+        return_value=logical_state,
+        create=True,
+    )
+
+    assert (
+        ddp_module.sharded_state_dict('logical.', sharded_offsets, metadata) is logical_state
+    )
+    default_sharded_state.assert_called_once_with(
+        leaf,
+        'logical.',
+        sharded_offsets,
+        metadata,
+        tp_group=ddp_module.tp_group,
+    )
+
+
+def test_mimo_load_state_dict_aggregates_logical_incompatibilities():
+    """Non-strict loads report child and root incompatibilities with logical prefixes."""
+    encoder = _nested_checkpoint_module(_CheckpointLeaf())
+    language = _nested_checkpoint_module(_CheckpointLeaf())
+    model = _checkpoint_model(encoder=encoder, language=language)
+
+    incompatible = model.load_state_dict(
+        {
+            'language_model.weight': torch.ones(1),
+            'language_model.extra': torch.ones(1),
+            'root_extra': torch.ones(1),
+        },
+        strict=False,
+    )
+
+    assert incompatible.missing_keys == [f'modality_submodules.{ENCODER_NAME}.weight']
+    assert incompatible.unexpected_keys == ['language_model.extra', 'root_extra']
+
+
+def test_mimo_load_state_dict_rebases_metadata_and_forwards_assign():
+    """Logical child loads retain version metadata and standard assign semantics."""
+    leaf = _VersionedCheckpointLeaf()
+    model = _checkpoint_model(language=_nested_checkpoint_module(leaf))
+    state_dict = OrderedDict({'language_model.weight': torch.full_like(leaf.weight, 9)})
+    state_dict._metadata = {'language_model': {'version': 17}}
+
+    model.load_state_dict(state_dict, assign=True)
+
+    assert leaf.loaded_metadata == {'version': 17, 'assign_to_params_buffers': True}
+    torch.testing.assert_close(leaf.weight, torch.full_like(leaf.weight, 9))
 
 
 def _get_shared_tmpdir():
@@ -227,6 +379,16 @@ class TestMimoCheckpoint:
     def teardown_method(self):
         destroy_all_grids()
 
+    def test_expert_view_shares_pipeline_groups_with_base_view(self):
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        grid = create_hypercomm_grid(tp=2, dp=2, pp=2)
+
+        base_pp_ranks = dist.get_process_group_ranks(grid.get_pg("pp"))
+        expert_pp_ranks = dist.get_process_group_ranks(grid.get_pg("pp", view="expert"))
+
+        assert base_pp_ranks == expert_pp_ranks
+
     def test_encoder_tp2_llm_tp2_pp3(self):
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -279,6 +441,20 @@ class TestMimoCheckpoint:
 class TestOptimizerCheckpointHelpers:
     """CPU-only coverage for the dist-checkpoint extract/restore helpers."""
 
+    def test_replica_id_includes_context_parallel_rank(self):
+        from unittest.mock import Mock
+
+        from megatron.core.models.mimo.optimizer import _get_replica_id
+
+        pg_collection = ProcessGroupCollection(
+            tp=Mock(rank=Mock(return_value=1)),
+            cp=Mock(rank=Mock(return_value=2)),
+            pp=Mock(rank=Mock(return_value=3)),
+            dp=Mock(rank=Mock(return_value=4)),
+        )
+
+        assert _get_replica_id(pg_collection) == (1, 3, 4, 2)
+
     @staticmethod
     def _extract_param_state_sharding_type(*args, **kwargs):
         from megatron.core.models.mimo.optimizer import _extract_param_state_sharding_type
@@ -296,6 +472,12 @@ class TestOptimizerCheckpointHelpers:
         from megatron.core.models.mimo.optimizer import _extract_param_groups
 
         return _extract_param_groups(*args, **kwargs)
+
+    @staticmethod
+    def _extract_grad_scaler(*args, **kwargs):
+        from megatron.core.models.mimo.optimizer import _extract_grad_scaler
+
+        return _extract_grad_scaler(*args, **kwargs)
 
     @staticmethod
     def _restore_param_groups(*args, **kwargs):
@@ -355,6 +537,34 @@ class TestOptimizerCheckpointHelpers:
 
         assert sub_sd['optimizer'] == {'state': {0: {'step': 5}}}
         assert '_mimo_param_groups' in sub_sd
+
+    def test_extract_grad_scaler_preserves_distributed_optimizer_sharded_object(self):
+        from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+        grad_scaler = ShardedObject(
+            key='optimizer.distributed.dp_group_idx_0.grad_scaler',
+            data={'scale': 65536.0},
+            global_shape=(1,),
+            global_offset=(0,),
+            replica_id=(0, 0, 0),
+        )
+        sub_sd = {'grad_scaler': grad_scaler}
+
+        self._extract_grad_scaler(sub_sd, 'images', '', replica_id=(0, 0, 0, 0))
+
+        assert sub_sd == {'grad_scaler': grad_scaler}
+
+    def test_extract_grad_scaler_wraps_raw_scaler_state(self):
+        from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+        sub_sd = {'grad_scaler': {'scale': 65536.0}}
+
+        self._extract_grad_scaler(sub_sd, 'images', '', replica_id=(0, 0, 0, 0))
+
+        wrapped = sub_sd['_mimo_grad_scaler']
+        assert isinstance(wrapped, ShardedObject)
+        assert wrapped.data == {'scale': 65536.0}
+        assert 'grad_scaler' not in sub_sd
 
     def test_restore_param_groups_recreates_missing_optimizer_wrapper(self):
         from unittest.mock import MagicMock

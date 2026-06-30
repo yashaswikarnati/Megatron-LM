@@ -96,6 +96,38 @@ def test_pretrain_forwards_exact_carrier_to_data_iterator_builders():
 
 
 @pytest.mark.parametrize(
+    "entrypoint",
+    (
+        training_mod.setup_model_and_optimizer,
+        training_mod.train,
+        training_mod.save_checkpoint_and_time,
+    ),
+)
+def test_direct_checkpoint_calls_forward_only_the_union_carrier(entrypoint):
+    tree = ast.parse(textwrap.dedent(inspect.getsource(entrypoint)))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"save_checkpoint", "load_checkpoint"}
+    ]
+
+    assert calls
+    explicit_group_names = {
+        "tp_group",
+        "pp_group",
+        "dp_group",
+        "dp_cp_group",
+        "expt_dp_group",
+    }
+    for call in calls:
+        keyword_names = {keyword.arg for keyword in call.keywords}
+        assert "pg_collection" in keyword_names
+        assert keyword_names.isdisjoint(explicit_group_names)
+
+
+@pytest.mark.parametrize(
     ("carrier", "communicator"),
     [
         (_multi_carrier(), _multimodule_communicator()),
@@ -200,3 +232,28 @@ def test_multimodule_pretrain_skips_process_global_seed_bootstrap():
             "seed_etp_group",
         )
     )
+
+
+def test_multimodule_only_local_item_preserves_its_name_and_collection():
+    vision = ProcessGroupCollection()
+    carrier = MultiModuleProcessGroupCollection(
+        module_pgs={"vision": vision},
+        loss_module_name="language",
+        module_order=("vision", "language"),
+    )
+
+    assert carrier.get_only_local_item() == ("vision", vision)
+
+
+def test_multimodule_only_local_item_rejects_multiple_modules_without_selecting_loss_owner():
+    carrier = MultiModuleProcessGroupCollection(
+        module_pgs={
+            "vision": ProcessGroupCollection(),
+            "language": ProcessGroupCollection(),
+        },
+        loss_module_name="language",
+        module_order=("vision", "language"),
+    )
+
+    with pytest.raises(ValueError, match="exactly one local module"):
+        carrier.get_only_local_item()

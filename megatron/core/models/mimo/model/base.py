@@ -2,11 +2,11 @@
 
 import logging
 import warnings
-from typing import Any, Dict, Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 
-from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
@@ -97,42 +97,100 @@ class MimoModel(MegatronModule):
         self._initialize_language_model()
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """Build sharded state dict, bypassing parallel_state global fallbacks.
-
-        Iterates modality_submodules manually (ModuleDict lacks sharded_state_dict)
-        and injects dp_cp_group from each module's pg_collection.
-        """
+        """Build a wrapper-independent sharded state dict for logical MIMO modules."""
         sharded_sd = {}
-        for name, module in self.named_children():
-            if name == 'modality_submodules':
-                # Unwrap DDP, call ModalitySubmodules.sharded_state_dict directly
-                # (which injects dp_cp_group from its pg_collection)
-                for mod_name, mod in module.items():
-                    is_ddp = isinstance(mod, DistributedDataParallel)
-                    inner = mod.module if is_ddp else mod
-                    child_prefix = f'{prefix}{name}.{mod_name}.'
-                    if is_ddp:
-                        child_prefix += 'module.'
-                    sharded_sd.update(
-                        inner.sharded_state_dict(child_prefix, sharded_offsets, metadata)
-                    )
-            else:
-                # Inject dp_cp_group from pg_collection for language_model
-                inner = module.module if isinstance(module, DistributedDataParallel) else module
-                pg = getattr(inner, 'pg_collection', None)
-                mod_metadata = metadata
+        for logical_prefix, module in self._checkpoint_children():
+            mod_metadata = metadata
+            wrapped_module = module
+            while wrapped_module is not None:
+                pg = getattr(wrapped_module, 'pg_collection', None)
                 if pg is not None:
                     assert (
                         hasattr(pg, 'dp_cp') and pg.dp_cp is not None
-                    ), f"pg_collection on '{name}' is missing dp_cp group"
+                    ), f"pg_collection on '{logical_prefix[:-1]}' is missing dp_cp group"
                     mod_metadata = dict(metadata) if metadata else {}
                     mod_metadata['dp_cp_group'] = pg.dp_cp
-                sharded_sd.update(
-                    sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, mod_metadata
+                    break
+                wrapped_module = getattr(wrapped_module, 'module', None)
+            sharded_sd.update(
+                sharded_state_dict_default(
+                    module, f'{prefix}{logical_prefix}', sharded_offsets, mod_metadata
+                )
+            )
+        return sharded_sd
+
+    def load_state_dict(
+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
+    ):
+        """Load logical MIMO module keys through each child's public wrapper interface."""
+        if not isinstance(state_dict, Mapping):
+            raise TypeError(f"Expected state_dict to be dict-like, got {type(state_dict)}.")
+
+        metadata = getattr(state_dict, '_metadata', None)
+        missing_keys = []
+        unexpected_keys = []
+        consumed_keys = set()
+        for logical_prefix, module in self._checkpoint_children():
+            child_state = OrderedDict(
+                (key[len(logical_prefix) :], value)
+                for key, value in state_dict.items()
+                if key.startswith(logical_prefix)
+            )
+            consumed_keys.update(
+                key for key in state_dict if key.startswith(logical_prefix)
+            )
+
+            child_metadata = None
+            if metadata is not None:
+                child_metadata = OrderedDict()
+                logical_name = logical_prefix[:-1]
+                for key, value in metadata.items():
+                    if key == logical_name:
+                        child_metadata[''] = value
+                    elif key.startswith(logical_prefix):
+                        child_metadata[key[len(logical_prefix) :]] = value
+
+            if child_metadata is not None:
+                child_state._metadata = child_metadata
+            load_kwargs = {'strict': False}
+            if assign:
+                load_kwargs['assign'] = True
+            incompatible = module.load_state_dict(child_state, **load_kwargs)
+            if incompatible is not None:
+                missing_keys.extend(
+                    f'{logical_prefix}{key}' for key in incompatible.missing_keys
+                )
+                unexpected_keys.extend(
+                    f'{logical_prefix}{key}' for key in incompatible.unexpected_keys
+                )
+
+        unexpected_keys.extend(key for key in state_dict if key not in consumed_keys)
+        if strict and (missing_keys or unexpected_keys):
+            errors = []
+            if unexpected_keys:
+                errors.append(
+                    "Unexpected key(s) in state_dict: {}. ".format(
+                        ", ".join(f'"{key}"' for key in unexpected_keys)
                     )
                 )
-        return sharded_sd
+            if missing_keys:
+                errors.append(
+                    "Missing key(s) in state_dict: {}. ".format(
+                        ", ".join(f'"{key}"' for key in missing_keys)
+                    )
+                )
+            raise RuntimeError(
+                f"Error(s) in loading state_dict for {self.__class__.__name__}:\n\t"
+                + "\n\t".join(errors)
+            )
+        return torch.nn.modules.module._IncompatibleKeys(missing_keys, unexpected_keys)
+
+    def _checkpoint_children(self):
+        """Yield logical checkpoint prefixes and active local module children."""
+        for name, module in self.modality_submodules.items():
+            yield f'modality_submodules.{name}.', module
+        if self.language_model is not None:
+            yield 'language_model.', self.language_model
 
     def align_embeddings_by_token_positions(
         self,

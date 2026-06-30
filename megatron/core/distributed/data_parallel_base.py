@@ -87,10 +87,10 @@ class _BaseDataParallel(MegatronModule):
         """
         return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict=True, assign=False):
         """
         Copies parameters and buffers from state_dict into the wrapped module and its
         descendants. If strict is True, then the keys of state_dict must exactly match
         the keys returned by this module’s state_dict() function.
         """
-        self.module.load_state_dict(state_dict, strict=strict)
+        return self.module.load_state_dict(state_dict, strict=strict, assign=assign)

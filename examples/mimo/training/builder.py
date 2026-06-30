@@ -52,14 +52,6 @@ def _resolve_role(topology: HeteroTopology):
     return encoder_name, rank_in_language, rank_in_encoder, language_pg, encoder_pg
 
 
-def _mimo_branch_name(topology: HeteroTopology) -> str:
-    """Return this rank's MIMO branch ("language" or the encoder grid name)."""
-    if topology.grids[MIMO_LANGUAGE_MODULE_KEY].is_current_rank_in_grid():
-        return "language"
-    encoder_name = _encoder_module_name(topology)
-    return encoder_name if encoder_name is not None else "language"
-
-
 class MimoModelBuilder(ModelBuilder["MimoModel", MimoBuildConfig]):
     """Build this rank's hetero ``MimoModel`` on the disjoint vision/language grids."""
 
@@ -152,6 +144,4 @@ class MimoModelBuilder(ModelBuilder["MimoModel", MimoBuildConfig]):
             )
 
         configure_grad_sync(args, mimo_model, topology)
-        # Per-grid rng key namespace (read by stock save/load); torch_dist only.
-        mimo_model.rng_state_key_prefix = f"mimo.{_mimo_branch_name(topology)}."
         return [mimo_model]

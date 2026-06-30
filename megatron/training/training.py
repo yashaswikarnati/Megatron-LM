@@ -2214,11 +2214,17 @@ def setup_model_and_optimizer(
                 'model': dense_model_for_upcycling,
                 'optimizer': None,
                 'opt_param_scheduler': None,
+                'pg_collection': pg_collection,
             },
         )
         args.iteration = 1
         save_checkpoint(
-            args.iteration, model, None, None, args.num_floating_point_operations_so_far
+            args.iteration,
+            model,
+            None,
+            None,
+            args.num_floating_point_operations_so_far,
+            pg_collection=pg_collection,
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
@@ -2234,16 +2240,11 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
-        ckpt_pgc = pg_collection if pg_collection is not None else getattr(unwrap_model(model)[0], "pg_collection", None)
-        load_kwargs = {}
-        if ckpt_pgc is not None:
-            load_kwargs = {
-                "tp_group": getattr(ckpt_pgc, "tp", None),
-                "pp_group": getattr(ckpt_pgc, "pp", None),
-                "dp_group": getattr(ckpt_pgc, "dp", None),
-                "dp_cp_group": getattr(ckpt_pgc, "dp_cp", None),
-                "rng_state_key_prefix": getattr(unwrap_model(model)[0], "rng_state_key_prefix", ""),
-            }
+        checkpoint_pg_collection = pg_collection
+        if checkpoint_pg_collection is None:
+            checkpoint_pg_collection = getattr(
+                unwrap_model(model)[0], "pg_collection", None
+            )
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
@@ -2252,7 +2253,7 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
-            **load_kwargs,
+            pg_collection=checkpoint_pg_collection,
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
@@ -2311,6 +2312,7 @@ def setup_model_and_optimizer(
             opt_param_scheduler,
             args.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
+            pg_collection=pg_collection,
         )
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
@@ -3091,18 +3093,22 @@ def save_checkpoint_and_time(
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
+    checkpoint_pg_collection = pg_collection
+    if checkpoint_pg_collection is None:
+        checkpoint_pg_collection = getattr(unwrap_model(model)[0], "pg_collection", None)
+    checkpoint_dp_group = None
+    if isinstance(checkpoint_pg_collection, MultiModuleProcessGroupCollection):
+        _, local_checkpoint_collection = checkpoint_pg_collection.get_only_local_item()
+        checkpoint_dp_group = getattr(local_checkpoint_collection, "dp", None)
+    elif isinstance(checkpoint_pg_collection, ProcessGroupCollection):
+        checkpoint_dp_group = getattr(checkpoint_pg_collection, "dp", None)
+
     if should_report_memory:
         # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})")
-
-    ckpt_pgc = pg_collection if pg_collection is not None else getattr(unwrap_model(model)[0], "pg_collection", None)
-    tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
-    pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
-    dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
-    expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
-    # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
-    rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+        report_memory(
+            f"(before save_checkpoint for iteration {iteration})",
+            process_group=checkpoint_dp_group,
+        )
 
     # Save checkpoint.
     save_checkpoint(
@@ -3115,12 +3121,7 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
-        tp_group=tp_group,
-        pp_group=pp_group,
-        dp_cp_group=dp_cp_group,
-        dp_group=dp_group,
-        expt_dp_group=expt_dp_group,
-        rng_state_key_prefix=rng_state_key_prefix,
+        pg_collection=checkpoint_pg_collection,
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -3129,7 +3130,10 @@ def save_checkpoint_and_time(
 
     if should_report_memory:
         # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})")
+        report_memory(
+            f"(after save_checkpoint for iteration {iteration})",
+            process_group=checkpoint_dp_group,
+        )
     num_checkpoints_memory_reported += 1
 
     if args.fp8:
@@ -3442,6 +3446,7 @@ def train(
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
+                    pg_collection=pg_collection,
                 )
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
@@ -3457,6 +3462,7 @@ def train(
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
+                    pg_collection=pg_collection,
                 )
 
             args.no_load_optim = no_load_optim
