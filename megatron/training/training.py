@@ -322,6 +322,20 @@ def _validate_train_step_pg_collection(pg_collection: Optional[PGCollection]) ->
                 raise ValueError(f"plain pg_collection must define {required_group}")
 
 
+def _get_data_parallel_world_size(pg_collection: Optional[PGCollection], args) -> int:
+    """Get the loss data-parallel world size used for training sample accounting."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        loss_pg_collection = pg_collection.get_loss_module_collection()
+        if loss_pg_collection is None:
+            return args.data_parallel_size
+        return loss_pg_collection.dp.size()
+    if pg_collection is not None:
+        return pg_collection.dp.size()
+    if mpu.model_parallel_is_initialized():
+        return mpu.get_data_parallel_world_size()
+    return args.data_parallel_size
+
+
 def set_startup_timestamps(program_start=None, main_entry=None):
     """Set startup timestamps from the entry script.
 
@@ -2612,6 +2626,10 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
+    is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection)
+    metric_pg_collection = (
+        pg_collection.get_loss_module_collection() if is_multimodule else pg_collection
+    )
 
     # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
     should_reset = not is_first_iteration
@@ -2686,11 +2704,13 @@ def training_log(
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
-    # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    _lr_mp_group = pg_collection.mp if pg_collection is not None else None
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
-        learning_rate, group=_lr_mp_group
-    )
+    # Ordinary ranks gather the learning rate across MP ranks. Multi-module optimizer values
+    # are already coherent across their heterogeneous topology.
+    if not is_multimodule:
+        _lr_mp_group = metric_pg_collection.mp if metric_pg_collection is not None else None
+        learning_rate = reduce_max_stat_across_model_parallel_group(
+            learning_rate, group=_lr_mp_group
+        )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
@@ -2772,7 +2792,9 @@ def training_log(
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
     # Log MoE metrics.
     moe_log_string = ""
-    if args.num_experts is not None:
+    if args.num_experts is not None and (
+        not is_multimodule or metric_pg_collection is not None
+    ):
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
@@ -2806,7 +2828,7 @@ def training_log(
             num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
-            pg_collection=pg_collection,
+            pg_collection=metric_pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
@@ -2924,25 +2946,31 @@ def training_log(
             total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
         reported_memory_in_this_iteration = False
+        can_report_memory = not is_multimodule or metric_pg_collection is not None
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
-            report_memory(
-                f'(after {iteration} iterations)',
-                process_group=pg_collection.dp if pg_collection is not None else None,
-            )
+            if can_report_memory:
+                report_memory(
+                    f'(after {iteration} iterations)',
+                    process_group=(
+                        metric_pg_collection.dp if metric_pg_collection is not None else None
+                    ),
+                )
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
             if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
                 report_memory_flag = False
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
-            not reported_memory_in_this_iteration:
+            not reported_memory_in_this_iteration and can_report_memory:
             report_memory(
                 f'(after {iteration} iterations)',
-                process_group=pg_collection.dp if pg_collection is not None else None,
+                process_group=(
+                    metric_pg_collection.dp if metric_pg_collection is not None else None
+                ),
             )
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
         # Token throughput metrics are read from RLRuntimeState automatically.
@@ -3364,11 +3392,6 @@ def train(
     p2p_communicator = _resolve_pipeline_communicator(
         pg_collection, p2p_communicator, config
     )
-    loss_pg_collection = (
-        pg_collection.get_loss_module_collection()
-        if isinstance(pg_collection, MultiModuleProcessGroupCollection)
-        else pg_collection
-    )
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
         if hasattr(args, f.name):
@@ -3439,11 +3462,7 @@ def train(
             args.no_load_optim = no_load_optim
 
     def _dp_world_size():
-        if loss_pg_collection is not None:
-            return loss_pg_collection.dp.size()
-        if mpu.model_parallel_is_initialized():
-            return mpu.get_data_parallel_world_size()
-        return args.data_parallel_size
+        return _get_data_parallel_world_size(pg_collection, args)
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
