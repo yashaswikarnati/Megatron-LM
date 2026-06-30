@@ -9,7 +9,7 @@ import argparse
 import torch
 
 from examples.mimo.training.topology import HeteroTopology
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -17,8 +17,9 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.training.initialize import _set_random_seed
-from megatron.training.training import resolve_ddp_bucket_size, wrap_model_chunks_with_ddp
-from megatron.training.utils import print_rank_0
+from megatron.training.models.dist_utils import (
+    prepare_existing_model_chunks_for_distributed_training,
+)
 
 
 class _EncoderFloat16Module(Float16Module):
@@ -91,83 +92,60 @@ def _module_config(module: torch.nn.Module):
     raise ValueError("Cannot resolve a config for DDP wrapping from module")
 
 
-def _maybe_float16_wrap(module: torch.nn.Module, config, is_encoder: bool) -> torch.nn.Module:
-    """Wrap a submodule in Float16Module when fp16/bf16 is enabled; encoders keep bf16 outputs."""
-    if not (getattr(config, "fp16", False) or getattr(config, "bf16", False)):
-        return module
-    cls = _EncoderFloat16Module if is_encoder else Float16Module
-    return cls(config, module)
+def _ddp_config_for(args: argparse.Namespace, *, overlap_grad_reduce: bool) -> DistributedDataParallelConfig:
+    """Per-module DDP config; bucket size is resolved downstream by the stock wrap path."""
+    return DistributedDataParallelConfig(
+        overlap_grad_reduce=overlap_grad_reduce,
+        overlap_param_gather=overlap_grad_reduce and getattr(args, "overlap_param_gather", False),
+        num_buckets=getattr(args, "ddp_num_buckets", None),
+        bucket_size=getattr(args, "ddp_bucket_size", None),
+        pad_buckets_for_high_nccl_busbw=getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False),
+        use_distributed_optimizer=True,
+        grad_reduce_in_fp32=getattr(args, "accumulate_allreduce_grads_in_fp32", True),
+    )
 
 
 def wrap_active_modules_with_ddp(
-    args: argparse.Namespace, mimo_model: MimoModel, topology: HeteroTopology
+    args: argparse.Namespace,
+    mimo_model: MimoModel,
+    topology: HeteroTopology,
+    *,
+    use_megatron_fsdp: bool = False,
+    use_torch_fsdp2: bool = False,
+    data_parallel_random_init: bool = False,
+    overlap_param_gather_with_optimizer_step: bool = False,
 ) -> None:
-    """Freeze (per --freeze-* flags), Float16Module-wrap, and DDP-wrap each active module."""
-    pad_buckets = getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False)
-    grad_reduce_in_fp32 = getattr(args, "accumulate_allreduce_grads_in_fp32", True)
+    """Freeze (per --freeze-* flags) and distributed-wrap each active module via the stock lifecycle."""
 
-    ddp_stream = torch.cuda.Stream()
-    ddp_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(ddp_stream):
-        if mimo_model.language_model is not None:
-            if getattr(args, "freeze_lm", False):
-                mimo_model.language_model.requires_grad_(False)
-            overlap = getattr(args, "overlap_grad_reduce", False)
-            ddp_config = DistributedDataParallelConfig(
-                overlap_grad_reduce=overlap,
-                overlap_param_gather=getattr(args, "overlap_param_gather", False),
-                num_buckets=getattr(args, "ddp_num_buckets", None),
-                bucket_size=getattr(args, "ddp_bucket_size", None),
-                pad_buckets_for_high_nccl_busbw=pad_buckets,
-                use_distributed_optimizer=True,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-            )
-            # Resolve the absolute bucket size on the real config, as get_model does.
-            ddp_config.bucket_size = resolve_ddp_bucket_size(
-                ddp_config,
-                topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY].dp_cp,
-                overlap,
-                sum(p.numel() for p in mimo_model.language_model.parameters()),
-            )
-            lm_config = _module_config(mimo_model.language_model)
-            lm_module = _maybe_float16_wrap(mimo_model.language_model, lm_config, is_encoder=False)
-            print_rank_0("wrapping language model in DDP")
-            mimo_model.language_model = wrap_model_chunks_with_ddp(
-                [lm_module],
-                lm_config,
-                ddp_config,
-                DP=DistributedDataParallel,
-                pg_collection=topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
-            )[0]
+    def _prepare(module, pg_collection, *, is_encoder, overlap_grad_reduce):
+        config = _module_config(module)
+        return prepare_existing_model_chunks_for_distributed_training(
+            [module],
+            config,
+            pg_collection,
+            built_with_meta_device=config.init_model_with_meta_device,
+            ddp_config=_ddp_config_for(args, overlap_grad_reduce=overlap_grad_reduce),
+            overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=use_megatron_fsdp,
+            use_torch_fsdp2=use_torch_fsdp2,
+            data_parallel_random_init=data_parallel_random_init,
+            mixed_precision_wrapper=_EncoderFloat16Module if is_encoder else Float16Module,
+        )[0]
 
-        for name, submodule in mimo_model.modality_submodules.items():
-            if submodule is None or name not in topology.module_pgs:
-                continue
-            _freeze_modality_submodule(submodule, args)
-            ddp_config = DistributedDataParallelConfig(
-                overlap_grad_reduce=False,
-                overlap_param_gather=False,
-                num_buckets=getattr(args, "ddp_num_buckets", None),
-                bucket_size=getattr(args, "ddp_bucket_size", None),
-                pad_buckets_for_high_nccl_busbw=pad_buckets,
-                use_distributed_optimizer=True,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-            )
-            # Encoders keep overlap off; resolve_ddp_bucket_size returns None there.
-            ddp_config.bucket_size = resolve_ddp_bucket_size(
-                ddp_config,
-                topology.module_pgs[name].dp_cp,
-                False,
-                sum(p.numel() for p in submodule.parameters()),
-            )
-            enc_config = _module_config(submodule)
-            enc_module = _maybe_float16_wrap(submodule, enc_config, is_encoder=True)
-            print_rank_0(f"wrapping modality submodule {name!r} in DDP")
-            mimo_model.modality_submodules[name] = wrap_model_chunks_with_ddp(
-                [enc_module],
-                enc_config,
-                ddp_config,
-                DP=DistributedDataParallel,
-                pg_collection=topology.module_pgs[name],
-            )[0]
-    torch.cuda.current_stream().wait_stream(ddp_stream)
+    if mimo_model.language_model is not None:
+        if getattr(args, "freeze_lm", False):
+            mimo_model.language_model.requires_grad_(False)
+        mimo_model.language_model = _prepare(
+            mimo_model.language_model,
+            topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
+            is_encoder=False,
+            overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
+        )
+
+    for name, submodule in mimo_model.modality_submodules.items():
+        if submodule is None or name not in topology.module_pgs:
+            continue
+        _freeze_modality_submodule(submodule, args)
+        mimo_model.modality_submodules[name] = _prepare(
+            submodule, topology.module_pgs[name], is_encoder=True, overlap_grad_reduce=False
+        )

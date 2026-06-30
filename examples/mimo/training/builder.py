@@ -143,7 +143,15 @@ class MimoModelBuilder(ModelBuilder["MimoModel", MimoBuildConfig]):
         mimo_model = self.build_model(pg_collection)
 
         if wrap_with_ddp:
-            wrap_active_modules_with_ddp(args, mimo_model, topology)
+            wrap_active_modules_with_ddp(
+                args,
+                mimo_model,
+                topology,
+                use_megatron_fsdp=use_megatron_fsdp,
+                use_torch_fsdp2=use_torch_fsdp2,
+                data_parallel_random_init=data_parallel_random_init,
+                overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+            )
 
         configure_grad_sync(args, mimo_model, topology)
         # Per-grid rng key namespace (read by stock save/load); torch_dist only.
