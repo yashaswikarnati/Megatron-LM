@@ -98,6 +98,8 @@ def test_dynamic_radio_loader_emits_patchified_cpu_metadata():
     packed = inputs["packed_seq_params"]
     assert isinstance(packed, PackedSeqParams)
     assert (packed.qkv_format, packed.max_seqlen_q, packed.max_seqlen_kv) == ("thd", 16, 16)
+    assert packed.cu_seqlens_q.dtype == torch.int32
+    assert packed.cu_seqlens_kv.dtype == torch.int32
     assert torch.equal(packed.cu_seqlens_q, torch.arange(0, 97, 16, dtype=torch.int32))
     assert torch.equal(packed.cu_seqlens_kv, packed.cu_seqlens_q)
     assert packed.cu_seqlens_q.device.type == "cpu"

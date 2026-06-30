@@ -395,7 +395,10 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, object]:
                     )
                 seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1, dtype=torch.int32)
                 cu_seqlens = torch.cat(
-                    (torch.zeros(1, dtype=torch.int32), torch.cumsum(seq_lens, dim=0))
+                    (
+                        torch.zeros(1, dtype=torch.int32),
+                        torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
+                    )
                 )
                 max_seqlen = int(seq_lens.max().item())
                 encoder_batch.update(
