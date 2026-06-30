@@ -17,7 +17,6 @@ from tests.unit_tests.test_utilities import Utils
 
 ENCODER = "images"
 
-
 def _specs():
     return [
         ModuleGridSpec(name=ENCODER, num_ranks=4, tp=2, rank_offset=0),
@@ -65,6 +64,13 @@ class TestHeteroTopology:
             assert encoder_ranks | llm_ranks == set(range(dist.get_world_size()))
             assert topo.grids[ENCODER].rank_offset == 0
             assert topo.grids[MIMO_LANGUAGE_MODULE_KEY].rank_offset == 4
+            local_module_name = ENCODER if dist.get_rank() < 4 else MIMO_LANGUAGE_MODULE_KEY
+            expected_language_name = (
+                MIMO_LANGUAGE_MODULE_KEY if dist.get_rank() >= 4 else None
+            )
+            assert len(topo.pg_collection.module_pgs) == 1
+            assert topo.pg_collection.module_pgs[local_module_name] is topo.module_pgs[local_module_name]
+            assert topo.pg_collection.language_model_module_name == expected_language_name
         finally:
             topo.destroy()
 

@@ -126,7 +126,14 @@ class MimoOptimizer(MegatronOptimizer):
 
     def count_zeros(self) -> int:
         """Count zero gradients across all active module optimizers."""
-        return sum(opt.count_zeros() for opt in self._active_optimizers)
+        module_counts = torch.zeros(
+            len(self.module_infos), device="cuda", dtype=torch.int64
+        )
+        for index, (_, info) in enumerate(sorted(self.module_infos.items())):
+            if info.is_active and info.optimizer is not None:
+                module_counts[index] = info.optimizer.count_zeros()
+        torch.distributed.all_reduce(module_counts, op=torch.distributed.ReduceOp.MAX)
+        return int(module_counts.sum().item())
 
     @property
     def param_groups(self) -> List[dict]:

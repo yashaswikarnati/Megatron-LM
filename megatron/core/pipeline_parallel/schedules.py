@@ -48,7 +48,9 @@ Shape = Union[List[int], torch.Size]
 def get_forward_backward_func(
     pp_size: Optional[int] = None,
     vp_size: Optional[int] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[
+        Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]
+    ] = None,
 ):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -142,11 +144,12 @@ def get_forward_backward_func(
         vp_size (Optional[int]): Virtual pipeline model parallel size to use.
             If both pp_size and vp_size are None, both values fall back to parallel_state.
             Otherwise, provided values are used as-is and None is treated as an explicit input.
-        schedule_pg_collection (Optional[MultiModuleProcessGroupCollection]): When a
-            multi-module (cross-grid) collection is passed, select the bridge schedule.
+        pg_collection (Optional[Union[ProcessGroupCollection,
+            MultiModuleProcessGroupCollection]]): When a multi-module (cross-grid)
+            collection is passed, select the bridge schedule.
 
     """
-    if isinstance(schedule_pg_collection, MultiModuleProcessGroupCollection):
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
         return forward_backward_pipelining_without_interleaving
 
     if pp_size is None and vp_size is None:
@@ -2137,7 +2140,9 @@ def forward_backward_pipelining_without_interleaving(
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,
-    p2p_communicator: Optional[P2PCommunicator] = None,
+    p2p_communicator: Optional[
+        Union[P2PCommunicator, MultiModulePipelineCommunicator]
+    ] = None,
     pg_collection: Optional[
         Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]
     ] = None,
