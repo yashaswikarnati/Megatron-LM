@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.enums import ModelType
+from megatron.core.transformer.module import Float16Module
 from megatron.training.models.dist_utils import (
     _ddp_wrap,
     _print_num_params,
@@ -861,6 +862,69 @@ class TestUnimodalBuildDistributedModels:
                 self.transformer_config.virtual_pipeline_model_parallel_size,
                 ModelType.encoder_or_decoder,
             )
+        finally:
+            self._stop_patches()
+
+    def test_prebuilt_chunks_skip_stage_build_but_run_lifecycle(self):
+        param = Mock()
+        self.mock_model.parameters.return_value = [param]
+        transformer_config = _make_transformer_config(init_model_with_meta_device=True)
+        mocks = self._standard_patches()
+        prebuilt_chunks = [self.mock_model]
+        try:
+
+            def assert_model_type_before_hook(chunks):
+                assert chunks[0].model_type == ModelType.encoder_or_decoder
+                return chunks
+
+            hook = Mock(side_effect=assert_model_type_before_hook)
+            with patch(
+                f"{_MODULE}.to_empty_if_meta_device", return_value=self.mock_model
+            ) as mock_toempty:
+                unimodal_build_distributed_models(
+                    None,
+                    transformer_config,
+                    self.pg,
+                    wrap_with_ddp=False,
+                    pre_wrap_hook=hook,
+                    prebuilt_model_chunks=prebuilt_chunks,
+                )
+
+                mocks["bvps"].assert_not_called()
+                hook.assert_called_once_with(prebuilt_chunks)
+                mocks["tp_attr"].assert_called_once_with(param)
+                mocks["print"].assert_called_once_with(prebuilt_chunks, pg_collection=self.pg)
+                self.mock_model.cuda.assert_not_called()
+                mocks["mp_wrap"].assert_called_once_with(
+                    prebuilt_chunks, transformer_config, Float16Module
+                )
+                mock_toempty.assert_called_once_with(
+                    self.mock_model, device=torch.device("cuda")
+                )
+        finally:
+            self._stop_patches()
+
+    def test_raises_when_no_model_source_is_provided(self):
+        self._standard_patches()
+        try:
+            with pytest.raises(ValueError, match="build_model_func must be callable"):
+                unimodal_build_distributed_models(
+                    None, self.transformer_config, self.pg, wrap_with_ddp=False
+                )
+        finally:
+            self._stop_patches()
+
+    def test_raises_when_both_model_sources_are_provided(self):
+        self._standard_patches()
+        try:
+            with pytest.raises(ValueError, match="build_model_func must be None"):
+                unimodal_build_distributed_models(
+                    Mock(),
+                    self.transformer_config,
+                    self.pg,
+                    wrap_with_ddp=False,
+                    prebuilt_model_chunks=[self.mock_model],
+                )
         finally:
             self._stop_patches()
 

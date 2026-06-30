@@ -28,7 +28,7 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-from megatron.training.models.base import ModelBuilder, ModelConfig
+from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 
 _LANGUAGE_SEED_OFFSET = 20_000
 _ENCODER_SEED_OFFSET = 10_000
@@ -139,7 +139,6 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         model_type: ModelType = ModelType.encoder_or_decoder,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
-        del model_type
         if wrap_with_ddp and ddp_config is None:
             raise ValueError("ddp_config is required when wrap_with_ddp is True")
 
@@ -176,12 +175,22 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         else:
             mimo_model = self.build_model(pg_collection)
 
+        mimo_model.model_type = model_type
+        model_list = [mimo_model]
+        _model = compose_hooks(self._model_config.pre_wrap_hooks)(model_list)
+        if _model is not None:
+            model_list = _model
+        if len(model_list) != 1:
+            raise ValueError(
+                f"MIMO pre-wrap hooks must return exactly one outer model; got {len(model_list)}"
+            )
+        mimo_model = model_list[0]
+
         prepare_active_modules_for_distributed_training(
             args,
             mimo_model,
             topology,
             ddp_config=ddp_config,
-            built_with_meta_device=built_with_meta_device,
             overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
             use_megatron_fsdp=use_megatron_fsdp,
             use_torch_fsdp2=use_torch_fsdp2,
@@ -190,4 +199,13 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             mixed_precision_wrapper=mixed_precision_wrapper,
         )
         configure_grad_sync(args, mimo_model, topology)
-        return [mimo_model]
+
+        model_list = [mimo_model]
+        _model = compose_hooks(self._model_config.post_wrap_hooks)(model_list)
+        if _model is not None:
+            model_list = _model
+        if len(model_list) != 1:
+            raise ValueError(
+                f"MIMO post-wrap hooks must return exactly one outer model; got {len(model_list)}"
+            )
+        return model_list

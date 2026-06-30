@@ -18,9 +18,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.training.initialize import _set_random_seed
-from megatron.training.models.dist_utils import (
-    prepare_existing_model_chunks_for_distributed_training,
-)
+from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.utils import print_rank_0
 
 
@@ -78,7 +76,6 @@ def prepare_active_modules_for_distributed_training(
     mimo_model: MimoModel,
     topology: HeteroTopology,
     ddp_config: DistributedDataParallelConfig | None,
-    built_with_meta_device: bool,
     overlap_param_gather_with_optimizer_step: bool = False,
     use_megatron_fsdp: bool = False,
     use_torch_fsdp2: bool = False,
@@ -97,11 +94,10 @@ def prepare_active_modules_for_distributed_training(
         language_config = _module_config(mimo_model.language_model)
         language_ddp_config = replace(ddp_config) if ddp_config is not None else None
         print_rank_0("preparing language model for distributed training")
-        mimo_model.language_model = prepare_existing_model_chunks_for_distributed_training(
-            [mimo_model.language_model],
-            language_config,
-            topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
-            built_with_meta_device=built_with_meta_device,
+        mimo_model.language_model = unimodal_build_distributed_models(
+            build_model_func=None,
+            transformer_config=language_config,
+            pg_collection=topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
             ddp_config=language_ddp_config,
             overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
             use_megatron_fsdp=use_megatron_fsdp,
@@ -109,6 +105,7 @@ def prepare_active_modules_for_distributed_training(
             wrap_with_ddp=wrap_with_ddp,
             data_parallel_random_init=data_parallel_random_init,
             mixed_precision_wrapper=mixed_precision_wrapper,
+            prebuilt_model_chunks=[mimo_model.language_model],
         )[0]
 
     for name, submodule in mimo_model.modality_submodules.items():
@@ -134,11 +131,10 @@ def prepare_active_modules_for_distributed_training(
             else mixed_precision_wrapper
         )
         print_rank_0(f"preparing modality submodule {name!r} for distributed training")
-        mimo_model.modality_submodules[name] = prepare_existing_model_chunks_for_distributed_training(
-            [submodule],
-            encoder_config,
-            topology.module_pgs[name],
-            built_with_meta_device=built_with_meta_device,
+        mimo_model.modality_submodules[name] = unimodal_build_distributed_models(
+            build_model_func=None,
+            transformer_config=encoder_config,
+            pg_collection=topology.module_pgs[name],
             ddp_config=encoder_ddp_config,
             overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
             use_megatron_fsdp=use_megatron_fsdp,
@@ -146,4 +142,5 @@ def prepare_active_modules_for_distributed_training(
             wrap_with_ddp=wrap_with_ddp,
             data_parallel_random_init=data_parallel_random_init,
             mixed_precision_wrapper=encoder_wrapper,
+            prebuilt_model_chunks=[submodule],
         )[0]
