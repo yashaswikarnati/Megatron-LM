@@ -28,9 +28,20 @@ else
   TOKENIZER_ARGS+=(--image-token-id "${IMAGE_TOKEN_ID}")
 fi
 
+TORCHRUN_ARGS=(
+  --standalone
+  --nproc-per-node "${GPUS_PER_NODE}"
+)
+if [[ -n "${TORCHRUN_LOG_DIR:-}" ]]; then
+  TORCHRUN_ARGS+=(
+    --log-dir "${TORCHRUN_LOG_DIR}"
+    --redirects 3
+    --tee 0:3
+  )
+fi
+
 "${PYTHON_BIN}" -m torch.distributed.run \
-  --standalone \
-  --nproc-per-node "${GPUS_PER_NODE}" \
+  "${TORCHRUN_ARGS[@]}" \
   examples/mimo/pretrain_mimo.py \
   --model-provider nemotron-moe-vlm \
   --dynamic-resolution \
