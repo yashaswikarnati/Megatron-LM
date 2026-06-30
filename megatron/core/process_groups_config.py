@@ -693,7 +693,8 @@ class MultiModuleProcessGroupCollection:
             raise ValueError(
                 "Operation requires exactly one local module process-group collection"
             )
-        return next(iter(self.module_pgs.values()))
+        (local_collection,) = self.module_pgs.values()
+        return local_collection
 
     def __len__(self):
         """Return the number of modules in this wrapper."""

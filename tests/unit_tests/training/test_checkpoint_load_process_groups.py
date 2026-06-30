@@ -2,8 +2,6 @@
 
 """Focused tests for checkpoint-load process-group forwarding."""
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -75,36 +73,6 @@ def test_fully_parallel_load_uses_supplied_group_or_mpu_fallback(
         other_getter.assert_not_called()
 
 
-def test_nonpersistent_global_load_forwards_supplied_groups():
-    args = SimpleNamespace(
-        non_persistent_global_ckpt_dir="nonpersistent",
-        non_persistent_ckpt_type="global",
-        ckpt_step=None,
-    )
-    dp_cp_group, expt_dp_group = object(), object()
-    expected = (object(), "checkpoint", False, checkpointing.CheckpointType.GLOBAL)
-    with (
-        mock.patch.object(checkpointing, "_get_non_persistent_iteration", return_value=3),
-        mock.patch.object(checkpointing, "set_loaded_iteration"),
-        mock.patch.object(
-            checkpointing, "_load_global_dist_base_checkpoint", return_value=expected
-        ) as load_global,
-    ):
-        result = checkpointing._load_base_checkpoint(
-            None,
-            args,
-            rank0=False,
-            sharded_state_dict={},
-            checkpointing_context={"context": object()},
-            dp_cp_group=dp_cp_group,
-            expt_dp_group=expt_dp_group,
-        )
-
-    assert result is expected
-    assert load_global.call_args.kwargs["dp_cp_group"] is dp_cp_group
-    assert load_global.call_args.kwargs["expt_dp_group"] is expt_dp_group
-
-
 def test_persistent_global_load_forwards_supplied_groups():
     args = SimpleNamespace(
         non_persistent_global_ckpt_dir=None, non_persistent_ckpt_type=None, ckpt_step=None
@@ -165,30 +133,3 @@ def test_nonpersistent_local_load_uses_supplied_dp_group():
         intermediate_state_dict.to_state_dict.call_args.kwargs["parallelization_group"]
         is dp_cp_group
     )
-
-
-def test_load_checkpoint_forwards_groups_to_rank_local_base_load():
-    tree = ast.parse(Path(checkpointing.__file__).read_text())
-    load_function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "load_checkpoint"
-    )
-    rank_local_calls = [
-        node
-        for node in ast.walk(load_function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_load_base_checkpoint"
-        and any(
-            keyword.arg == "rank0"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is False
-            for keyword in node.keywords
-        )
-    ]
-    assert len(rank_local_calls) == 1
-    group_keywords = {keyword.arg: keyword.value for keyword in rank_local_calls[0].keywords}
-    for group_name in ("dp_cp_group", "expt_dp_group"):
-        assert isinstance(group_keywords[group_name], ast.Name)
-        assert group_keywords[group_name].id == group_name

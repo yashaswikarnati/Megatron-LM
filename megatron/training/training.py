@@ -1083,7 +1083,10 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    seed_pg_collection = pg_collection if pg_collection is not None and not is_multi_module else None
+    if is_multi_module:
+        local_pg_collection = pg_collection.get_only_local_collection()
+    else:
+        local_pg_collection = pg_collection
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -1091,18 +1094,13 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
-        skip_random_seed=is_multi_module,
-        seed_pp_group=getattr(seed_pg_collection, "pp", None),
-        seed_dp_group=getattr(seed_pg_collection, "dp", None),
-        seed_tp_group=getattr(seed_pg_collection, "tp", None),
-        seed_ep_group=getattr(seed_pg_collection, "ep", None),
-        seed_etp_group=getattr(seed_pg_collection, "expt_tp", None),
+        seed_pp_group=getattr(local_pg_collection, "pp", None),
+        seed_dp_group=getattr(local_pg_collection, "dp", None),
+        seed_tp_group=getattr(local_pg_collection, "tp", None),
+        seed_ep_group=getattr(local_pg_collection, "ep", None),
+        seed_etp_group=getattr(local_pg_collection, "expt_tp", None),
     )
-    if is_multi_module:
-        local_pg_collection = pg_collection.get_only_local_collection()
-    elif pg_collection is not None:
-        local_pg_collection = pg_collection
-    else:
+    if local_pg_collection is None:
         # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
         local_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -1119,8 +1117,7 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    jit_pg_collection = local_pg_collection if pg_collection is not None else None
-    tp_size = get_pg_size(jit_pg_collection.tp) if jit_pg_collection is not None else None
+    tp_size = get_pg_size(local_pg_collection.tp) if pg_collection is not None else None
     set_jit_fusion_options(tp_size=tp_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
@@ -3025,14 +3022,17 @@ def save_checkpoint_and_time(
             model_chunk.free_overlap_buffers()
     torch.cuda.empty_cache()
 
+    local_pg_collection, rng_state_key_prefix = _resolve_local_pg_collection(pg_collection)
+
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
     if should_report_memory:
         # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})")
-
-    local_pg_collection, rng_state_key_prefix = _resolve_local_pg_collection(pg_collection)
+        report_memory(
+            f"(before save_checkpoint for iteration {iteration})",
+            process_group=local_pg_collection.dp,
+        )
 
     # Save checkpoint.
     save_checkpoint(
@@ -3059,7 +3059,10 @@ def save_checkpoint_and_time(
 
     if should_report_memory:
         # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})")
+        report_memory(
+            f"(after save_checkpoint for iteration {iteration})",
+            process_group=local_pg_collection.dp,
+        )
     num_checkpoints_memory_reported += 1
 
     if args.fp8:

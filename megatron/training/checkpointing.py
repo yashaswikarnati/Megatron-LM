@@ -790,7 +790,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     cached_metadata = checkpointing_context['local_checkpoint_cache']
                 state_dict_for_save, cacheable_metadata = MCoreTensorAwareStateDict.from_state_dict(
                     state_dict, algo=algo, cached_metadata=cached_metadata,
-                    parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True)
+                    parallelization_group=(
+                        dp_cp_group
+                        if dp_cp_group is not None
+                        else mpu.get_data_parallel_group(with_context_parallel=True)
+                    ),
                 )
                 async_save_request = checkpointing_context['local_checkpoint_manager'].save(
                     state_dict_for_save, iteration, is_async=bool(args.async_save)
@@ -823,6 +827,29 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     append_to_progress_log(args.save, f'Saved async local checkpoint\tIteration: {iteration}',
                                            barrier=False)
         else:
+            if tensor_rank is not None:
+                tensor_rank_to_print = tensor_rank + 1
+            elif tp_group is not None:
+                tensor_rank_to_print = get_pg_rank(tp_group) + 1
+            else:
+                tensor_rank_to_print = mpu.get_tensor_model_parallel_rank() + 1
+            if pipeline_rank is not None:
+                pipeline_rank_to_print = pipeline_rank + 1
+            elif pp_group is not None:
+                pipeline_rank_to_print = get_pg_rank(pp_group) + 1
+            else:
+                pipeline_rank_to_print = mpu.get_pipeline_model_parallel_rank() + 1
+            tensor_world_size_to_print = (
+                get_pg_size(tp_group)
+                if tp_group is not None
+                else mpu.get_tensor_model_parallel_world_size()
+            )
+            pipeline_world_size_to_print = (
+                get_pg_size(pp_group)
+                if pp_group is not None
+                else mpu.get_pipeline_model_parallel_world_size()
+            )
+
             def iter_finalize_fn():
                 prev_iteration = 0
                 save_retain_interval = getattr(args, 'save_retain_interval', None)  # For backwards compatibility of tests.
@@ -832,12 +859,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             prev_iteration = int(f.read().strip())
                 with open_file(tracker_filename, 'w') as f:
                     f.write("release" if release else str(iteration))
-                tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
-                pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
                              f"checkpoint from iteration {int(iteration):7d} to {args.save} "
-                             f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
-                             f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
+                             f"[ t {tensor_rank_to_print}/{tensor_world_size_to_print}, "
+                             f"p {pipeline_rank_to_print}/{pipeline_world_size_to_print} ]")
                 if args.log_progress and args.async_save:
                     append_to_progress_log(args.save, f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)

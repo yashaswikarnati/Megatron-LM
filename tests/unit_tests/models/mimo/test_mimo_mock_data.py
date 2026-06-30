@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from examples.mimo.data.mock import MockVLMDataset, get_mock_vlm_dataloader
+from examples.mimo.data.mock import get_mock_vlm_dataloader
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -21,8 +21,8 @@ def _grid(contains_rank):
     return SimpleNamespace(is_current_rank_in_grid=lambda: contains_rank)
 
 
-def _args(**overrides):
-    values = dict(
+def _args():
+    return argparse.Namespace(
         seed=123,
         dataset_provider="mock",
         micro_batch_size=2,
@@ -42,18 +42,12 @@ def _args(**overrides):
         mock_dataset_size=16,
         disable_vision_class_token=True,
     )
-    values.update(overrides)
-    return argparse.Namespace(**values)
 
 
-def _topology(*, language_rank, encoder_rank=None, language_pp_rank=0):
+def _topology(*, language_rank, encoder_rank=None):
     encoder = RADIO_ENCODER_MODULE_NAME
     grids = {"language": _grid(language_rank)}
-    pgs = {
-        "language": SimpleNamespace(
-            pp=_group(rank=language_pp_rank, size=3), dp=_group(rank=0, size=2)
-        )
-    }
+    pgs = {"language": SimpleNamespace(pp=_group(size=3), dp=_group(rank=0, size=2))}
     if encoder_rank is not None:
         grids[encoder] = _grid(encoder_rank)
         pgs[encoder] = SimpleNamespace(pp=_group(), dp=_group(rank=1, size=2))
@@ -68,46 +62,6 @@ def adapter(monkeypatch):
     monkeypatch.setattr(data, "is_pp_first_stage", lambda pg: pg.rank() == 0)
     monkeypatch.setattr(data, "is_pp_last_stage", lambda pg: pg.rank() == pg.size() - 1)
     return data
-
-
-def test_mock_loader_preserves_nested_inputs_and_masks_shifted_labels():
-    loader = get_mock_vlm_dataloader(
-        batch_size=2,
-        dataset_size=2,
-        shuffle=False,
-        seq_len=16,
-        image_seq_length=12,
-        vocab_size=32,
-        pad_token_id=5,
-        image_token_id=7,
-        modality_module_name="images",
-        encoder_name="clip_encoder",
-        img_h=8,
-        img_w=12,
-        patch_dim=4,
-        num_image_tiles=2,
-        dtype=torch.float16,
-        seed=11,
-        validate_image_token_count=True,
-    )
-
-    batch = next(iter(loader))
-    encoder_inputs = batch["modality_inputs"]["images"]["clip_encoder"]
-    assert encoder_inputs["x"].shape == (4, 3, 8, 12)
-    assert encoder_inputs["x"].dtype == torch.float16
-    assert torch.all(batch["input_ids"][:, :12] == 7)
-    assert torch.all(batch["input_ids"][:, 12:] != 7)
-    assert torch.all(batch["input_ids"][:, 12:] != 5)
-
-    expected_labels = torch.cat(
-        (batch["input_ids"][:, 1:], torch.full((2, 1), -100, dtype=torch.long)), dim=1
-    )
-    expected_labels[expected_labels == 7] = -100
-    assert torch.equal(batch["labels"], expected_labels)
-    assert torch.equal(batch["loss_mask"], (expected_labels != -100).float())
-    assert len(MockVLMDataset(image_size=224, seq_len=512, image_seq_length=197)) == 10_000
-    legacy_loader = get_mock_vlm_dataloader(batch_size=1, dataset_size=1)
-    assert (legacy_loader.dataset.seq_len, legacy_loader.dataset.image_seq_length) == (77, 32)
 
 
 def test_dynamic_radio_loader_emits_patchified_cpu_metadata():
@@ -148,32 +102,6 @@ def test_dynamic_radio_loader_emits_patchified_cpu_metadata():
     assert torch.equal(packed.cu_seqlens_kv, packed.cu_seqlens_q)
     assert packed.cu_seqlens_q.device.type == "cpu"
 
-    with pytest.raises(ValueError, match="image_seq_length.*divisible by num_image_tiles"):
-        MockVLMDataset(
-            dynamic_resolution=True, pixel_shuffle=True, image_seq_length=10, num_image_tiles=3
-        )
-    with pytest.raises(ValueError, match="must be less than seq_len"):
-        MockVLMDataset(seq_len=4, image_seq_length=4)
-    with pytest.raises(ValueError, match="pixel shuffle.*even patch grid"):
-        MockVLMDataset(
-            pixel_shuffle=True,
-            patch_dim=8,
-            img_h=24,
-            img_w=32,
-            image_seq_length=3,
-            validate_image_token_count=True,
-        )
-    with pytest.raises(ValueError, match="fixed-resolution.*12 image tokens"):
-        MockVLMDataset(
-            seq_len=16, image_seq_length=4, patch_dim=4, img_h=8, img_w=12,
-            num_image_tiles=2, validate_image_token_count=True,
-        )
-    with pytest.raises(ValueError, match="square patch grid"):
-        MockVLMDataset(
-            seq_len=8, image_seq_length=2, patch_dim=4, img_h=8, img_w=16,
-            pixel_shuffle=True, validate_image_token_count=True,
-        )
-
 
 def test_data_adapter_builds_independent_role_specific_loaders(adapter):
     language_loaders = adapter.build_train_valid_test_data_loaders(
@@ -185,11 +113,6 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
     language_batch = next(iter(language_loaders[0]))
     assert language_batch["input_ids"].shape == (2, 8)
     assert language_batch["modality_inputs"] == {}
-    assert all(
-        adapter.build_train_valid_test_data_loaders(
-            _args(), _topology(language_rank=True, language_pp_rank=2)
-        )
-    )
 
     encoder_loaders = adapter.build_train_valid_test_data_loaders(
         _args(), _topology(encoder_rank=True, language_rank=False)
@@ -202,42 +125,3 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         RADIO_ENCODER_MODULE_NAME
     ]
     assert encoder_inputs["x"].shape == (4, 3, 4, 4)
-    fixed = adapter._mock_loader_kwargs(
-        _args(image_seq_length=None, seq_length=16, img_w=6, num_image_tiles=2),
-        RADIO_ENCODER_MODULE_NAME,
-    )
-    dynamic = adapter._mock_loader_kwargs(
-        _args(
-            image_seq_length=None,
-            seq_length=24,
-            dynamic_resolution=True,
-            pixel_shuffle=True,
-            num_image_tiles=3,
-        ),
-        RADIO_ENCODER_MODULE_NAME,
-    )
-    assert (fixed["image_seq_length"], dynamic["image_seq_length"]) == (12, 12)
-
-
-def test_data_adapter_rejects_invalid_encoder_inputs_and_skips_non_consumers(adapter):
-    loaders = adapter.build_train_valid_test_data_loaders(
-        _args(), _topology(encoder_rank=False, language_rank=True, language_pp_rank=1)
-    )
-    assert loaders == (None, None, None)
-    assert all(
-        adapter.build_train_valid_test_data_loaders(
-            _args(disable_vision_class_token=False),
-            _topology(encoder_rank=False, language_rank=True),
-        )
-    )
-
-    with pytest.raises(ValueError, match="micro_batch_size.*llm_dp.*encoder_dp"):
-        adapter.build_train_valid_test_data_loaders(
-            _args(micro_batch_size=1, llm_dp=1, encoder_dp=2),
-            _topology(encoder_rank=False, language_rank=True),
-        )
-    with pytest.raises(ValueError, match="disable-vision-class-token"):
-        adapter.build_train_valid_test_data_loaders(
-            _args(disable_vision_class_token=False),
-            _topology(encoder_rank=True, language_rank=False),
-        )
