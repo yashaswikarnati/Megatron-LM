@@ -48,7 +48,9 @@ Shape = Union[List[int], torch.Size]
 def get_forward_backward_func(
     pp_size: Optional[int] = None,
     vp_size: Optional[int] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[
+        Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]
+    ] = None,
 ):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -142,11 +144,12 @@ def get_forward_backward_func(
         vp_size (Optional[int]): Virtual pipeline model parallel size to use.
             If both pp_size and vp_size are None, both values fall back to parallel_state.
             Otherwise, provided values are used as-is and None is treated as an explicit input.
-        schedule_pg_collection (Optional[MultiModuleProcessGroupCollection]): When a
-            multi-module (cross-grid) collection is passed, select the bridge schedule.
+        pg_collection (Optional[Union[ProcessGroupCollection,
+            MultiModuleProcessGroupCollection]]): When a multi-module (cross-grid) collection is
+            passed, select the bridge schedule.
 
     """
-    if isinstance(schedule_pg_collection, MultiModuleProcessGroupCollection):
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
         return forward_backward_pipelining_without_interleaving
 
     if pp_size is None and vp_size is None:
@@ -597,7 +600,7 @@ def backward_step_multimodule(
     output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
     output_tensor_grad: Optional[Dict[str, torch.Tensor]],
     config,
-    language_model_module_name: str,
+    loss_module_name: str,
 ) -> Dict[str, torch.Tensor]:
     """Backward step for multi-module pipelines.
 
@@ -618,10 +621,10 @@ def backward_step_multimodule(
         if tensor is not None:
             tensor.retain_grad()
 
-    # Last stage: output_tensor is a scalar loss from the language model.
-    # Associate it with the language_model_module_name.
+    # Last stage: output_tensor is a scalar loss from the loss module.
+    # Associate it with the loss_module_name.
     if not isinstance(output_tensor, dict):
-        output_tensor = {language_model_module_name: output_tensor}
+        output_tensor = {loss_module_name: output_tensor}
 
     # Handle output_tensor_grad: None (last stage) or dict (intermediate stages).
     if not output_tensor_grad:
@@ -2200,16 +2203,15 @@ def forward_backward_pipelining_without_interleaving(
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
 
         if is_multimodule:
-            # Multi-module: use language model's CP size for loss scaling
+            # Multi-module: use the loss module's CP size for loss scaling.
             if not config.variable_seq_lengths:
                 raise ValueError(
                     "config.variable_seq_lengths=True required for multi-module pipelines"
                 )
-            if pg_collection.has_language_model():
-                cp_size = pg_collection.get_language_model_cp_size()
-            else:
-                # Encoder-only ranks should not use CP loss scaling.
-                cp_size = None
+            loss_module_collection = pg_collection.get_loss_module_collection()
+            cp_size = (
+                loss_module_collection.cp.size() if loss_module_collection is not None else None
+            )
 
         elif isinstance(pg_collection, ProcessGroupCollection):
             # Single-module: extract tp/cp groups and cp_size
@@ -2282,7 +2284,7 @@ def forward_backward_pipelining_without_interleaving(
     if is_multimodule:
         backward_func = partial(
             backward_step_multimodule,
-            language_model_module_name=pg_collection.language_model_module_name,
+            loss_module_name=pg_collection.loss_module_name,
         )
     else:
         backward_func = backward_step

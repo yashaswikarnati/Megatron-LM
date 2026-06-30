@@ -11,6 +11,7 @@ from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
+from ..transformer.utils import sharded_state_dict_default
 from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
@@ -40,6 +41,16 @@ class DistributedDataParallel(_BaseDataParallel):
             instead of computing a default one.
 
     """
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Return the wrapped module's logical sharded state without a DDP prefix."""
+        return sharded_state_dict_default(
+            self.module,
+            prefix,
+            sharded_offsets,
+            metadata,
+            tp_group=self.tp_group,
+        )
 
     def __init__(
         self,

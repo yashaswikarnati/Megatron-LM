@@ -385,7 +385,14 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
-def validate_args(args, defaults={}):
+def validate_args(args, defaults={}, data_parallel_size_override: int | None = None):
+
+    if data_parallel_size_override is not None and (
+        isinstance(data_parallel_size_override, bool)
+        or not isinstance(data_parallel_size_override, int)
+        or data_parallel_size_override <= 0
+    ):
+        raise ValueError("data_parallel_size_override must be a positive integer")
 
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
@@ -410,10 +417,13 @@ def validate_args(args, defaults={}):
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
 
-    # Total model size.
-    assert args.world_size % total_model_size == 0, (
-        f"world size ({args.world_size}) is not divisible by total_model_size ({total_model_size=})"
-    )
+    # Total model size. Heterogeneous launchers validate their module grid separately and
+    # provide the data-parallel size of the loss-owning grid explicitly.
+    if data_parallel_size_override is None:
+        assert args.world_size % total_model_size == 0, (
+            f"world size ({args.world_size}) is not divisible by "
+            f"total_model_size ({total_model_size=})"
+        )
 
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
@@ -422,7 +432,11 @@ def validate_args(args, defaults={}):
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
-    args.data_parallel_size = args.world_size // total_model_size
+    args.data_parallel_size = (
+        data_parallel_size_override
+        if data_parallel_size_override is not None
+        else args.world_size // total_model_size
+    )
 
     if args.perform_rl_step:
         # ----------------------------------------------------------------
@@ -670,6 +684,8 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
+    assert args.eval_global_batch_size > 0, "eval_global_batch_size must be greater than zero"
+    assert args.eval_micro_batch_size > 0, "eval_micro_batch_size must be greater than zero"
     assert args.eval_global_batch_size % (args.eval_micro_batch_size * args.data_parallel_size) == 0, \
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by " \
         f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"

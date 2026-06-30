@@ -409,16 +409,16 @@ def run_multimodule_schedule_test(
     # Reuse pg_collections already created during model init (avoid creating duplicate PGs)
     rank = dist.get_rank()
     module_pgs = {}
-    language_model_module_name = None
     for name, grid in model.encoder_grids.items():
         if grid.rank_offset <= rank < grid.rank_offset + grid.size:
             module_pgs[name] = model.encoder_pg_collections[name]
     if model.llm_grid.rank_offset <= rank < model.llm_grid.rank_offset + model.llm_grid.size:
         module_pgs['llm'] = model.llm_pg_collection
-        language_model_module_name = 'llm'
 
     pg_collection = MultiModuleProcessGroupCollection(
-        module_pgs=module_pgs, language_model_module_name=language_model_module_name
+        module_pgs=module_pgs,
+        loss_module_name='llm',
+        module_order=tuple(module_to_grid_map),
     )
 
     # Define step function

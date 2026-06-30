@@ -1,21 +1,39 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Real-distributed (8-GPU, no mocks) tests for the hetero MIMO grid topology.
+"""Construction and real-distributed tests for the hetero MIMO grid topology.
 
 Layout under test: encoder grid tp=2,dp=2 at ranks 0-3, language grid tp=2,pp=2 at ranks 4-7.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 
-from examples.mimo.training.topology import ModuleGridSpec, _validate_grid_layout, create_topology
+import examples.mimo.training.topology as topology_module
+from examples.mimo.training.topology import (
+    HeteroTopology,
+    ModuleGridSpec,
+    _encoder_module_name,
+    _validate_grid_layout,
+    create_topology,
+)
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout
 from megatron.core.parallel_state import default_embedding_ranks
+from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 ENCODER = "images"
+
+
+def _mock_grid(mocker, rank_offset, size, pp_rank_groups=()):
+    grid = mocker.Mock()
+    grid.rank_offset = rank_offset
+    grid.size = size
+    grid.get_rank_enum.return_value = [list(ranks) for ranks in pp_rank_groups]
+    return grid
 
 
 def _specs():
@@ -23,6 +41,198 @@ def _specs():
         ModuleGridSpec(name=ENCODER, num_ranks=4, tp=2, rank_offset=0),
         ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, tp=2, pp=2, rank_offset=4),
     ]
+
+
+def test_hetero_topology_exposes_only_pg_collection_field():
+    fields = set(HeteroTopology.__dataclass_fields__)
+
+    assert "pg_collection" in fields
+    assert "schedule_pg_collection" not in fields
+    assert not hasattr(HeteroTopology, "schedule_pg_collection")
+
+
+def test_create_topology_rejects_duplicate_module_names_before_grid_build(mocker):
+    build_grid = mocker.patch.object(topology_module, "_build_grid")
+    specs = [
+        ModuleGridSpec(name="vision", num_ranks=4, tp=2),
+        ModuleGridSpec(name="vision", num_ranks=4, tp=2),
+        ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, tp=2),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate module names"):
+        create_topology(specs)
+
+    build_grid.assert_not_called()
+
+
+def test_example_encoder_resolver_rejects_multiple_encoder_grids():
+    topology = SimpleNamespace(
+        grids={"vision": object(), "audio": object(), MIMO_LANGUAGE_MODULE_KEY: object()}
+    )
+
+    with pytest.raises(ValueError, match="supports exactly one encoder.*audio.*vision"):
+        _encoder_module_name(topology)
+
+
+def test_create_topology_preserves_distinct_module_resources(mocker):
+    specs = [
+        ModuleGridSpec(name="vision", num_ranks=4, tp=2),
+        ModuleGridSpec(name="audio", num_ranks=4, tp=2),
+        ModuleGridSpec(name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, tp=2, rank_offset=4),
+    ]
+    vision_grid = mocker.Mock(name="vision_grid")
+    audio_grid = mocker.Mock(name="audio_grid")
+    language_grid = mocker.Mock(name="language_grid")
+    for grid in (vision_grid, audio_grid):
+        grid.is_current_rank_in_grid.return_value = True
+    language_grid.is_current_rank_in_grid.return_value = False
+    build_grid = mocker.patch.object(
+        topology_module, "_build_grid", side_effect=[vision_grid, audio_grid, language_grid]
+    )
+    mocker.patch.object(topology_module, "_validate_grid_layout")
+
+    vision_pgs = ProcessGroupCollection()
+    audio_pgs = ProcessGroupCollection()
+    language_pgs = ProcessGroupCollection()
+    for pgc in (vision_pgs, audio_pgs, language_pgs):
+        pgc.embd = None
+        pgc.pos_embd = None
+    mocker.patch.object(
+        topology_module,
+        "pg_collection_from_grid",
+        side_effect=[vision_pgs, audio_pgs, language_pgs],
+    )
+
+    topology = create_topology(specs)
+    try:
+        assert [call.args[0] for call in build_grid.call_args_list] == specs
+        assert topology.grids["vision"] is vision_grid
+        assert topology.grids["audio"] is audio_grid
+        assert topology.grids[MIMO_LANGUAGE_MODULE_KEY] is language_grid
+        assert topology.module_pgs["vision"] is vision_pgs
+        assert topology.module_pgs["audio"] is audio_pgs
+        assert topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY] is language_pgs
+        assert topology.pg_collection.module_order == (
+            "vision",
+            "audio",
+            MIMO_LANGUAGE_MODULE_KEY,
+        )
+        assert list(topology.pg_collection.keys()) == ["vision", "audio"]
+        assert topology.pg_collection["vision"] is vision_pgs
+        assert topology.pg_collection["audio"] is audio_pgs
+    finally:
+        topology.destroy()
+
+
+def test_grid_layout_allows_identical_encoder_spans_disjoint_from_language(mocker):
+    grids = {
+        "vision": _mock_grid(mocker, 0, 4),
+        "audio": _mock_grid(mocker, 0, 4),
+        MIMO_LANGUAGE_MODULE_KEY: _mock_grid(mocker, 4, 4, ((4, 6), (5, 7))),
+    }
+    mocker.patch.object(topology_module.dist, "get_world_size", return_value=8)
+    mocker.patch.object(
+        topology_module.RankRole,
+        "build",
+        return_value=SimpleNamespace(mode=ModuleLayout.NON_COLOCATED),
+    )
+
+    _validate_grid_layout(grids)
+
+
+def test_grid_layout_rejects_partial_encoder_overlap(mocker):
+    grids = {
+        "vision": _mock_grid(mocker, 0, 4),
+        "audio": _mock_grid(mocker, 2, 4),
+        MIMO_LANGUAGE_MODULE_KEY: _mock_grid(mocker, 6, 2, ((6, 7),)),
+    }
+    mocker.patch.object(topology_module.dist, "get_world_size", return_value=8)
+
+    with pytest.raises(ValueError, match="encoder grids must be identical or disjoint"):
+        _validate_grid_layout(grids)
+
+
+def test_grid_layout_accepts_world_last_on_language_terminal_stage(mocker):
+    grids = {
+        "vision": _mock_grid(mocker, 0, 4),
+        MIMO_LANGUAGE_MODULE_KEY: _mock_grid(mocker, 4, 4, ((4, 6), (5, 7))),
+    }
+    mocker.patch.object(topology_module.dist, "get_world_size", return_value=8)
+    mocker.patch.object(
+        topology_module.RankRole,
+        "build",
+        return_value=SimpleNamespace(mode=ModuleLayout.NON_COLOCATED),
+    )
+
+    _validate_grid_layout(grids)
+
+
+def test_grid_layout_rejects_world_last_outside_language_terminal_stage(mocker):
+    grids = {
+        MIMO_LANGUAGE_MODULE_KEY: _mock_grid(mocker, 0, 4, ((0, 2), (1, 3))),
+        "vision": _mock_grid(mocker, 4, 4),
+    }
+    mocker.patch.object(topology_module.dist, "get_world_size", return_value=8)
+
+    with pytest.raises(ValueError, match="world-last rank 7.*terminal pipeline stage"):
+        _validate_grid_layout(grids)
+
+
+def test_build_multi_module_pg_collection_filters_in_canonical_order(mocker):
+    vision_grid = mocker.Mock()
+    audio_grid = mocker.Mock()
+    language_grid = mocker.Mock()
+    for grid in (vision_grid, audio_grid):
+        grid.shape = (2, 2)
+        grid.rank_offset = 0
+        grid.size = 4
+        grid.is_current_rank_in_grid.return_value = True
+    language_grid.is_current_rank_in_grid.return_value = False
+
+    vision_pgs = ProcessGroupCollection()
+    audio_pgs = ProcessGroupCollection()
+    language_pgs = ProcessGroupCollection()
+    grids = {"vision": vision_grid, "audio": audio_grid, "language": language_grid}
+    module_pgs = {"language": language_pgs, "audio": audio_pgs, "vision": vision_pgs}
+
+    collection = topology_module.build_multi_module_pg_collection(
+        grids,
+        module_pgs,
+        loss_module_name="language",
+        module_order=("vision", "audio", "language"),
+    )
+
+    assert collection.module_order == ("vision", "audio", "language")
+    assert collection.loss_module_name == "language"
+    assert list(collection.keys()) == ["vision", "audio"]
+    assert collection["vision"] is vision_pgs
+    assert collection["audio"] is audio_pgs
+    assert collection["vision"] is not collection["audio"]
+
+
+@pytest.mark.parametrize(
+    ("grid_names", "pg_names", "module_order"),
+    [
+        (("vision",), ("vision", "language"), ("vision", "language")),
+        (("vision", "language"), ("vision",), ("vision", "language")),
+        (("vision", "language"), ("vision", "language"), ("vision",)),
+    ],
+)
+def test_build_multi_module_pg_collection_rejects_module_name_mismatch(
+    mocker, grid_names, pg_names, module_order
+):
+    grids = {name: mocker.Mock() for name in grid_names}
+    for grid in grids.values():
+        grid.is_current_rank_in_grid.return_value = True
+    module_pgs = {name: ProcessGroupCollection() for name in pg_names}
+
+    with pytest.raises(ValueError, match="same declared module names"):
+        topology_module.build_multi_module_pg_collection(
+            grids,
+            module_pgs,
+            loss_module_name="language",
+            module_order=module_order,
+        )
 
 
 class TestModuleGridSpecResolution:
@@ -65,6 +275,20 @@ class TestHeteroTopology:
             assert encoder_ranks | llm_ranks == set(range(dist.get_world_size()))
             assert topo.grids[ENCODER].rank_offset == 0
             assert topo.grids[MIMO_LANGUAGE_MODULE_KEY].rank_offset == 4
+        finally:
+            topo.destroy()
+
+    def test_exposes_ordered_pg_collection(self):
+        specs = _specs()
+        topo = create_topology(specs)
+        try:
+            assert topo.pg_collection.module_order == tuple(spec.name for spec in specs)
+            assert topo.pg_collection.loss_module_name == MIMO_LANGUAGE_MODULE_KEY
+            assert list(topo.pg_collection.keys()) == [
+                spec.name
+                for spec in specs
+                if topo.grids[spec.name].is_current_rank_in_grid()
+            ]
         finally:
             topo.destroy()
 

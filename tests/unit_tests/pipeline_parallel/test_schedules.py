@@ -17,7 +17,10 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
@@ -74,6 +77,43 @@ def test_get_forward_backward_func():
         == schedule.forward_backward_pipelining_with_interleaving
     )
     Utils.destroy_model_parallel()
+
+
+def test_get_forward_backward_func_plain_pg_collection_uses_mpu_schedule():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
+    try:
+        expected_schedule = schedule.get_forward_backward_func()
+        assert (
+            schedule.get_forward_backward_func(pg_collection=ProcessGroupCollection())
+            is expected_schedule
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_get_forward_backward_func_selects_multimodule_schedule_from_pg_collection():
+    pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"vision": ProcessGroupCollection()},
+        loss_module_name="language",
+        module_order=("vision", "language"),
+    )
+
+    assert pg_collection.get_loss_module_collection() is None
+    assert (
+        schedule.get_forward_backward_func(pg_collection=pg_collection)
+        is schedule.forward_backward_pipelining_without_interleaving
+    )
+
+
+def test_get_forward_backward_func_has_no_schedule_pg_collection_alias():
+    pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"vision": ProcessGroupCollection()},
+        loss_module_name="language",
+        module_order=("vision", "language"),
+    )
+
+    with pytest.raises(TypeError, match="schedule_pg_collection"):
+        schedule.get_forward_backward_func(schedule_pg_collection=pg_collection)
 
 
 def test_deallocate_output_tensor():

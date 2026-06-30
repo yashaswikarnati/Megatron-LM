@@ -65,19 +65,24 @@ class HeteroTopology:
 
     grids: dict[str, HyperCommGrid]
     module_pgs: dict[str, ProcessGroupCollection]
-    schedule_pg_collection: MultiModuleProcessGroupCollection
+    pg_collection: MultiModuleProcessGroupCollection
 
     def destroy(self) -> None:
         """Destroy every process group owned by this topology."""
-        destroyed: set[int] = set()
-        for pgc in self.module_pgs.values():
-            for pg in (pgc.embd, pgc.pos_embd):
-                if pg is None or id(pg) in destroyed or not _is_process_group_member(pg):
-                    continue
-                dist.destroy_process_group(pg)
-                destroyed.add(id(pg))
-        for grid in self.grids.values():
-            grid.destroy()
+        _destroy_topology_resources(self.grids, self.module_pgs)
+
+
+def _encoder_module_name(topology: HeteroTopology) -> Optional[str]:
+    """Return the sole encoder name supported by the current example, if present."""
+    names = sorted(
+        name for name in topology.grids if name != MIMO_LANGUAGE_MODULE_KEY
+    )
+    if len(names) > 1:
+        raise ValueError(
+            "the current heterogeneous MIMO example supports exactly one encoder grid "
+            f"or LLM-only execution; got multiple encoders: {names}"
+        )
+    return names[0] if names else None
 
 
 def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
@@ -88,13 +93,21 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
     """
     if not specs:
         raise ValueError("create_topology requires at least one ModuleGridSpec")
+    module_order = tuple(spec.name for spec in specs)
+    duplicate_names = tuple(
+        name for name in dict.fromkeys(module_order) if module_order.count(name) > 1
+    )
+    if duplicate_names:
+        raise ValueError(
+            f"create_topology requires unique module names; duplicate module names: "
+            f"{duplicate_names}"
+        )
     language_specs = [spec for spec in specs if spec.name == MIMO_LANGUAGE_MODULE_KEY]
     if len(language_specs) != 1:
         raise ValueError(
             f"create_topology requires exactly one spec named {MIMO_LANGUAGE_MODULE_KEY!r} "
             f"(the language module), got {len(language_specs)}"
         )
-    language_name = MIMO_LANGUAGE_MODULE_KEY
 
     grids: dict[str, HyperCommGrid] = {}
     module_pgs: dict[str, ProcessGroupCollection] = {}
@@ -103,16 +116,38 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
             grids[spec.name] = _build_grid(spec)
         _validate_grid_layout(grids)
 
-        for name, grid in grids.items():
-            module_pgs[name] = pg_collection_from_grid(grid, is_language=(name == language_name))
+        for name in module_order:
+            module_pgs[name] = pg_collection_from_grid(
+                grids[name], is_language=(name == MIMO_LANGUAGE_MODULE_KEY)
+            )
 
-        schedule_pg_collection = build_schedule_pg_collection(grids, module_pgs, language_name)
+        pg_collection = build_multi_module_pg_collection(
+            grids,
+            module_pgs,
+            loss_module_name=MIMO_LANGUAGE_MODULE_KEY,
+            module_order=module_order,
+        )
         return HeteroTopology(
-            grids=grids, module_pgs=module_pgs, schedule_pg_collection=schedule_pg_collection
+            grids=grids, module_pgs=module_pgs, pg_collection=pg_collection
         )
     except Exception:
-        HeteroTopology(grids=grids, module_pgs=module_pgs, schedule_pg_collection=None).destroy()
+        _destroy_topology_resources(grids, module_pgs)
         raise
+
+
+def _destroy_topology_resources(
+    grids: dict[str, HyperCommGrid], module_pgs: dict[str, ProcessGroupCollection]
+) -> None:
+    """Destroy all process groups created while building a topology."""
+    destroyed: set[int] = set()
+    for pgc in module_pgs.values():
+        for pg in (pgc.embd, pgc.pos_embd):
+            if pg is None or id(pg) in destroyed or not _is_process_group_member(pg):
+                continue
+            dist.destroy_process_group(pg)
+            destroyed.add(id(pg))
+    for grid in grids.values():
+        grid.destroy()
 
 
 def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
@@ -147,23 +182,31 @@ def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
 
 
 def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
-    """Assert grids tile the world disjointly (non-colocated) XOR fully share ranks (colocated),
-    with no gaps. Colocated-vs-not is decided via the core ``RankRole.build`` path.
-    """
+    """Validate module placement and the current world-last reporting contract."""
     spans = {name: (g.rank_offset, g.rank_offset + g.size) for name, g in grids.items()}
     names = list(spans)
     all_same = all(spans[n] == spans[names[0]] for n in names)
-    pairwise_disjoint = all(
-        spans[a][1] <= spans[b][0] or spans[b][1] <= spans[a][0]
-        for i, a in enumerate(names)
-        for b in names[i + 1 :]
-    )
-    if not (all_same or pairwise_disjoint):
-        raise ValueError(
-            f"Module grids must either fully share ranks or be pairwise disjoint, got {spans}"
-        )
 
-    # Disjoint spans must also leave no rank uncovered (their union == [0, world_size)).
+    def disjoint(left: tuple[int, int], right: tuple[int, int]) -> bool:
+        return left[1] <= right[0] or right[1] <= left[0]
+
+    modality_names = [n for n in names if n != MIMO_LANGUAGE_MODULE_KEY]
+    if not all_same:
+        language_span = spans[MIMO_LANGUAGE_MODULE_KEY]
+        if any(not disjoint(spans[name], language_span) for name in modality_names):
+            raise ValueError(
+                f"The language grid must be disjoint from every encoder grid, got {spans}"
+            )
+        for index, name in enumerate(modality_names):
+            for other_name in modality_names[index + 1 :]:
+                if spans[name] != spans[other_name] and not disjoint(
+                    spans[name], spans[other_name]
+                ):
+                    raise ValueError(
+                        "encoder grids must be identical or disjoint, "
+                        f"got {name}={spans[name]} and {other_name}={spans[other_name]}"
+                    )
+
     world_size = dist.get_world_size()
     covered_ranks: set[int] = set()
     for start, end in spans.values():
@@ -173,7 +216,19 @@ def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
             f"Module grids must partition the world [0, {world_size}) with no gaps, got {spans}"
         )
 
-    modality_names = [n for n in names if n != MIMO_LANGUAGE_MODULE_KEY]
+    language_terminal_ranks = {
+        ranks[-1]
+        for ranks in grids[MIMO_LANGUAGE_MODULE_KEY].get_rank_enum("pp")
+        if ranks
+    }
+    reporting_rank = world_size - 1
+    if reporting_rank not in language_terminal_ranks:
+        raise ValueError(
+            f"world-last rank {reporting_rank} must belong to a terminal pipeline stage "
+            f"of the {MIMO_LANGUAGE_MODULE_KEY!r} grid; terminal ranks are "
+            f"{sorted(language_terminal_ranks)}"
+        )
+
     role = RankRole.build(modality_names, grids)
     expected = ModuleLayout.COLOCATED if all_same else ModuleLayout.NON_COLOCATED
     if role.mode is not expected:
@@ -227,24 +282,27 @@ def _build_language_embedding_groups(grid: HyperCommGrid, pgc: ProcessGroupColle
                 pgc.pos_embd = pos_group
 
 
-def build_schedule_pg_collection(
+def build_multi_module_pg_collection(
     grids: dict[str, HyperCommGrid],
     module_pgs: dict[str, ProcessGroupCollection],
-    language_name: str,
+    loss_module_name: str,
+    module_order: tuple[str, ...],
 ) -> MultiModuleProcessGroupCollection:
-    """Build the schedule-facing collection of the modules this rank participates in."""
-    rank_modules = {}
-    rank_language_name = None
-    for name, grid in grids.items():
-        # Include only modules this rank belongs to (colocated -> all; non-colocated -> its own),
-        # so language_model_module_name is set only when this rank is in the language module.
-        if not grid.is_current_rank_in_grid():
-            continue
-        rank_modules[name] = module_pgs[name]
-        if name == language_name:
-            rank_language_name = name
+    """Build the ordered collection of modules active on this rank."""
+    declared_names = set(module_order)
+    if set(grids) != declared_names or set(module_pgs) != declared_names:
+        raise ValueError(
+            "grids, module_pgs, and module_order must describe the same declared module names"
+        )
+    rank_modules = {
+        name: module_pgs[name]
+        for name in module_order
+        if grids[name].is_current_rank_in_grid()
+    }
     return MultiModuleProcessGroupCollection(
-        module_pgs=rank_modules, language_model_module_name=rank_language_name
+        module_pgs=rank_modules,
+        loss_module_name=loss_module_name,
+        module_order=module_order,
     )
 
 

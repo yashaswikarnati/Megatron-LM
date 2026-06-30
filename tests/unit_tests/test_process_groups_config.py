@@ -3,7 +3,10 @@
 import pytest
 import torch.distributed as dist
 
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -103,6 +106,139 @@ class TestProcessGroupsConfig:
         repr_str = repr(model_pgs)
         assert "ProcessGroupCollection(" in repr_str
         assert "hcp([2, 4])" in repr_str
+
+
+class TestMultiModuleProcessGroupCollection:
+    """Tests for ordered rank-local multi-module process group ownership."""
+
+    def test_loss_collection_resolves_locally(self):
+        vision_pgs = ProcessGroupCollection()
+        loss_pgs = ProcessGroupCollection()
+        collection = MultiModuleProcessGroupCollection(
+            module_pgs={"loss": loss_pgs, "vision": vision_pgs},
+            loss_module_name="loss",
+            module_order=("vision", "loss"),
+        )
+
+        assert collection.get_loss_module_collection() is loss_pgs
+
+    def test_loss_collection_is_none_when_loss_module_is_inactive(self):
+        vision_pgs = ProcessGroupCollection()
+        collection = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": vision_pgs},
+            loss_module_name="loss",
+            module_order=("vision", "loss"),
+        )
+
+        assert collection.get_loss_module_collection() is None
+
+    def test_topology_and_policy_are_immutable_snapshots(self):
+        vision_pgs = ProcessGroupCollection()
+        source_pgs = {"vision": vision_pgs}
+        collection = MultiModuleProcessGroupCollection(
+            module_pgs=source_pgs,
+            loss_module_name="loss",
+            module_order=("vision", "loss"),
+        )
+
+        source_pgs["loss"] = ProcessGroupCollection()
+
+        assert list(collection.keys()) == ["vision"]
+        assert collection.module_order == ("vision", "loss")
+        with pytest.raises(TypeError):
+            collection.module_pgs["loss"] = ProcessGroupCollection()
+        with pytest.raises(AttributeError):
+            collection.module_pgs = {}
+        with pytest.raises(AttributeError):
+            collection.loss_module_name = "vision"
+        with pytest.raises(AttributeError):
+            collection.module_order = ("loss", "vision")
+
+        sentinel = object()
+        vision_pgs.tp = sentinel
+        assert collection["vision"].tp is sentinel
+
+    def test_accessors_follow_canonical_order_for_local_modules(self):
+        vision_pgs = ProcessGroupCollection()
+        loss_pgs = ProcessGroupCollection()
+        collection = MultiModuleProcessGroupCollection(
+            module_pgs={"loss": loss_pgs, "vision": vision_pgs},
+            loss_module_name="loss",
+            module_order=("vision", "inactive", "loss"),
+        )
+
+        assert list(collection.keys()) == ["vision", "loss"]
+        assert list(collection.values()) == [vision_pgs, loss_pgs]
+        assert list(collection.items()) == [("vision", vision_pgs), ("loss", loss_pgs)]
+        assert list(collection) == [vision_pgs, loss_pgs]
+        assert len(collection) == 2
+        assert collection["vision"] is vision_pgs
+        repr_str = repr(collection)
+        assert "modules=[vision, loss]" in repr_str
+        assert "loss_module_name='loss'" in repr_str
+
+    def test_get_module_collection_returns_exact_local_collection(self):
+        vision_pgs = ProcessGroupCollection()
+        collection = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": vision_pgs},
+            loss_module_name="loss",
+            module_order=("vision", "loss"),
+        )
+
+        assert collection.get_module_collection("vision") is vision_pgs
+        with pytest.raises(ValueError, match="Module 'loss' is not active on this rank"):
+            collection.get_module_collection("loss")
+
+    @pytest.mark.parametrize(
+        ("module_pgs", "loss_module_name", "module_order", "message"),
+        [
+            ({}, "loss", ("loss",), "module_pgs cannot be empty"),
+            (
+                {"vision": ProcessGroupCollection()},
+                "loss",
+                ("vision", "loss", "vision"),
+                "module_order contains duplicate module names",
+            ),
+            (
+                {"vision": ProcessGroupCollection()},
+                "loss",
+                ("vision",),
+                "loss_module_name 'loss' is not present in module_order",
+            ),
+            (
+                {"vision": ProcessGroupCollection()},
+                "loss",
+                ("loss",),
+                "Local module 'vision' is not present in module_order",
+            ),
+        ],
+    )
+    def test_validation_errors(self, module_pgs, loss_module_name, module_order, message):
+        with pytest.raises(ValueError, match=message):
+            MultiModuleProcessGroupCollection(
+                module_pgs=module_pgs,
+                loss_module_name=loss_module_name,
+                module_order=module_order,
+            )
+
+    @pytest.mark.parametrize(
+        "legacy_api",
+        [
+            "language_model_module_name",
+            "get_language_model_collection",
+            "get_language_model_cp_size",
+            "has_language_model",
+            "local_collection",
+        ],
+    )
+    def test_legacy_apis_are_absent(self, legacy_api):
+        collection = MultiModuleProcessGroupCollection(
+            module_pgs={"loss": ProcessGroupCollection()},
+            loss_module_name="loss",
+            module_order=("loss",),
+        )
+
+        assert not hasattr(collection, legacy_api)
 
 
 class TestPGConfigDefaultInitialization:

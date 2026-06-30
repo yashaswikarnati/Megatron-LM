@@ -509,6 +509,6 @@ class Float16Module(MegatronModule):
         return self.module.sharded_state_dict(prefix, *args, **kwargs)
 
     def load_state_dict(
-        self, state_dict, strict=True
+        self, state_dict, strict=True, assign=False
     ):  # pylint: disable=missing-function-docstring
-        self.module.load_state_dict(state_dict, strict=strict)
+        return self.module.load_state_dict(state_dict, strict=strict, assign=assign)

@@ -3,9 +3,15 @@
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
+import pytest
 import torch
 
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
@@ -90,6 +96,184 @@ class TestTraining:
         assert next(valid_iters[1]) == 20
         # data_parallel_size=1, so MAX across DP ranks equals the local lengths
         assert args.eval_iters == [2, 3]
+
+    def test_multimodule_full_validation_reduces_lengths_over_world(self):
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        carrier = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": ProcessGroupCollection()},
+            loss_module_name="language",
+            module_order=("vision", "language"),
+        )
+
+        with mock.patch.object(torch.distributed, "all_reduce") as all_reduce:
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider, pg_collection=carrier
+            )
+
+        assert all_reduce.call_args.kwargs["group"] is torch.distributed.group.WORLD
+
+    def test_multimodule_ranks_without_validation_data_join_world_length_reduce(self):
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        carrier = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": ProcessGroupCollection()},
+            loss_module_name="language",
+            module_order=("vision", "language"),
+        )
+
+        with (
+            mock.patch(
+                "megatron.training.training.build_train_valid_test_data_loaders",
+                return_value=(None, [None, None], None),
+            ),
+            mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
+        ):
+            _, valid_iterators, _ = build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider, pg_collection=carrier
+            )
+
+        assert all_reduce.call_count == 2
+        assert all_reduce.call_args.kwargs["group"] is torch.distributed.group.WORLD
+        assert args.eval_iters == [0, 0]
+        assert valid_iterators == [None, None]
+
+    def test_multimodule_global_invalid_loader_status_stops_before_length_reduce(self):
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        carrier = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": ProcessGroupCollection()},
+            loss_module_name="language",
+            module_order=("vision", "language"),
+        )
+
+        def report_remote_invalid(validation_status, **kwargs):
+            validation_status.fill_(1)
+
+        with (
+            mock.patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=report_remote_invalid,
+            ) as all_reduce,
+            pytest.raises(ValueError, match="finite, sized validation loaders"),
+        ):
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider, pg_collection=carrier
+            )
+
+        all_reduce.assert_called_once_with(
+            mock.ANY,
+            op=torch.distributed.ReduceOp.MAX,
+            group=torch.distributed.group.WORLD,
+        )
+
+    def test_multimodule_remote_loader_count_mismatch_stops_before_length_reduce(self):
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        carrier = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": ProcessGroupCollection()},
+            loss_module_name="language",
+            module_order=("vision", "language"),
+        )
+
+        def report_remote_count_mismatch(validation_status, **kwargs):
+            assert validation_status.numel() == 3
+            validation_status[1].fill_(3)
+            validation_status[2].fill_(-2)
+
+        with (
+            mock.patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=report_remote_count_mismatch,
+            ) as all_reduce,
+            pytest.raises(ValueError, match="same number of validation loaders"),
+        ):
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider, pg_collection=carrier
+            )
+
+        all_reduce.assert_called_once_with(
+            mock.ANY,
+            op=torch.distributed.ReduceOp.MAX,
+            group=torch.distributed.group.WORLD,
+        )
+
+    @pytest.mark.parametrize(
+        "invalid_valid_dataloaders",
+        (None, [iter([1])]),
+        ids=("missing-container", "unsized-loader"),
+    )
+    def test_multimodule_local_invalid_loader_status_is_synchronized_before_raise(
+        self, invalid_valid_dataloaders
+    ):
+        args = create_test_args()
+        args.full_validation = True
+        set_args(args)
+        carrier = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": ProcessGroupCollection()},
+            loss_module_name="language",
+            module_order=("vision", "language"),
+        )
+
+        with (
+            mock.patch(
+                "megatron.training.training.build_train_valid_test_data_loaders",
+                return_value=(None, invalid_valid_dataloaders, None),
+            ),
+            mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
+            pytest.raises(ValueError, match="finite, sized validation loaders"),
+        ):
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider, pg_collection=carrier
+            )
+
+        all_reduce.assert_called_once_with(
+            mock.ANY,
+            op=torch.distributed.ReduceOp.MAX,
+            group=torch.distributed.group.WORLD,
+        )
+
+    def test_plain_full_validation_reduces_lengths_over_explicit_dp_cp(self):
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        dp_cp_group = object()
+
+        with mock.patch.object(torch.distributed, "all_reduce") as all_reduce:
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider,
+                pg_collection=ProcessGroupCollection(dp_cp=dp_cp_group),
+            )
+
+        assert all_reduce.call_args.kwargs["group"] is dp_cp_group
+
+    def test_plain_full_validation_requires_explicit_dp_cp_before_collective(self):
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+
+        with (
+            mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
+            pytest.raises(ValueError, match="plain pg_collection must define dp_cp"),
+        ):
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider,
+                pg_collection=ProcessGroupCollection(),
+            )
+
+        all_reduce.assert_not_called()
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):

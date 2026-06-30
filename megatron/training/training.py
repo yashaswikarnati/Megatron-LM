@@ -23,7 +23,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 # Third-party.
 import torch
@@ -96,6 +96,7 @@ from megatron.core.parallel_state import (
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -125,7 +126,6 @@ from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
     configure_nvtx_profiling,
-    get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_model_config,
@@ -255,6 +255,85 @@ _seqlen_stats_active: bool = False
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
+
+PGCollection = Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]
+PipelineCommunicator = Union[P2PCommunicator, MultiModulePipelineCommunicator]
+
+
+def _resolve_pipeline_communicator(
+    pg_collection: Optional[PGCollection],
+    p2p_communicator: Optional[PipelineCommunicator],
+    config,
+) -> Optional[PipelineCommunicator]:
+    if pg_collection is not None and not isinstance(
+        pg_collection, (ProcessGroupCollection, MultiModuleProcessGroupCollection)
+    ):
+        raise TypeError(
+            "pg_collection must be a ProcessGroupCollection or "
+            "MultiModuleProcessGroupCollection"
+        )
+    if isinstance(pg_collection, ProcessGroupCollection):
+        for required_group in ("pp", "tp", "cp"):
+            if getattr(pg_collection, required_group, None) is None:
+                raise ValueError(
+                    f"plain pg_collection must define non-None {required_group}"
+                )
+        if isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+            raise ValueError(
+                "MultiModulePipelineCommunicator requires a "
+                "MultiModuleProcessGroupCollection"
+            )
+        if p2p_communicator is None:
+            return P2PCommunicator(pp_group=pg_collection.pp, config=config)
+        return p2p_communicator
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        if not isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+            raise ValueError(
+                "MultiModuleProcessGroupCollection requires a "
+                "MultiModulePipelineCommunicator"
+            )
+        return p2p_communicator
+    if isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+        raise ValueError(
+            "MultiModulePipelineCommunicator requires a "
+            "MultiModuleProcessGroupCollection"
+        )
+    if pg_collection is None and p2p_communicator is not None:
+        raise ValueError("An explicit communicator requires an explicit pg_collection")
+    return p2p_communicator
+
+
+def _validate_train_step_pg_collection(pg_collection: Optional[PGCollection]) -> None:
+    """Validate process groups used directly by ``train_step`` before side effects."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        loss_pg_collection = pg_collection.get_loss_module_collection()
+        if loss_pg_collection is None:
+            return
+        for required_group in ("pp", "cp", "dp_cp"):
+            if getattr(loss_pg_collection, required_group, None) is None:
+                raise ValueError(
+                    f"loss module pg_collection must define {required_group}"
+                )
+        return
+
+    if pg_collection is not None:
+        for required_group in ("mp", "dp_cp"):
+            if getattr(pg_collection, required_group, None) is None:
+                raise ValueError(f"plain pg_collection must define {required_group}")
+
+
+def _get_data_parallel_world_size(pg_collection: Optional[PGCollection], args) -> int:
+    """Get the loss data-parallel world size used for training sample accounting."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        loss_pg_collection = pg_collection.get_loss_module_collection()
+        if loss_pg_collection is None:
+            return args.data_parallel_size
+        return loss_pg_collection.dp.size()
+    if pg_collection is not None:
+        return pg_collection.dp.size()
+    if mpu.model_parallel_is_initialized():
+        return mpu.get_data_parallel_world_size()
+    return args.data_parallel_size
 
 
 def set_startup_timestamps(program_start=None, main_entry=None):
@@ -1013,8 +1092,8 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
-    p2p_communicator: Optional[P2PCommunicator] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
+    pg_collection: Optional[PGCollection] = None,
     skip_model_parallel_init=False,
 ):
     """Main training program.
@@ -1074,13 +1153,9 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    init_pg_collection = None
-    if schedule_pg_collection is not None:
-        init_pg_collection = (
-            schedule_pg_collection.get_language_model_collection()
-            if schedule_pg_collection.has_language_model()
-            else next(iter(schedule_pg_collection.module_pgs.values()))
-        )
+    bootstrap_pg_collection = (
+        pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None
+    )
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -1088,14 +1163,15 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
-        seed_pp_group=getattr(init_pg_collection, "pp", None),
-        seed_dp_group=getattr(init_pg_collection, "dp", None),
-        seed_tp_group=getattr(init_pg_collection, "tp", None),
-        seed_ep_group=getattr(init_pg_collection, "ep", None),
-        seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
+        skip_random_seed=isinstance(pg_collection, MultiModuleProcessGroupCollection),
+        seed_pp_group=getattr(bootstrap_pg_collection, "pp", None),
+        seed_dp_group=getattr(bootstrap_pg_collection, "dp", None),
+        seed_tp_group=getattr(bootstrap_pg_collection, "tp", None),
+        seed_ep_group=getattr(bootstrap_pg_collection, "ep", None),
+        seed_etp_group=getattr(bootstrap_pg_collection, "expt_tp", None),
     )
-    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     timestamp_after_initialize_megatron = time.time()
 
@@ -1110,8 +1186,15 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    _jit_tp_size = get_pg_size(init_pg_collection.tp) if init_pg_collection is not None else None
-    set_jit_fusion_options(tp_size=_jit_tp_size)
+    # Heterogeneous module-specific JIT warmup belongs at child construction,
+    # where each child has its own shapes and process groups.
+    if not isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        _jit_tp_size = (
+            get_pg_size(bootstrap_pg_collection.tp)
+            if bootstrap_pg_collection is not None
+            else None
+        )
+        set_jit_fusion_options(tp_size=_jit_tp_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -1344,14 +1427,17 @@ def pretrain(
             if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                 vp_stage_train_valid_test_dataset_provider.is_distributed = True
             iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
+                vp_stage_train_valid_test_dataset_provider,
+                pg_collection=pg_collection,
             )
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+            build_train_valid_test_data_iterators(
+                train_valid_test_dataset_provider, pg_collection=pg_collection
+            )
         )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
@@ -1425,7 +1511,7 @@ def pretrain(
                 non_loss_data_func,
                 inference_model,
                 p2p_communicator=p2p_communicator,
-                schedule_pg_collection=schedule_pg_collection,
+                pg_collection=pg_collection,
             )
 
         print_datetime('after training is done')
@@ -1438,7 +1524,8 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator
+                train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
 
         one_logger and one_logger.log_metrics(
@@ -1477,7 +1564,9 @@ def pretrain(
                 valid_data_iterator, model,
                 iteration, process_non_loss_data_func, model_cfg,
                 verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
-                non_loss_data_func=non_loss_data_func
+                non_loss_data_func=non_loss_data_func,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
 
     if args.do_test:
@@ -1493,6 +1582,8 @@ def pretrain(
             verbose=True,
             write_to_tensorboard=not cfg_container.validation.skip_train,
             non_loss_data_func=non_loss_data_func,
+            pg_collection=pg_collection,
+            p2p_communicator=p2p_communicator,
         )
 
     wandb_writer = get_wandb_writer()
@@ -2001,7 +2092,7 @@ def setup_model_and_optimizer(
     checkpointing_context=None,
     *,
     cfg_container: PretrainConfigContainer,
-    pg_collection: ProcessGroupCollection,
+    pg_collection: PGCollection,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2123,11 +2214,17 @@ def setup_model_and_optimizer(
                 'model': dense_model_for_upcycling,
                 'optimizer': None,
                 'opt_param_scheduler': None,
+                'pg_collection': pg_collection,
             },
         )
         args.iteration = 1
         save_checkpoint(
-            args.iteration, model, None, None, args.num_floating_point_operations_so_far
+            args.iteration,
+            model,
+            None,
+            None,
+            args.num_floating_point_operations_so_far,
+            pg_collection=pg_collection,
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
@@ -2143,6 +2240,11 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
+        checkpoint_pg_collection = pg_collection
+        if checkpoint_pg_collection is None:
+            checkpoint_pg_collection = getattr(
+                unwrap_model(model)[0], "pg_collection", None
+            )
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
@@ -2151,6 +2253,7 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
+            pg_collection=checkpoint_pg_collection,
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
@@ -2170,7 +2273,12 @@ def setup_model_and_optimizer(
     # is too small for the number of data-parallel replicas.
     num_microbatches = get_num_microbatches()
     current_global_batch_size = get_current_global_batch_size()
-    data_parallel_size = mpu.get_data_parallel_world_size()
+    # Fall back to args when global parallel_state is absent (e.g. skip_model_parallel_init).
+    data_parallel_size = (
+        mpu.get_data_parallel_world_size()
+        if mpu.model_parallel_is_initialized()
+        else args.data_parallel_size
+    )
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
         f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
@@ -2204,6 +2312,7 @@ def setup_model_and_optimizer(
             opt_param_scheduler,
             args.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
+            pg_collection=pg_collection,
         )
 
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
@@ -2260,18 +2369,30 @@ def dummy_train_step(data_iterator):
             )
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None, schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None):
+def train_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    config,
+    forward_backward_func,
+    iteration=None,
+    pg_collection: Optional[PGCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
+):
     """Single training step.
 
-    pg_collection: optional per-module :class:`ProcessGroupCollection`; None uses the mpu globals,
-        otherwise it must define mp, pp, and dp_cp.
+    pg_collection: optional process-group carrier forwarded to the schedule.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
-        cross-grid case; None preserves the default behavior.
     """
     args = get_args()
     timers = get_timers()
+    p2p_communicator = _resolve_pipeline_communicator(
+        pg_collection, p2p_communicator, config
+    )
+    _validate_train_step_pg_collection(pg_collection)
 
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
@@ -2345,7 +2466,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
             p2p_communicator=p2p_communicator,
-            pg_collection=schedule_pg_collection,
+            pg_collection=pg_collection,
         )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
@@ -2411,23 +2532,29 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    for _required in ("mp", "pp", "dp_cp"):
-        assert getattr(pg_collection, _required, None) is not None, (
-            f"pg_collection passed to train_step must define {_required}"
+
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        loss_pg_collection = pg_collection.get_loss_module_collection()
+        is_last_stage = (
+            loss_pg_collection is not None and is_pp_last_stage(loss_pg_collection.pp)
         )
-    mp_group = pg_collection.mp
-    dp_cp_group = pg_collection.dp_cp
-    is_last_stage = is_pp_last_stage(pg_collection.pp)
-    # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
-    # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
-    # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
-    # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if args.log_num_zeros_in_grad:
-        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
-            num_zeros_in_grad, group=mp_group
+        dp_cp_group = loss_pg_collection.dp_cp if loss_pg_collection is not None else None
+    else:
+        # When freezing sub-models, ordinary runs may have a mixture of successful and
+        # unsuccessful ranks, so gather optimizer statistics across the exact MP group.
+        update_successful = logical_and_across_model_parallel_group(
+            update_successful, group=pg_collection.mp
         )
+        # grad_norm and num_zeros_in_grad may be None on ranks without trainable params.
+        grad_norm = reduce_max_stat_across_model_parallel_group(
+            grad_norm, group=pg_collection.mp
+        )
+        if args.log_num_zeros_in_grad:
+            num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
+                num_zeros_in_grad, group=pg_collection.mp
+            )
+        is_last_stage = is_pp_last_stage(pg_collection.pp)
+        dp_cp_group = pg_collection.dp_cp
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -2501,6 +2628,10 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
+    is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection)
+    metric_pg_collection = (
+        pg_collection.get_loss_module_collection() if is_multimodule else pg_collection
+    )
 
     # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
     should_reset = not is_first_iteration
@@ -2575,11 +2706,13 @@ def training_log(
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
-    # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    _lr_mp_group = pg_collection.mp if pg_collection is not None else None
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
-        learning_rate, group=_lr_mp_group
-    )
+    # Ordinary ranks gather the learning rate across MP ranks. Multi-module optimizer values
+    # are already coherent across their heterogeneous topology.
+    if not is_multimodule:
+        _lr_mp_group = metric_pg_collection.mp if metric_pg_collection is not None else None
+        learning_rate = reduce_max_stat_across_model_parallel_group(
+            learning_rate, group=_lr_mp_group
+        )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
@@ -2661,7 +2794,9 @@ def training_log(
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
     # Log MoE metrics.
     moe_log_string = ""
-    if args.num_experts is not None:
+    if args.num_experts is not None and (
+        not is_multimodule or metric_pg_collection is not None
+    ):
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
@@ -2695,7 +2830,7 @@ def training_log(
             num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
-            pg_collection=pg_collection,
+            pg_collection=metric_pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
@@ -2813,25 +2948,31 @@ def training_log(
             total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
         reported_memory_in_this_iteration = False
+        can_report_memory = not is_multimodule or metric_pg_collection is not None
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
-            report_memory(
-                f'(after {iteration} iterations)',
-                process_group=pg_collection.dp if pg_collection is not None else None,
-            )
+            if can_report_memory:
+                report_memory(
+                    f'(after {iteration} iterations)',
+                    process_group=(
+                        metric_pg_collection.dp if metric_pg_collection is not None else None
+                    ),
+                )
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
             if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
                 report_memory_flag = False
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
-            not reported_memory_in_this_iteration:
+            not reported_memory_in_this_iteration and can_report_memory:
             report_memory(
                 f'(after {iteration} iterations)',
-                process_group=pg_collection.dp if pg_collection is not None else None,
+                process_group=(
+                    metric_pg_collection.dp if metric_pg_collection is not None else None
+                ),
             )
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
         # Token throughput metrics are read from RLRuntimeState automatically.
@@ -2921,6 +3062,7 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    pg_collection=None,
 ):
     args = get_args()
     timers = get_timers()
@@ -2951,20 +3093,22 @@ def save_checkpoint_and_time(
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
+    checkpoint_pg_collection = pg_collection
+    if checkpoint_pg_collection is None:
+        checkpoint_pg_collection = getattr(unwrap_model(model)[0], "pg_collection", None)
+    checkpoint_dp_group = None
+    if isinstance(checkpoint_pg_collection, MultiModuleProcessGroupCollection):
+        _, local_checkpoint_collection = checkpoint_pg_collection.get_only_local_item()
+        checkpoint_dp_group = getattr(local_checkpoint_collection, "dp", None)
+    elif isinstance(checkpoint_pg_collection, ProcessGroupCollection):
+        checkpoint_dp_group = getattr(checkpoint_pg_collection, "dp", None)
+
     if should_report_memory:
         # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})")
-
-    # Resolve checkpoint groups from this rank's module PGC; None for stock runs
-    # falls back to the mpu groups inside save_checkpoint (byte-identical).
-    ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
-    tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
-    pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
-    dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
-    expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
-    # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
-    rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+        report_memory(
+            f"(before save_checkpoint for iteration {iteration})",
+            process_group=checkpoint_dp_group,
+        )
 
     # Save checkpoint.
     save_checkpoint(
@@ -2977,12 +3121,7 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
-        tp_group=tp_group,
-        pp_group=pp_group,
-        dp_cp_group=dp_cp_group,
-        dp_group=dp_group,
-        expt_dp_group=expt_dp_group,
-        rng_state_key_prefix=rng_state_key_prefix,
+        pg_collection=checkpoint_pg_collection,
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -2991,7 +3130,10 @@ def save_checkpoint_and_time(
 
     if should_report_memory:
         # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})")
+        report_memory(
+            f"(after save_checkpoint for iteration {iteration})",
+            process_group=checkpoint_dp_group,
+        )
     num_checkpoints_memory_reported += 1
 
     if args.fp8:
@@ -3118,6 +3260,7 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    pg_collection=None,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -3139,6 +3282,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    pg_collection=pg_collection,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -3154,6 +3298,7 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            pg_collection=pg_collection,
         )
         saved_checkpoint = True
 
@@ -3171,6 +3316,7 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            pg_collection=pg_collection,
         )
         saved_checkpoint = True
 
@@ -3192,6 +3338,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    pg_collection=pg_collection,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -3214,6 +3361,7 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -3234,18 +3382,20 @@ def train(
     checkpointing_context,
     non_loss_data_func,
     inference_model=None,
-    p2p_communicator: Optional[P2PCommunicator] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
+    pg_collection: Optional[PGCollection] = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
-        cross-grid case; None preserves the default behavior.
+    pg_collection: optional process-group carrier forwarded to the schedule.
     """
     args = get_args()
     timers = get_timers()
+    p2p_communicator = _resolve_pipeline_communicator(
+        pg_collection, p2p_communicator, config
+    )
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
         if hasattr(args, f.name):
@@ -3296,6 +3446,7 @@ def train(
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
+                    pg_collection=pg_collection,
                 )
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
@@ -3311,22 +3462,13 @@ def train(
                     skip_load_to_model_and_opt=HAVE_FSDP2
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
+                    pg_collection=pg_collection,
                 )
 
             args.no_load_optim = no_load_optim
 
-    lang_pgc = (
-        schedule_pg_collection.get_language_model_collection()
-        if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
-        else None
-    )
-
     def _dp_world_size():
-        if lang_pgc is not None:
-            return lang_pgc.dp.size()
-        if mpu.model_parallel_is_initialized():
-            return mpu.get_data_parallel_world_size()
-        return args.data_parallel_size
+        return _get_data_parallel_world_size(pg_collection, args)
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
@@ -3375,8 +3517,6 @@ def train(
     for model_module in model:
         model_module.train()
 
-    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-
     # Tracking loss.
     total_loss_dict = {}
 
@@ -3423,7 +3563,9 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    # Don't clobber a finalize hook a builder already installed (e.g. hetero MIMO).
+    if getattr(config, "finalize_model_grads_func", None) is None:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
@@ -3470,9 +3612,7 @@ def train(
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
-    forward_backward_func = get_forward_backward_func(
-        schedule_pg_collection=schedule_pg_collection
-    )
+    forward_backward_func = get_forward_backward_func(pg_collection=pg_collection)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -3636,6 +3776,7 @@ def train(
                         num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
+                        pg_collection=pg_collection,
                     )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
@@ -3713,9 +3854,16 @@ def train(
                 num_zeros_in_grad,
                 max_attention_logit,
             ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
-                pg_collection=model_pg_collection,
-                p2p_communicator=p2p_communicator, schedule_pg_collection=schedule_pg_collection
+                forward_step_func,
+                train_data_iterator,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                config,
+                forward_backward_func,
+                iteration=iteration,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
@@ -3736,6 +3884,7 @@ def train(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
         if should_exit:
             break
@@ -3853,7 +4002,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
-            pg_collection=model_pg_collection,
+            pg_collection=pg_collection,
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
@@ -3900,7 +4049,9 @@ def train(
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, verbose=False, write_to_tensorboard=True,
-                                       non_loss_data_func=non_loss_data_func)
+                                       non_loss_data_func=non_loss_data_func,
+                                       pg_collection=pg_collection,
+                                       p2p_communicator=p2p_communicator)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -3941,6 +4092,7 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            pg_collection=pg_collection,
         )
         if should_exit:
             break
@@ -4013,10 +4165,37 @@ def evaluate(
     verbose=False,
     non_loss_data_func=None,
     eval_iters=None,
+    pg_collection: Optional[PGCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
 ):
     """Evaluation."""
     args = get_args()
     timers = get_timers()
+    p2p_communicator = _resolve_pipeline_communicator(
+        pg_collection, p2p_communicator, config
+    )
+
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        loss_pg_collection = pg_collection.get_loss_module_collection()
+        if loss_pg_collection is None:
+            is_loss_terminal = False
+            loss_dp_cp_group = None
+        else:
+            for required_group in ("pp", "cp", "dp_cp"):
+                if getattr(loss_pg_collection, required_group, None) is None:
+                    raise ValueError(
+                        f"loss module pg_collection must define {required_group}"
+                    )
+            is_loss_terminal = is_pp_last_stage(loss_pg_collection.pp)
+            loss_dp_cp_group = loss_pg_collection.dp_cp
+    elif isinstance(pg_collection, ProcessGroupCollection):
+        if pg_collection.dp_cp is None:
+            raise ValueError("plain pg_collection must define dp_cp")
+        is_loss_terminal = is_pp_last_stage(pg_collection.pp)
+        loss_dp_cp_group = pg_collection.dp_cp
+    else:
+        is_loss_terminal = mpu.is_pipeline_last_stage(ignore_virtual=True)
+        loss_dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
 
     timers('evaluate', log_level=0).start(barrier=True)
 
@@ -4035,7 +4214,7 @@ def evaluate(
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
-    forward_backward_func = get_forward_backward_func()
+    forward_backward_func = get_forward_backward_func(pg_collection=pg_collection)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -4053,7 +4232,7 @@ def evaluate(
             forward_backward_func,
         )
 
-    if has_nvidia_modelopt:
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
@@ -4089,6 +4268,8 @@ def evaluate(
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
@@ -4097,7 +4278,7 @@ def evaluate(
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            if is_loss_terminal:
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
@@ -4112,10 +4293,10 @@ def evaluate(
                             val = val.mean()
                             torch.distributed.all_reduce(
                                 val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                                group=loss_dp_cp_group,
                             )
                             val /= torch.distributed.get_world_size(
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                                group=loss_dp_cp_group,
                             )
                             total_loss_dict[key][0] += val
                             total_loss_dict[key][1] += 1
@@ -4123,7 +4304,7 @@ def evaluate(
                             val = torch.vstack(val).sum(dim=0)
                             torch.distributed.all_reduce(
                                 val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
+                                group=loss_dp_cp_group,
                             )
                             total_loss_dict[key] += val
                     elif val[0].numel() == 1:
@@ -4140,7 +4321,11 @@ def evaluate(
                 done_cuda = torch.tensor(
                     [train_time > args.exit_duration_in_mins], dtype=torch.int, device='cuda'
                 )
-                torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
+                torch.distributed.all_reduce(
+                    done_cuda,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=torch.distributed.group.WORLD,
+                )
                 done = done_cuda.item()
                 if done:
                     rerun_state_machine.set_mode(rerun_mode)
@@ -4150,18 +4335,24 @@ def evaluate(
         collected_non_loss_data = None
         if non_loss_data_func is not None:
             collected_non_loss_data = non_loss_data_func(model)
-        elif process_non_loss_data_func is not None and is_last_rank():
-            collected_non_loss_data = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
-                model=model,
-                num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=eval_micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=True,
-                collect_non_loss_data=True,
-            )
+        elif process_non_loss_data_func is not None:
+            report_rank = is_last_rank()
+            if isinstance(pg_collection, MultiModuleProcessGroupCollection) or report_rank:
+                non_loss_data = forward_backward_func(
+                    forward_step_func=forward_step_func,
+                    data_iterator=data_iterator,
+                    model=model,
+                    num_microbatches=eval_num_microbatches,
+                    seq_length=args.seq_length,
+                    micro_batch_size=eval_micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True,
+                    collect_non_loss_data=True,
+                    pg_collection=pg_collection,
+                    p2p_communicator=p2p_communicator,
+                )
+                if report_rank:
+                    collected_non_loss_data = non_loss_data
 
     # Move model back to the train mode.
     for model_module in model:
@@ -4190,9 +4381,14 @@ def evaluate_and_print_results(
     verbose=False,
     write_to_tensorboard=True,
     non_loss_data_func=None,
+    pg_collection: Optional[PGCollection] = None,
+    p2p_communicator: Optional[PipelineCommunicator] = None,
 ):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
+    p2p_communicator = _resolve_pipeline_communicator(
+        pg_collection, p2p_communicator, config
+    )
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
     else:
@@ -4211,7 +4407,12 @@ def evaluate_and_print_results(
         assert len(eval_iters) == len(data_iterators)
 
         # with full validation we need to distribute eval_iters to all ranks
-        if mpu.get_tensor_model_parallel_rank() == 0:
+        is_source_rank = (
+            torch.distributed.get_rank() == 0
+            if isinstance(pg_collection, MultiModuleProcessGroupCollection)
+            else mpu.get_tensor_model_parallel_rank() == 0
+        )
+        if is_source_rank:
             eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
@@ -4246,6 +4447,8 @@ def evaluate_and_print_results(
             verbose,
             non_loss_data_func,
             eval_iters=iterations,
+            pg_collection=pg_collection,
+            p2p_communicator=p2p_communicator,
         )
         # Timelimit hit during evaluation
         if timelimit:
@@ -4434,7 +4637,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(
+    build_train_valid_test_datasets_provider,
+    pg_collection: Optional[PGCollection] = None,
+):
     """Build pretraining data iterators."""
 
     args = get_args()
@@ -4443,6 +4649,45 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider
     )
+
+    is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection)
+    multimodule_eval_lengths: list[int] = []
+    if args.full_validation and is_multimodule:
+        local_invalid = valid_dataloaders is None
+        local_loader_count = 0 if valid_dataloaders is None else len(valid_dataloaders)
+        if not local_invalid:
+            try:
+                multimodule_eval_lengths = [
+                    len(dataloader) if dataloader is not None else 0
+                    for dataloader in valid_dataloaders
+                ]
+                local_invalid = not multimodule_eval_lengths
+            except (TypeError, ValueError, OverflowError, NotImplementedError):
+                local_invalid = True
+
+        validation_status = torch.tensor(
+            [int(local_invalid), local_loader_count, -local_loader_count],
+            dtype=torch.long,
+            device='cuda',
+        )
+        torch.distributed.all_reduce(
+            validation_status,
+            op=torch.distributed.ReduceOp.MAX,
+            group=torch.distributed.group.WORLD,
+        )
+        if validation_status[0].item():
+            raise ValueError(
+                "Multi-module full validation requires a validation-loader container "
+                "on every rank and finite, sized validation loaders for every non-None entry"
+            )
+        max_loader_count = validation_status[1].item()
+        min_loader_count = -validation_status[2].item()
+        if min_loader_count != max_loader_count:
+            raise ValueError(
+                "Multi-module full validation requires every rank to provide the same "
+                "number of validation loaders; observed counts range from "
+                f"{min_loader_count} to {max_loader_count}"
+            )
 
     # Build iterators.
     dl_type = args.dataloader_type
@@ -4472,27 +4717,52 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
         # when using full validation, we need to override eval iters with the
         # MAX length across DP ranks so all ranks run the same number of steps
         if args.full_validation:
+            if is_multimodule:
+                full_validation_group = torch.distributed.group.WORLD
+            elif isinstance(pg_collection, ProcessGroupCollection):
+                if pg_collection.dp_cp is None:
+                    raise ValueError("plain pg_collection must define dp_cp")
+                full_validation_group = pg_collection.dp_cp
+            else:
+                full_validation_group = mpu.get_data_parallel_group(
+                    with_context_parallel=True
+                )
+
             if args.multiple_validation_sets:
-                if valid_dataloaders[0] is None:
+                if valid_dataloaders[0] is None and not is_multimodule:
                     args.eval_iters = [None] * len(valid_dataloaders)
                 else:
-                    local_eval_iters = [len(dl) for dl in valid_dataloaders]
+                    local_eval_iters = (
+                        multimodule_eval_lengths
+                        if is_multimodule
+                        else [
+                            len(dl) if dl is not None else 0
+                            for dl in valid_dataloaders
+                        ]
+                    )
                     eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
                     torch.distributed.all_reduce(
                         eval_iters_tensor,
                         op=torch.distributed.ReduceOp.MAX,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True),
+                        group=full_validation_group,
                     )
                     args.eval_iters = eval_iters_tensor.tolist()
             else:
-                local_eval_iters = len(valid_dataloaders[0])
-                eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
-                torch.distributed.all_reduce(
-                    eval_iters_tensor,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=mpu.get_data_parallel_group(with_context_parallel=True),
-                )
-                args.eval_iters = eval_iters_tensor.item()
+                if valid_dataloaders[0] is not None or is_multimodule:
+                    local_eval_iters = (
+                        multimodule_eval_lengths[0]
+                        if is_multimodule
+                        else len(valid_dataloaders[0])
+                    )
+                    eval_iters_tensor = torch.tensor(
+                        [local_eval_iters], dtype=torch.long, device='cuda'
+                    )
+                    torch.distributed.all_reduce(
+                        eval_iters_tensor,
+                        op=torch.distributed.ReduceOp.MAX,
+                        group=full_validation_group,
+                    )
+                    args.eval_iters = eval_iters_tensor.item()
 
         if args.multiple_validation_sets:
             if valid_dataloaders[0] is None:

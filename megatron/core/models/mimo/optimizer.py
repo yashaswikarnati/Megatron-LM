@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedBase, ShardedObject
 from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
@@ -19,6 +19,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 
 if TYPE_CHECKING:
     from megatron.core.hyper_comm_grid import HyperCommGrid
+
+_EXPERT_VIEW = "expert"
 
 
 @dataclass
@@ -236,7 +238,11 @@ def _extract_param_groups(sub_sd, module_name, suffix, replica_id):
 
 def _extract_grad_scaler(sub_sd, module_name, suffix, replica_id):
     """Save: extract grad_scaler into a ShardedObject."""
-    if 'grad_scaler' in sub_sd and sub_sd['grad_scaler'] is not None:
+    if (
+        'grad_scaler' in sub_sd
+        and sub_sd['grad_scaler'] is not None
+        and not isinstance(sub_sd['grad_scaler'], ShardedBase)
+    ):
         sub_sd[f'_mimo_grad_scaler{suffix}'] = ShardedObject(
             f'optimizer.mimo.{module_name}{suffix}.grad_scaler',
             sub_sd.pop('grad_scaler'),
@@ -307,7 +313,7 @@ def _restore_grad_scaler(sub_sd):
 def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     """Build replica_id tuple for ShardedObject deduplication.
 
-    Returns (tp_rank, pp_rank, dp_rank) so only (0, 0, 0) within each
+    Returns (tp_rank, pp_rank, dp_rank, cp_rank) so only (0, 0, 0, 0) within each
     module's parallelism group is the main replica; all other ranks
     in the same module are non-main replicas of the same object.
     """
@@ -321,7 +327,15 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     assert (
         hasattr(pg_collection, 'dp') and pg_collection.dp is not None
     ), "pg_collection.dp must be set for checkpoint deduplication"
-    return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
+    assert (
+        hasattr(pg_collection, 'cp') and pg_collection.cp is not None
+    ), "pg_collection.cp must be set for checkpoint deduplication"
+    return (
+        pg_collection.tp.rank(),
+        pg_collection.pp.rank(),
+        pg_collection.dp.rank(),
+        pg_collection.cp.rank(),
+    )
 
 
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
@@ -334,11 +348,12 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
         grid.create_pg(["dp"])
         grid.create_pg(["dp", "cp"])
         grid.create_pg(["tp"])
+        grid.create_pg(["cp"])
         grid.create_pg(["pp"])
         grid.create_pg(["tp", "pp"])
-        grid.create_pg(["tp", "ep", "pp"])
-        grid.create_pg(["dp", "ep"])
-        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+        grid.create_pg(["tp", "cp", "dp", "pp"])
+        grid.create_pg(["expt_tp", "ep", "pp"], view="expert")
+        grid.create_pg(["expt_dp"], view="expert")
 
     Args:
         grid: HyperCommGrid with pre-created process groups.
@@ -348,6 +363,7 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
         - dp: Data parallel group
         - dp_cp: Data parallel with context parallel
         - tp: Tensor parallel group
+        - cp: Context parallel group
         - mp: Model parallel group (tp × pp)
         - tp_ep_pp: Expert tensor-model-pipeline group
         - expt_dp: Expert data parallel group
@@ -358,19 +374,16 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
     pg.tp = grid.get_pg("tp")
+    pg.cp = grid.get_pg("cp")
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
 
-    # Expert groups
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.expt_dp = grid.get_pg(["dp", "ep"])
+    # Expert groups live on the grid's expert view (ep == 1 for non-expert grids).
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
+    pg.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
 
-    # Distributed optimizer grad stats group: must span all dimensions so grad norm
-    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
-    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
-    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
-    # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
+    # Grad-stats group spans the full grid (ep re-views the same ranks).
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
 
     return pg
 

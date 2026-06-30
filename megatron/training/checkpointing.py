@@ -38,6 +38,10 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
@@ -81,6 +85,60 @@ _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
 # Track deletion processes to prevent zombies
 _deletion_processes = []
+
+CheckpointProcessGroupCollection = Union[
+    ProcessGroupCollection, MultiModuleProcessGroupCollection
+]
+
+
+def _resolve_checkpoint_pg_collection(
+    pg_collection: Optional[CheckpointProcessGroupCollection],
+) -> tuple[Optional[ProcessGroupCollection], str]:
+    """Resolve one rank-local checkpoint topology and its RNG key namespace.
+
+    A plain collection preserves the stock single-module behavior. A multi-module
+    collection is valid when exactly one module is active on this rank, which is the
+    non-colocated heterogeneous layout. The module name namespaces RNG state so
+    disjoint grids do not publish the same sharded-object key.
+    """
+    if pg_collection is None:
+        return None, ""
+    if isinstance(pg_collection, ProcessGroupCollection):
+        return pg_collection, ""
+    if not isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        raise TypeError(
+            "pg_collection must be ProcessGroupCollection, "
+            "MultiModuleProcessGroupCollection, or None"
+        )
+
+    module_name, local_collection = pg_collection.get_only_local_item()
+    for group_name in ("tp", "pp", "dp", "dp_cp", "expt_dp"):
+        if getattr(local_collection, group_name, None) is None:
+            raise ValueError(
+                f"Checkpoint process-group collection for module '{module_name}' "
+                f"must define non-None {group_name}"
+            )
+    return local_collection, f"mimo.{module_name}."
+
+
+def _validate_checkpoint_format_for_pg_collection(
+    pg_collection: Optional[CheckpointProcessGroupCollection],
+    ckpt_format: Optional[str],
+    *,
+    is_local: bool = False,
+) -> None:
+    """Restrict multi-module checkpointing to wrapper-transparent formats."""
+    if (
+        isinstance(pg_collection, MultiModuleProcessGroupCollection)
+        and ckpt_format not in (None, "torch_dist")
+        and not is_local
+    ):
+        raise ValueError(
+            "Multi-module checkpointing supports global torch_dist and local checkpoints; "
+            f"format '{ckpt_format}' does not preserve module-namespaced logical state. "
+            "Use --ckpt-format torch_dist."
+        )
+
 
 def finalize_deletion_processes(blocking=False):
     """Clean up deletion processes to prevent zombie processes.
@@ -507,9 +565,30 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
-def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
-                    checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+def save_checkpoint(
+    iteration,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    num_floating_point_operations_so_far,
+    checkpointing_context=None,
+    pipeline_rank=None,
+    expert_rank=None,
+    tensor_rank=None,
+    pipeline_parallel=None,
+    expert_parallel=None,
+    non_persistent_ckpt=False,
+    train_data_iterator=None,
+    preprocess_common_state_dict_fn=None,
+    release=False,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    rng_state_key_prefix: str = '',
+    pg_collection: Optional[CheckpointProcessGroupCollection] = None,
+):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -525,12 +604,32 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     to the Megatron Energon dataloader (multimodal) and not the built-in Megatron dataloader (text-only).
 
     Args:
+        pg_collection: Single- or multi-module process-group carrier. Multi-module
+            checkpointing currently requires exactly one module active on this rank.
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
         dp_group: Data parallel group (default: None, falls back to mpu API)
         expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     """
     start_ckpt = time()
     args = get_args()
+
+    if pg_collection is not None:
+        if any(
+            group is not None
+            for group in (tp_group, pp_group, dp_cp_group, dp_group, expt_dp_group)
+        ):
+            raise ValueError(
+                "Pass pg_collection or explicit checkpoint process groups, not both"
+            )
+        local_collection, module_key_prefix = _resolve_checkpoint_pg_collection(pg_collection)
+        if local_collection is not None:
+            tp_group = getattr(local_collection, "tp", None)
+            pp_group = getattr(local_collection, "pp", None)
+            dp_cp_group = getattr(local_collection, "dp_cp", None)
+            dp_group = getattr(local_collection, "dp", None)
+            expt_dp_group = getattr(local_collection, "expt_dp", None)
+        if module_key_prefix:
+            rng_state_key_prefix = module_key_prefix
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
@@ -567,6 +666,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             raise NotImplementedError(f"Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})")
 
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
+    _validate_checkpoint_format_for_pg_collection(
+        pg_collection, ckpt_format, is_local=ckpt_type == CheckpointType.LOCAL
+    )
     print_rank_0(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving checkpoint "
                  f"at iteration {iteration:7d} to {save_dir} in {ckpt_format} format")
 
@@ -790,7 +892,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     cached_metadata = checkpointing_context['local_checkpoint_cache']
                 state_dict_for_save, cacheable_metadata = MCoreTensorAwareStateDict.from_state_dict(
                     state_dict, algo=algo, cached_metadata=cached_metadata,
-                    parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True)
+                    parallelization_group=(
+                        dp_cp_group
+                        if dp_cp_group is not None
+                        else mpu.get_data_parallel_group(with_context_parallel=True)
+                    ),
                 )
                 async_save_request = checkpointing_context['local_checkpoint_manager'].save(
                     state_dict_for_save, iteration, is_async=bool(args.async_save)
@@ -832,12 +938,38 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             prev_iteration = int(f.read().strip())
                 with open_file(tracker_filename, 'w') as f:
                     f.write("release" if release else str(iteration))
-                tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
-                pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
+                tensor_rank_to_print = (
+                    tensor_rank
+                    if tensor_rank is not None
+                    else (
+                        get_pg_rank(tp_group)
+                        if tp_group is not None
+                        else mpu.get_tensor_model_parallel_rank()
+                    )
+                ) + 1
+                pipeline_rank_to_print = (
+                    pipeline_rank
+                    if pipeline_rank is not None
+                    else (
+                        get_pg_rank(pp_group)
+                        if pp_group is not None
+                        else mpu.get_pipeline_model_parallel_rank()
+                    )
+                ) + 1
+                tensor_world_size = (
+                    get_pg_size(tp_group)
+                    if tp_group is not None
+                    else mpu.get_tensor_model_parallel_world_size()
+                )
+                pipeline_world_size = (
+                    get_pg_size(pp_group)
+                    if pp_group is not None
+                    else mpu.get_pipeline_model_parallel_world_size()
+                )
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
                              f"checkpoint from iteration {int(iteration):7d} to {args.save} "
-                             f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
-                             f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
+                             f"[ t {tensor_rank_to_print}/{tensor_world_size}, "
+                             f"p {pipeline_rank_to_print}/{pipeline_world_size} ]")
                 if args.log_progress and args.async_save:
                     append_to_progress_log(args.save, f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
@@ -1237,6 +1369,8 @@ def _load_non_persistent_base_checkpoint(
     sharded_state_dict,
     non_persistent_iteration,
     checkpointing_context=None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """ Load the base state_dict from a non-persistent distributed checkpoint.
     Depending on the non_persistent_ckpt_type, different logic may be required.
@@ -1249,7 +1383,9 @@ def _load_non_persistent_base_checkpoint(
             )
         return _load_global_dist_base_checkpoint(
             non_persistent_global_dir, args, rank0, sharded_state_dict, non_persistent_iteration, False,
-            checkpointing_context=checkpointing_context
+            checkpointing_context=checkpointing_context,
+            dp_cp_group=dp_cp_group,
+            expt_dp_group=expt_dp_group,
         )
     elif args.non_persistent_ckpt_type == "local":
         intermediate_state_dict, checkpoint_name = checkpointing_context[
@@ -1258,7 +1394,11 @@ def _load_non_persistent_base_checkpoint(
         state_dict = intermediate_state_dict.to_state_dict(
             sharded_state_dict,
             algo=args.non_persistent_local_ckpt_algo,
-            parallelization_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            parallelization_group=(
+                dp_cp_group
+                if dp_cp_group is not None
+                else mpu.get_data_parallel_group(with_context_parallel=True)
+            ),
         )
         return state_dict, checkpoint_name, False, CheckpointType.LOCAL
     else:
@@ -1266,7 +1406,15 @@ def _load_non_persistent_base_checkpoint(
 
 
 def _load_global_dist_base_checkpoint(
-    load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=None
+    load_dir,
+    args,
+    rank0,
+    sharded_state_dict,
+    iteration,
+    release,
+    checkpointing_context=None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """ Load the base state_dict from the given directory containing the global distributed checkpoint """
     if rank0:
@@ -1288,9 +1436,17 @@ def _load_global_dist_base_checkpoint(
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
-            process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            process_group = (
+                dp_cp_group
+                if dp_cp_group is not None
+                else mpu.get_data_parallel_group(with_context_parallel=True)
+            )
         elif args.ckpt_fully_parallel_load_process_group == 'ep_dp':
-            process_group = mpu.get_expert_data_parallel_group()
+            process_group = (
+                expt_dp_group
+                if expt_dp_group is not None
+                else mpu.get_expert_data_parallel_group()
+            )
         else:
             raise ValueError(f"Invalid load process group: {args.ckpt_fully_parallel_load_process_group}")
 
@@ -1342,6 +1498,8 @@ def _load_base_checkpoint(
     rank0=False,
     sharded_state_dict=None,
     checkpointing_context=None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """ Load the base state_dict from the given directory
 
@@ -1380,6 +1538,8 @@ def _load_base_checkpoint(
                 sharded_state_dict,
                 non_persistent_iteration,
                 checkpointing_context,
+                dp_cp_group=dp_cp_group,
+                expt_dp_group=expt_dp_group,
             )
         else:
             print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
@@ -1417,7 +1577,15 @@ def _load_base_checkpoint(
     # Handle global distributed checkpoint
     if ckpt_format == "torch_dist":
         return _load_global_dist_base_checkpoint(
-            load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=checkpointing_context
+            load_dir,
+            args,
+            rank0,
+            sharded_state_dict,
+            iteration,
+            release,
+            checkpointing_context=checkpointing_context,
+            dp_cp_group=dp_cp_group,
+            expt_dp_group=expt_dp_group,
         )
     elif ckpt_format == "torch":
         ckpt_type = CheckpointType.LEGACY
@@ -1659,8 +1827,22 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
-def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+def load_checkpoint(
+    ddp_model,
+    optimizer,
+    opt_param_scheduler,
+    load_arg='load',
+    strict=True,
+    checkpointing_context=None,
+    skip_load_to_model_and_opt=False,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    rng_state_key_prefix: str = '',
+    pg_collection: Optional[CheckpointProcessGroupCollection] = None,
+):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -1673,6 +1855,24 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
+
+    if pg_collection is not None:
+        if any(
+            group is not None
+            for group in (tp_group, pp_group, dp_cp_group, dp_group, expt_dp_group)
+        ):
+            raise ValueError(
+                "Pass pg_collection or explicit checkpoint process groups, not both"
+            )
+        local_collection, module_key_prefix = _resolve_checkpoint_pg_collection(pg_collection)
+        if local_collection is not None:
+            tp_group = getattr(local_collection, "tp", None)
+            pp_group = getattr(local_collection, "pp", None)
+            dp_cp_group = getattr(local_collection, "dp_cp", None)
+            dp_group = getattr(local_collection, "dp", None)
+            expt_dp_group = getattr(local_collection, "expt_dp", None)
+        if module_key_prefix:
+            rng_state_key_prefix = module_key_prefix
 
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
@@ -1694,6 +1894,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             args,
             rank0=True,
             checkpointing_context=checkpointing_context,
+            dp_cp_group=dp_cp_group,
+            expt_dp_group=expt_dp_group,
         )
 
         ckpt_format = None
@@ -1710,6 +1912,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         else:
             raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
 
+    _validate_checkpoint_format_for_pg_collection(pg_collection, ckpt_format)
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
@@ -1905,6 +2108,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
         load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
+        dp_cp_group=dp_cp_group,
+        expt_dp_group=expt_dp_group,
         **load_kwargs
     )
 

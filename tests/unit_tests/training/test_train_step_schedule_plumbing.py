@@ -1,27 +1,61 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""train_step forwards p2p_communicator and schedule pg_collection to forward_backward_func."""
+"""Tests for ``train_step`` schedule plumbing."""
 
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+import torch
+
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.training import training as training_mod
 
 
 class _Rerun:
-    """Run the forward/backward body once, then ask train_step to exit before optimizer.step."""
+    """Run forward/backward once and optionally exit before ``optimizer.step``."""
 
-    _ran = False
+    def __init__(self, *, exit_before_optimizer=False):
+        self._ran = False
+        self._exit_before_optimizer = exit_before_optimizer
 
     def should_run_forward_backward(self, data_iterator):
         run, self._ran = not self._ran, True
         return run
 
     def should_checkpoint_and_exit(self):
-        return False, True, 0  # (checkpoint, exit, code)
+        return False, self._exit_before_optimizer, 0
 
 
-def _run(**kwargs):
+def _multi_carrier(*, loss_local=False, loss_groups=None):
+    module_pgs = {"vision": ProcessGroupCollection()}
+    if loss_local:
+        groups = dict(pp=object(), cp=object(), dp_cp=object())
+        groups.update(loss_groups or {})
+        module_pgs["language"] = ProcessGroupCollection(**groups)
+    return MultiModuleProcessGroupCollection(
+        module_pgs=module_pgs,
+        loss_module_name="language",
+        module_order=("vision", "language"),
+    )
+
+
+def _run_train_step(
+    *,
+    pg_collection=None,
+    p2p_communicator=None,
+    losses_reduced=None,
+    optimizer_values=(True, 7.0, 9.0),
+    log_num_zeros_in_grad=False,
+    exit_before_optimizer=False,
+    schedule=None,
+    optimizer=None,
+):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -34,36 +68,280 @@ def _run(**kwargs):
         micro_batch_size=1,
         decoder_seq_length=None,
         empty_unused_memory_level=0,
+        vision_pretraining=False,
+        vision_pretraining_type=None,
+        barrier_with_L1_time=False,
+        qk_clip=False,
+        log_max_attention_logit=False,
+        log_num_zeros_in_grad=log_num_zeros_in_grad,
+        data_parallel_size=1,
     )
     captured = {}
-    model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+    scheduler = mock.Mock()
+    optimizer = optimizer or SimpleNamespace(
+        zero_grad=mock.Mock(), step=mock.Mock(return_value=optimizer_values)
+    )
+
+    def capture_schedule(**kwargs):
+        captured.update(kwargs)
+        return [] if losses_reduced is None else losses_reduced
+
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
         mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
-        mock.patch.object(training_mod, "get_rerun_state_machine", return_value=_Rerun()),
+        mock.patch.object(
+            training_mod,
+            "get_rerun_state_machine",
+            return_value=_Rerun(exit_before_optimizer=exit_before_optimizer),
+        ),
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
     ):
-        training_mod.train_step(
-            forward_step_func=lambda *a, **k: None,
-            data_iterator=iter([]),
-            model=model,
-            optimizer=SimpleNamespace(zero_grad=lambda: None),
-            opt_param_scheduler=None,
+        result = training_mod.train_step(
+            forward_step_func=lambda *args, **kwargs: None,
+            data_iterator=iter(()),
+            model=[SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)],
+            optimizer=optimizer,
+            opt_param_scheduler=scheduler,
             config=SimpleNamespace(),
-            forward_backward_func=lambda **kw: captured.update(kw) or [],
+            forward_backward_func=schedule or capture_schedule,
             iteration=0,
-            **kwargs,
+            pg_collection=pg_collection,
+            p2p_communicator=p2p_communicator,
         )
-    return captured
+    return SimpleNamespace(captured=captured, result=result, scheduler=scheduler)
 
 
-def test_train_step_forwards_schedule_plumbing():
-    p2p, pg = object(), object()
-    captured = _run(p2p_communicator=p2p, schedule_pg_collection=pg)
-    assert captured["p2p_communicator"] is p2p and captured["pg_collection"] is pg
+def test_train_step_forwards_the_exact_carrier_and_resolved_communicator():
+    carrier = _multi_carrier()
+    communicator = object.__new__(MultiModulePipelineCommunicator)
+    resolved_communicator = object()
+
+    with mock.patch.object(
+        training_mod,
+        "_resolve_pipeline_communicator",
+        return_value=resolved_communicator,
+    ) as resolve:
+        run = _run_train_step(
+            pg_collection=carrier,
+            p2p_communicator=communicator,
+            exit_before_optimizer=True,
+        )
+
+    resolve.assert_called_once_with(carrier, communicator, mock.ANY)
+    assert run.captured["pg_collection"] is carrier
+    assert run.captured["p2p_communicator"] is resolved_communicator
 
 
-def test_train_step_defaults_to_none():
-    captured = _run()
-    assert captured["p2p_communicator"] is None and captured["pg_collection"] is None
+@pytest.mark.parametrize(
+    ("carrier", "communicator", "message"),
+    (
+        (
+            _multi_carrier(),
+            object.__new__(P2PCommunicator),
+            "MultiModulePipelineCommunicator",
+        ),
+        (
+            ProcessGroupCollection(pp=object(), tp=object(), cp=object()),
+            object.__new__(MultiModulePipelineCommunicator),
+            "MultiModuleProcessGroupCollection",
+        ),
+    ),
+)
+def test_train_step_rejects_mismatched_pair_before_schedule(
+    carrier, communicator, message
+):
+    schedule = mock.Mock(return_value=[])
+
+    with pytest.raises(ValueError, match=message):
+        _run_train_step(
+            pg_collection=carrier,
+            p2p_communicator=communicator,
+            exit_before_optimizer=True,
+            schedule=schedule,
+        )
+
+    schedule.assert_not_called()
+
+
+def test_plain_train_step_uses_exact_groups_and_reduced_optimizer_stats():
+    mp_group, pp_group, dp_cp_group = object(), object(), object()
+    carrier = ProcessGroupCollection(
+        mp=mp_group, pp=pp_group, dp_cp=dp_cp_group, tp=object(), cp=object()
+    )
+    losses = [{"lm loss": torch.tensor([6.0, 3.0])}]
+
+    with (
+        mock.patch.object(
+            training_mod,
+            "logical_and_across_model_parallel_group",
+            return_value=False,
+        ) as reduce_success,
+        mock.patch.object(
+            training_mod,
+            "reduce_max_stat_across_model_parallel_group",
+            side_effect=(11.0, 13.0),
+        ) as reduce_max,
+        mock.patch.object(
+            training_mod, "is_pp_last_stage", return_value=True
+        ) as is_last_stage,
+        mock.patch.object(training_mod.torch.distributed, "all_reduce") as all_reduce,
+    ):
+        run = _run_train_step(
+            pg_collection=carrier,
+            p2p_communicator=object.__new__(P2PCommunicator),
+            losses_reduced=losses,
+            log_num_zeros_in_grad=True,
+        )
+
+    reduce_success.assert_called_once_with(True, group=mp_group)
+    assert reduce_max.call_args_list == [
+        mock.call(7.0, group=mp_group),
+        mock.call(9.0, group=mp_group),
+    ]
+    assert run.result[1] == 1
+    assert run.result[5:7] == (11.0, 13.0)
+    is_last_stage.assert_called_once_with(pp_group)
+    assert all_reduce.call_args.kwargs["group"] is dp_cp_group
+    run.scheduler.step.assert_not_called()
+
+
+def test_multimodule_train_step_keeps_optimizer_stats_without_generic_reductions():
+    grad_norm, num_zeros_in_grad = object(), object()
+
+    with (
+        mock.patch.object(
+            training_mod,
+            "logical_and_across_model_parallel_group",
+            side_effect=AssertionError("generic success reduction used"),
+        ),
+        mock.patch.object(
+            training_mod,
+            "reduce_max_stat_across_model_parallel_group",
+            side_effect=AssertionError("generic stat reduction used"),
+        ),
+    ):
+        run = _run_train_step(
+            pg_collection=_multi_carrier(),
+            p2p_communicator=object.__new__(MultiModulePipelineCommunicator),
+            optimizer_values=(False, grad_norm, num_zeros_in_grad),
+            log_num_zeros_in_grad=True,
+        )
+
+    assert run.result[1] == 1
+    assert run.result[5] is grad_norm
+    assert run.result[6] is num_zeros_in_grad
+
+
+def test_encoder_only_train_step_does_not_read_plain_groups():
+    with (
+        mock.patch.object(
+            training_mod.ProcessGroupCollection,
+            "use_mpu_process_groups",
+            side_effect=AssertionError("MPU fallback used"),
+        ),
+        mock.patch.object(
+            training_mod,
+            "is_pp_last_stage",
+            side_effect=AssertionError("plain PP group used"),
+        ),
+    ):
+        run = _run_train_step(
+            pg_collection=_multi_carrier(),
+            p2p_communicator=object.__new__(MultiModulePipelineCommunicator),
+        )
+
+    assert run.result[0] == {}
+
+
+def test_local_loss_child_controls_terminal_stage_and_loss_reduction_group():
+    carrier = _multi_carrier(loss_local=True)
+    loss_collection = carrier.get_loss_module_collection()
+    losses = [{"lm loss": torch.tensor([6.0, 3.0])}]
+
+    with (
+        mock.patch.object(
+            training_mod, "is_pp_last_stage", return_value=True
+        ) as is_last_stage,
+        mock.patch.object(training_mod.torch.distributed, "all_reduce") as all_reduce,
+    ):
+        run = _run_train_step(
+            pg_collection=carrier,
+            p2p_communicator=object.__new__(MultiModulePipelineCommunicator),
+            losses_reduced=losses,
+        )
+
+    is_last_stage.assert_called_once_with(loss_collection.pp)
+    assert all_reduce.call_args.kwargs["group"] is loss_collection.dp_cp
+    assert run.result[0]["lm loss"].item() == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("missing_group", ("mp", "dp_cp"))
+def test_plain_carrier_missing_required_group_fails_before_side_effects(missing_group):
+    groups = dict(mp=object(), pp=object(), dp_cp=object(), tp=object(), cp=object())
+    groups[missing_group] = None
+    carrier = ProcessGroupCollection(**groups)
+    optimizer = SimpleNamespace(zero_grad=mock.Mock(), step=mock.Mock())
+    schedule = mock.Mock(return_value=[])
+
+    with pytest.raises(ValueError, match=rf"plain pg_collection must define {missing_group}"):
+        _run_train_step(
+            pg_collection=carrier,
+            p2p_communicator=object.__new__(P2PCommunicator),
+            exit_before_optimizer=True,
+            schedule=schedule,
+            optimizer=optimizer,
+        )
+
+    schedule.assert_not_called()
+    optimizer.zero_grad.assert_not_called()
+    optimizer.step.assert_not_called()
+
+
+@pytest.mark.parametrize("missing_group", ("pp", "cp", "dp_cp"))
+def test_local_loss_child_missing_required_group_fails_before_side_effects(missing_group):
+    carrier = _multi_carrier(loss_local=True, loss_groups={missing_group: None})
+    optimizer = SimpleNamespace(zero_grad=mock.Mock(), step=mock.Mock())
+    schedule = mock.Mock(return_value=[])
+
+    with pytest.raises(
+        ValueError, match=rf"loss module pg_collection must define {missing_group}"
+    ):
+        _run_train_step(
+            pg_collection=carrier,
+            p2p_communicator=object.__new__(MultiModulePipelineCommunicator),
+            exit_before_optimizer=True,
+            schedule=schedule,
+            optimizer=optimizer,
+        )
+
+    schedule.assert_not_called()
+    optimizer.zero_grad.assert_not_called()
+    optimizer.step.assert_not_called()
+
+
+def test_train_step_without_carrier_keeps_legacy_mpu_fallback():
+    carrier = ProcessGroupCollection(mp=object(), pp=object(), dp_cp=object())
+
+    with (
+        mock.patch.object(
+            training_mod.ProcessGroupCollection,
+            "use_mpu_process_groups",
+            return_value=carrier,
+        ) as use_mpu,
+        mock.patch.object(
+            training_mod,
+            "logical_and_across_model_parallel_group",
+            return_value=True,
+        ),
+        mock.patch.object(
+            training_mod,
+            "reduce_max_stat_across_model_parallel_group",
+            return_value=7.0,
+        ),
+        mock.patch.object(training_mod, "is_pp_last_stage", return_value=False),
+    ):
+        run = _run_train_step()
+
+    use_mpu.assert_called_once_with()
+    run.scheduler.step.assert_called_once_with(increment=1)
