@@ -123,6 +123,9 @@ class MimoModelBuilder(ModelBuilder["MimoModel", MimoBuildConfig]):
         model_type: ModelType = ModelType.encoder_or_decoder,
     ) -> list[MimoModel]:
         """Build, per-submodule-DDP-wrap, and configure this rank's hetero MimoModel."""
+        if wrap_with_ddp and ddp_config is None:
+            raise ValueError("ddp_config is required when wrap_with_ddp is True")
+
         topology, args = self._topology, self._args
         _, rank_in_language, rank_in_encoder, language_pg, encoder_pg = _resolve_role(topology)
 
@@ -137,7 +140,16 @@ class MimoModelBuilder(ModelBuilder["MimoModel", MimoBuildConfig]):
         mimo_model = self.build_model(pg_collection)
 
         if wrap_with_ddp:
-            wrap_active_modules_with_ddp(args, mimo_model, topology)
+            wrap_active_modules_with_ddp(
+                args,
+                mimo_model,
+                topology,
+                ddp_config,
+                overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+                use_megatron_fsdp=use_megatron_fsdp,
+                use_torch_fsdp2=use_torch_fsdp2,
+                data_parallel_random_init=data_parallel_random_init,
+            )
 
         configure_grad_sync(args, mimo_model, topology)
         # Per-grid rng key namespace (read by stock save/load); torch_dist only.

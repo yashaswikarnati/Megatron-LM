@@ -109,6 +109,7 @@ fi
   --adam-beta1 0.9 \
   --adam-beta2 0.95 \
   --clip-grad 1.0 \
+  --use-distributed-optimizer \
   --ddp-bucket-size 0 \
   --train-iters "${TRAIN_ITERS}" \
   --log-interval "${LOG_INTERVAL}" \
