@@ -174,6 +174,40 @@ class TestTraining:
             group=torch.distributed.group.WORLD,
         )
 
+    def test_multimodule_remote_loader_count_mismatch_stops_before_length_reduce(self):
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        carrier = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": ProcessGroupCollection()},
+            loss_module_name="language",
+            module_order=("vision", "language"),
+        )
+
+        def report_remote_count_mismatch(validation_status, **kwargs):
+            assert validation_status.numel() == 3
+            validation_status[1].fill_(3)
+            validation_status[2].fill_(-2)
+
+        with (
+            mock.patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=report_remote_count_mismatch,
+            ) as all_reduce,
+            pytest.raises(ValueError, match="same number of validation loaders"),
+        ):
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider, pg_collection=carrier
+            )
+
+        all_reduce.assert_called_once_with(
+            mock.ANY,
+            op=torch.distributed.ReduceOp.MAX,
+            group=torch.distributed.group.WORLD,
+        )
+
     @pytest.mark.parametrize(
         "invalid_valid_dataloaders",
         (None, [iter([1])]),

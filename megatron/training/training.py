@@ -4629,6 +4629,7 @@ def build_train_valid_test_data_iterators(
     multimodule_eval_lengths: list[int] = []
     if args.full_validation and is_multimodule:
         local_invalid = valid_dataloaders is None
+        local_loader_count = 0 if valid_dataloaders is None else len(valid_dataloaders)
         if not local_invalid:
             try:
                 multimodule_eval_lengths = [
@@ -4640,7 +4641,9 @@ def build_train_valid_test_data_iterators(
                 local_invalid = True
 
         validation_status = torch.tensor(
-            [int(local_invalid)], dtype=torch.long, device='cuda'
+            [int(local_invalid), local_loader_count, -local_loader_count],
+            dtype=torch.long,
+            device='cuda',
         )
         torch.distributed.all_reduce(
             validation_status,
@@ -4651,6 +4654,14 @@ def build_train_valid_test_data_iterators(
             raise ValueError(
                 "Multi-module full validation requires a validation-loader container "
                 "on every rank and finite, sized validation loaders for every non-None entry"
+            )
+        max_loader_count = validation_status[1].item()
+        min_loader_count = -validation_status[2].item()
+        if min_loader_count != max_loader_count:
+            raise ValueError(
+                "Multi-module full validation requires every rank to provide the same "
+                "number of validation loaders; observed counts range from "
+                f"{min_loader_count} to {max_loader_count}"
             )
 
     # Build iterators.
