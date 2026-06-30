@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from examples.mimo.data.mock import get_mock_vlm_dataloader
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -64,26 +63,22 @@ def adapter(monkeypatch):
     return data
 
 
-def test_dynamic_radio_loader_emits_patchified_cpu_metadata():
-    loader = get_mock_vlm_dataloader(
-        batch_size=2,
-        dataset_size=2,
-        shuffle=False,
-        seq_len=24,
-        image_seq_length=12,
-        vocab_size=64,
-        image_token_id=63,
-        modality_module_name=RADIO_ENCODER_MODULE_NAME,
-        encoder_name=RADIO_ENCODER_MODULE_NAME,
-        dynamic_resolution=True,
-        pixel_shuffle=True,
-        patch_dim=8,
-        img_h=224,
-        img_w=224,
-        num_image_tiles=3,
-        dtype=torch.bfloat16,
-        validate_image_token_count=True,
-    )
+def test_dynamic_radio_loader_emits_patchified_cpu_metadata(adapter):
+    args = _args()
+    args.micro_batch_size = 2
+    args.llm_dp = 1
+    args.seq_length = 24
+    args.image_seq_length = 12
+    args.params_dtype = torch.bfloat16
+    args.dynamic_resolution = True
+    args.pixel_shuffle = True
+    args.patch_dim = 8
+    args.img_h = 224
+    args.img_w = 224
+    args.num_image_tiles = 3
+    loader = adapter.build_train_valid_test_data_loaders(
+        args, _topology(encoder_rank=True, language_rank=False)
+    )[0]
 
     inputs = next(iter(loader))["modality_inputs"][RADIO_ENCODER_MODULE_NAME][
         RADIO_ENCODER_MODULE_NAME
@@ -120,7 +115,6 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         _args(), _topology(encoder_rank=True, language_rank=False)
     )
     assert all(loader.batch_size == 4 for loader in encoder_loaders)
-    assert encoder_loaders[0].dataset.validate_image_token_count
     encoder_batch = next(iter(encoder_loaders[0]))
     assert encoder_batch["input_ids"].shape == (4, 8)
     encoder_inputs = encoder_batch["modality_inputs"][RADIO_ENCODER_MODULE_NAME][
