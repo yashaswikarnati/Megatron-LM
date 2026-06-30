@@ -3549,7 +3549,9 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     if is_multi_module:
-        forward_backward_func = get_forward_backward_func(pg_collection=pg_collection)
+        forward_backward_func = get_forward_backward_func(
+            schedule_pg_collection=pg_collection
+        )
     else:
         forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
@@ -4137,7 +4139,9 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     is_multi_module = isinstance(pg_collection, MultiModuleProcessGroupCollection)
     if is_multi_module:
-        forward_backward_func = get_forward_backward_func(pg_collection=pg_collection)
+        forward_backward_func = get_forward_backward_func(
+            schedule_pg_collection=pg_collection
+        )
     else:
         forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "full_iteration":
