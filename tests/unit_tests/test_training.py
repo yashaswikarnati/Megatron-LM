@@ -137,9 +137,77 @@ class TestTraining:
                 mock_multi_valid_full_datasets_provider, pg_collection=carrier
             )
 
+        assert all_reduce.call_count == 2
         assert all_reduce.call_args.kwargs["group"] is torch.distributed.group.WORLD
         assert args.eval_iters == [0, 0]
         assert valid_iterators == [None, None]
+
+    def test_multimodule_global_invalid_loader_status_stops_before_length_reduce(self):
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        carrier = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": ProcessGroupCollection()},
+            loss_module_name="language",
+            module_order=("vision", "language"),
+        )
+
+        def report_remote_invalid(validation_status, **kwargs):
+            validation_status.fill_(1)
+
+        with (
+            mock.patch.object(
+                torch.distributed,
+                "all_reduce",
+                side_effect=report_remote_invalid,
+            ) as all_reduce,
+            pytest.raises(ValueError, match="finite, sized validation loaders"),
+        ):
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider, pg_collection=carrier
+            )
+
+        all_reduce.assert_called_once_with(
+            mock.ANY,
+            op=torch.distributed.ReduceOp.MAX,
+            group=torch.distributed.group.WORLD,
+        )
+
+    @pytest.mark.parametrize(
+        "invalid_valid_dataloaders",
+        (None, [iter([1])]),
+        ids=("missing-container", "unsized-loader"),
+    )
+    def test_multimodule_local_invalid_loader_status_is_synchronized_before_raise(
+        self, invalid_valid_dataloaders
+    ):
+        args = create_test_args()
+        args.full_validation = True
+        set_args(args)
+        carrier = MultiModuleProcessGroupCollection(
+            module_pgs={"vision": ProcessGroupCollection()},
+            loss_module_name="language",
+            module_order=("vision", "language"),
+        )
+
+        with (
+            mock.patch(
+                "megatron.training.training.build_train_valid_test_data_loaders",
+                return_value=(None, invalid_valid_dataloaders, None),
+            ),
+            mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
+            pytest.raises(ValueError, match="finite, sized validation loaders"),
+        ):
+            build_train_valid_test_data_iterators(
+                mock_multi_valid_full_datasets_provider, pg_collection=carrier
+            )
+
+        all_reduce.assert_called_once_with(
+            mock.ANY,
+            op=torch.distributed.ReduceOp.MAX,
+            group=torch.distributed.group.WORLD,
+        )
 
     def test_plain_full_validation_reduces_lengths_over_explicit_dp_cp(self):
         args = create_test_args()

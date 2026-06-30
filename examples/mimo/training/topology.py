@@ -72,6 +72,19 @@ class HeteroTopology:
         _destroy_topology_resources(self.grids, self.module_pgs)
 
 
+def _encoder_module_name(topology: HeteroTopology) -> Optional[str]:
+    """Return the sole encoder name supported by the current example, if present."""
+    names = sorted(
+        name for name in topology.grids if name != MIMO_LANGUAGE_MODULE_KEY
+    )
+    if len(names) > 1:
+        raise ValueError(
+            "the current heterogeneous MIMO example supports exactly one encoder grid "
+            f"or LLM-only execution; got multiple encoders: {names}"
+        )
+    return names[0] if names else None
+
+
 def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
     """Build every module's grid, PGC, and embedding groups.
 

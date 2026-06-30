@@ -29,11 +29,11 @@ from examples.mimo.training.args import (
     build_module_grid_specs,
     validate_hetero_grid_args,
 )
-from examples.mimo.training.builder import MimoBuildConfig, _encoder_module_name
+from examples.mimo.training.builder import MimoBuildConfig
 from examples.mimo.training.data import add_data_args, select_data_iterator
 from examples.mimo.training.distributed import initialize_distributed, shutdown_distributed
 from examples.mimo.training.step import mimo_forward_step
-from examples.mimo.training.topology import HeteroTopology, create_topology
+from examples.mimo.training.topology import HeteroTopology, _encoder_module_name, create_topology
 from megatron.core.config import set_experimental_flag
 from megatron.core.enums import ModelType
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY

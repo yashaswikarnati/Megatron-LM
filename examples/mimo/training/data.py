@@ -10,7 +10,7 @@ from typing import Optional
 
 import torch
 
-from examples.mimo.training.topology import HeteroTopology
+from examples.mimo.training.topology import HeteroTopology, _encoder_module_name
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -55,7 +55,7 @@ def select_mock_data_iterator(
     args: argparse.Namespace, topology: HeteroTopology
 ) -> Optional["MockVLMIterator"]:
     """Pick the mock iterator for this rank's role: encoder PP-first or language PP-edge stages."""
-    encoder_name = _encoder_name(topology)
+    encoder_name = _encoder_module_name(topology)
     llm_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
     llm_pgc = topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY]
     llm_mbs = args.micro_batch_size
@@ -98,12 +98,6 @@ def get_mock_data_seed(args: argparse.Namespace, pg_collection, module_seed_offs
     """Seed mock data per DP lane so PP/TP stages in a lane see coherent batches."""
     dp_lane = pg_collection.dp.rank() if pg_collection.dp is not None else 0
     return args.seed + module_seed_offset + dp_lane
-
-
-def _encoder_name(topology: HeteroTopology) -> Optional[str]:
-    """Return the single modality (encoder) grid name, or None for a language-only run."""
-    modality = [name for name in topology.grids if name != MIMO_LANGUAGE_MODULE_KEY]
-    return modality[0] if modality else None
 
 
 def _even_patch_grid(num_patches: int) -> tuple[int, int]:

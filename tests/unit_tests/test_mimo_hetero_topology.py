@@ -15,6 +15,7 @@ import examples.mimo.training.topology as topology_module
 from examples.mimo.training.topology import (
     HeteroTopology,
     ModuleGridSpec,
+    _encoder_module_name,
     _validate_grid_layout,
     create_topology,
 )
@@ -62,6 +63,15 @@ def test_create_topology_rejects_duplicate_module_names_before_grid_build(mocker
         create_topology(specs)
 
     build_grid.assert_not_called()
+
+
+def test_example_encoder_resolver_rejects_multiple_encoder_grids():
+    topology = SimpleNamespace(
+        grids={"vision": object(), "audio": object(), MIMO_LANGUAGE_MODULE_KEY: object()}
+    )
+
+    with pytest.raises(ValueError, match="supports exactly one encoder.*audio.*vision"):
+        _encoder_module_name(topology)
 
 
 def test_create_topology_preserves_distinct_module_resources(mocker):

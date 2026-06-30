@@ -16,7 +16,7 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
 )
 from examples.mimo.training.grad_sync import configure_grad_sync
 from examples.mimo.training.runtime import _seed_module_rng, wrap_active_modules_with_ddp
-from examples.mimo.training.topology import HeteroTopology
+from examples.mimo.training.topology import HeteroTopology, _encoder_module_name
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
@@ -38,12 +38,6 @@ class MimoBuildConfig(ModelConfig):
     builder: ClassVar[str] = "examples.mimo.training.builder.MimoModelBuilder"
     _topology: Optional[HeteroTopology] = field(default=None)
     _args: Optional[argparse.Namespace] = field(default=None)
-
-
-def _encoder_module_name(topology: HeteroTopology) -> Optional[str]:
-    """Return the single modality (encoder) grid name, or ``None`` for an LLM-only run."""
-    names = [name for name in topology.grids if name != MIMO_LANGUAGE_MODULE_KEY]
-    return names[0] if names else None
 
 
 def _resolve_role(topology: HeteroTopology):

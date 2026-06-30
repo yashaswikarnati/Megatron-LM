@@ -4625,6 +4625,34 @@ def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider
     )
 
+    is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection)
+    multimodule_eval_lengths: list[int] = []
+    if args.full_validation and is_multimodule:
+        local_invalid = valid_dataloaders is None
+        if not local_invalid:
+            try:
+                multimodule_eval_lengths = [
+                    len(dataloader) if dataloader is not None else 0
+                    for dataloader in valid_dataloaders
+                ]
+                local_invalid = not multimodule_eval_lengths
+            except (TypeError, ValueError, OverflowError, NotImplementedError):
+                local_invalid = True
+
+        validation_status = torch.tensor(
+            [int(local_invalid)], dtype=torch.long, device='cuda'
+        )
+        torch.distributed.all_reduce(
+            validation_status,
+            op=torch.distributed.ReduceOp.MAX,
+            group=torch.distributed.group.WORLD,
+        )
+        if validation_status.item():
+            raise ValueError(
+                "Multi-module full validation requires a validation-loader container "
+                "on every rank and finite, sized validation loaders for every non-None entry"
+            )
+
     # Build iterators.
     dl_type = args.dataloader_type
     assert dl_type in ['single', 'cyclic', 'external']
@@ -4653,9 +4681,6 @@ def build_train_valid_test_data_iterators(
         # when using full validation, we need to override eval iters with the
         # MAX length across DP ranks so all ranks run the same number of steps
         if args.full_validation:
-            is_multimodule = isinstance(
-                pg_collection, MultiModuleProcessGroupCollection
-            )
             if is_multimodule:
                 full_validation_group = torch.distributed.group.WORLD
             elif isinstance(pg_collection, ProcessGroupCollection):
@@ -4671,9 +4696,14 @@ def build_train_valid_test_data_iterators(
                 if valid_dataloaders[0] is None and not is_multimodule:
                     args.eval_iters = [None] * len(valid_dataloaders)
                 else:
-                    local_eval_iters = [
-                        len(dl) if dl is not None else 0 for dl in valid_dataloaders
-                    ]
+                    local_eval_iters = (
+                        multimodule_eval_lengths
+                        if is_multimodule
+                        else [
+                            len(dl) if dl is not None else 0
+                            for dl in valid_dataloaders
+                        ]
+                    )
                     eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
                     torch.distributed.all_reduce(
                         eval_iters_tensor,
@@ -4684,9 +4714,9 @@ def build_train_valid_test_data_iterators(
             else:
                 if valid_dataloaders[0] is not None or is_multimodule:
                     local_eval_iters = (
-                        len(valid_dataloaders[0])
-                        if valid_dataloaders[0] is not None
-                        else 0
+                        multimodule_eval_lengths[0]
+                        if is_multimodule
+                        else len(valid_dataloaders[0])
                     )
                     eval_iters_tensor = torch.tensor(
                         [local_eval_iters], dtype=torch.long, device='cuda'

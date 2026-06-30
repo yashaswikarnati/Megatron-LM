@@ -53,6 +53,14 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
     """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
+    micro_batch_size = getattr(args, "micro_batch_size", None)
+    if (
+        isinstance(micro_batch_size, bool)
+        or not isinstance(micro_batch_size, int)
+        or micro_batch_size <= 0
+    ):
+        raise ValueError("--micro-batch-size must be a positive integer")
+
     if args.llm_cp != 1:
         raise ValueError("hetero MIMO training currently supports CP=1 only")
 
@@ -81,7 +89,7 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
 
     # Fan-out divisibility: the bridge splits (mbs * llm_dp) LLM lanes across
     # encoder_dp encoder lanes; the split must be exact.
-    if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
+    if (micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
         raise ValueError(
             "--micro-batch-size * --llm-dp must be divisible by --encoder-dp "
             f"(got {args.micro_batch_size} * {args.llm_dp} % {args.encoder_dp} != 0)"

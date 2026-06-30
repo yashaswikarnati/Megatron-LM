@@ -83,6 +83,22 @@ def test_fanout_divisibility_raises():
         validate_hetero_grid_args(args, WORLD_SIZE_8)
 
 
+@pytest.mark.parametrize("micro_batch_size", [None, 0, -1])
+def test_micro_batch_size_must_be_positive_before_grid_arithmetic(micro_batch_size):
+    args = _layout_8gpu_20l(micro_batch_size=micro_batch_size)
+
+    with pytest.raises(ValueError, match="--micro-batch-size must be a positive integer"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
+
+
+def test_missing_micro_batch_size_fails_clearly():
+    args = _layout_8gpu_20l()
+    del args.micro_batch_size
+
+    with pytest.raises(ValueError, match="--micro-batch-size must be a positive integer"):
+        validate_hetero_grid_args(args, WORLD_SIZE_8)
+
+
 def test_ep_divisibility_raises():
     # num_experts 128 not divisible by llm_ep 3.
     args = _layout_8gpu_20l(llm_ep=3, num_experts=128)
