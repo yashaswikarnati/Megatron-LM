@@ -4650,7 +4650,7 @@ def build_train_valid_test_data_iterators(
             op=torch.distributed.ReduceOp.MAX,
             group=torch.distributed.group.WORLD,
         )
-        if validation_status.item():
+        if validation_status[0].item():
             raise ValueError(
                 "Multi-module full validation requires a validation-loader container "
                 "on every rank and finite, sized validation loaders for every non-None entry"
