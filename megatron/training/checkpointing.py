@@ -1237,6 +1237,8 @@ def _load_non_persistent_base_checkpoint(
     sharded_state_dict,
     non_persistent_iteration,
     checkpointing_context=None,
+    dp_cp_group=None,
+    expt_dp_group=None,
 ):
     """ Load the base state_dict from a non-persistent distributed checkpoint.
     Depending on the non_persistent_ckpt_type, different logic may be required.
@@ -1249,7 +1251,9 @@ def _load_non_persistent_base_checkpoint(
             )
         return _load_global_dist_base_checkpoint(
             non_persistent_global_dir, args, rank0, sharded_state_dict, non_persistent_iteration, False,
-            checkpointing_context=checkpointing_context
+            checkpointing_context=checkpointing_context,
+            dp_cp_group=dp_cp_group,
+            expt_dp_group=expt_dp_group,
         )
     elif args.non_persistent_ckpt_type == "local":
         intermediate_state_dict, checkpoint_name = checkpointing_context[
@@ -1258,7 +1262,11 @@ def _load_non_persistent_base_checkpoint(
         state_dict = intermediate_state_dict.to_state_dict(
             sharded_state_dict,
             algo=args.non_persistent_local_ckpt_algo,
-            parallelization_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            parallelization_group=(
+                dp_cp_group
+                if dp_cp_group is not None
+                else mpu.get_data_parallel_group(with_context_parallel=True)
+            ),
         )
         return state_dict, checkpoint_name, False, CheckpointType.LOCAL
     else:
@@ -1266,7 +1274,15 @@ def _load_non_persistent_base_checkpoint(
 
 
 def _load_global_dist_base_checkpoint(
-    load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=None
+    load_dir,
+    args,
+    rank0,
+    sharded_state_dict,
+    iteration,
+    release,
+    checkpointing_context=None,
+    dp_cp_group=None,
+    expt_dp_group=None,
 ):
     """ Load the base state_dict from the given directory containing the global distributed checkpoint """
     if rank0:
@@ -1288,9 +1304,17 @@ def _load_global_dist_base_checkpoint(
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
-            process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            process_group = (
+                dp_cp_group
+                if dp_cp_group is not None
+                else mpu.get_data_parallel_group(with_context_parallel=True)
+            )
         elif args.ckpt_fully_parallel_load_process_group == 'ep_dp':
-            process_group = mpu.get_expert_data_parallel_group()
+            process_group = (
+                expt_dp_group
+                if expt_dp_group is not None
+                else mpu.get_expert_data_parallel_group()
+            )
         else:
             raise ValueError(f"Invalid load process group: {args.ckpt_fully_parallel_load_process_group}")
 
@@ -1342,6 +1366,8 @@ def _load_base_checkpoint(
     rank0=False,
     sharded_state_dict=None,
     checkpointing_context=None,
+    dp_cp_group=None,
+    expt_dp_group=None,
 ):
     """ Load the base state_dict from the given directory
 
@@ -1380,6 +1406,8 @@ def _load_base_checkpoint(
                 sharded_state_dict,
                 non_persistent_iteration,
                 checkpointing_context,
+                dp_cp_group=dp_cp_group,
+                expt_dp_group=expt_dp_group,
             )
         else:
             print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
@@ -1417,7 +1445,15 @@ def _load_base_checkpoint(
     # Handle global distributed checkpoint
     if ckpt_format == "torch_dist":
         return _load_global_dist_base_checkpoint(
-            load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=checkpointing_context
+            load_dir,
+            args,
+            rank0,
+            sharded_state_dict,
+            iteration,
+            release,
+            checkpointing_context=checkpointing_context,
+            dp_cp_group=dp_cp_group,
+            expt_dp_group=expt_dp_group,
         )
     elif ckpt_format == "torch":
         ckpt_type = CheckpointType.LEGACY
@@ -1660,7 +1696,7 @@ def load_args_from_checkpoint(
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -1670,6 +1706,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         checkpointing, the tensors are already loaded in-place by `_load_base_checkpoint`.
     dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     dp_group: Data parallel group (default: None, falls back to mpu API)
+    expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
@@ -1904,7 +1941,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         load_kwargs["sharded_state_dict"] = state_dict
 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
+        load_dir,
+        args,
+        rank0=False,
+        checkpointing_context=checkpointing_context,
+        dp_cp_group=dp_cp_group,
+        expt_dp_group=expt_dp_group,
         **load_kwargs
     )
 

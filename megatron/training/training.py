@@ -1237,7 +1237,7 @@ def pretrain(
         model_type,
         checkpointing_context=checkpointing_context,
         cfg_container=cfg_container,
-        pg_collection=local_pg_collection,
+        pg_collection=pg_collection,
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1448,7 +1448,8 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator
+                train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
 
         one_logger and one_logger.log_metrics(
@@ -2009,18 +2010,32 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         return DistributedDataParallelConfig(**kwargs)
 
 
+def _resolve_local_pg_collection(
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
+) -> tuple[ProcessGroupCollection, str]:
+    """Resolve the rank-local process groups and checkpoint RNG namespace."""
+    if pg_collection is None:
+        return ProcessGroupCollection.use_mpu_process_groups(), ""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        local_pg_collection = pg_collection.get_only_local_collection()
+        ((module_name, _),) = pg_collection.module_pgs.items()
+        return local_pg_collection, f"{module_name}."
+    return pg_collection, ""
+
+
 def setup_model_and_optimizer(
     model_provider_func,
     model_type,
     checkpointing_context=None,
     *,
     cfg_container: PretrainConfigContainer,
-    pg_collection: ProcessGroupCollection,
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
 ):
     """Setup model and optimizer."""
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
+    local_pg_collection, rng_state_key_prefix = _resolve_local_pg_collection(pg_collection)
 
     # Typically, --skip-train is the only thing needed to disable the optimizer.
     has_normal_optimizer = not args.skip_train
@@ -2039,7 +2054,7 @@ def setup_model_and_optimizer(
         builder_cls = model_config.get_builder_cls()
         builder = builder_cls(model_config)
         return builder.build_distributed_models(
-            pg_collection=pg_collection,
+            pg_collection=local_pg_collection,
             ddp_config=cfg.ddp,
             overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
             use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
@@ -2165,6 +2180,12 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
+            tp_group=getattr(local_pg_collection, "tp", None),
+            pp_group=getattr(local_pg_collection, "pp", None),
+            dp_cp_group=getattr(local_pg_collection, "dp_cp", None),
+            dp_group=getattr(local_pg_collection, "dp", None),
+            expt_dp_group=getattr(local_pg_collection, "expt_dp", None),
+            rng_state_key_prefix=rng_state_key_prefix,
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
@@ -2184,7 +2205,7 @@ def setup_model_and_optimizer(
     # is too small for the number of data-parallel replicas.
     num_microbatches = get_num_microbatches()
     current_global_batch_size = get_current_global_batch_size()
-    data_parallel_size = mpu.get_data_parallel_world_size()
+    data_parallel_size = get_pg_size(local_pg_collection.dp)
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
         f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
@@ -2976,6 +2997,7 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
     args = get_args()
     timers = get_timers()
@@ -3010,16 +3032,7 @@ def save_checkpoint_and_time(
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
 
-    # Resolve checkpoint groups from this rank's module PGC; None for stock runs
-    # falls back to the mpu groups inside save_checkpoint (byte-identical).
-    ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
-    tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
-    pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
-    dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
-    expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
-    # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
-    rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+    local_pg_collection, rng_state_key_prefix = _resolve_local_pg_collection(pg_collection)
 
     # Save checkpoint.
     save_checkpoint(
@@ -3032,11 +3045,11 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
-        tp_group=tp_group,
-        pp_group=pp_group,
-        dp_cp_group=dp_cp_group,
-        dp_group=dp_group,
-        expt_dp_group=expt_dp_group,
+        tp_group=getattr(local_pg_collection, "tp", None),
+        pp_group=getattr(local_pg_collection, "pp", None),
+        dp_cp_group=getattr(local_pg_collection, "dp_cp", None),
+        dp_group=getattr(local_pg_collection, "dp", None),
+        expt_dp_group=getattr(local_pg_collection, "expt_dp", None),
         rng_state_key_prefix=rng_state_key_prefix,
     )
 
@@ -3173,6 +3186,7 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
@@ -3194,6 +3208,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    pg_collection=pg_collection,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
@@ -3209,6 +3224,7 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            pg_collection=pg_collection,
         )
         saved_checkpoint = True
 
@@ -3226,6 +3242,7 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            pg_collection=pg_collection,
         )
         saved_checkpoint = True
 
@@ -3247,6 +3264,7 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    pg_collection=pg_collection,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
@@ -3269,6 +3287,7 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -3693,6 +3712,7 @@ def train(
                         num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
+                        pg_collection=pg_collection,
                     )
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
@@ -3800,6 +3820,7 @@ def train(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                pg_collection=pg_collection,
             )
         if should_exit:
             break
@@ -4014,6 +4035,7 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            pg_collection=pg_collection,
         )
         if should_exit:
             break
