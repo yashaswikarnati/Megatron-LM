@@ -20,6 +20,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 if TYPE_CHECKING:
     from megatron.core.hyper_comm_grid import HyperCommGrid
 
+_EXPERT_VIEW = "expert"
+
 
 @dataclass
 class ModuleOptimizerInfo:
@@ -361,16 +363,12 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
 
-    # Expert groups
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.expt_dp = grid.get_pg(["dp", "ep"])
+    # Expert groups live on the grid's expert view (ep == 1 for non-expert grids).
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
+    pg.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
 
-    # Distributed optimizer grad stats group: must span all dimensions so grad norm
-    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
-    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
-    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
-    # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
+    # Grad-stats group spans the full grid (ep re-views the same ranks).
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
 
     return pg
 
