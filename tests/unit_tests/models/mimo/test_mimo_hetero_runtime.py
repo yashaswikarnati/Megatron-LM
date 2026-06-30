@@ -122,7 +122,7 @@ def test_builder_seeds_meta_build_and_forwards_lifecycle(mocker):
     call = prepare.call_args
     assert call.args == (args, model, topology)
     assert call.kwargs["ddp_config"] is ddp_config
-    assert "built_with_meta_device" not in call.kwargs
+    assert call.kwargs["built_with_meta_device"] is True
     assert call.kwargs["data_parallel_random_init"] is True
 
 
@@ -260,7 +260,7 @@ def test_active_runtime_uses_shared_lifecycle_with_copied_role_config(
     ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, overlap_param_gather=True)
     prepared_module = mocker.Mock()
     shared_lifecycle = mocker.patch(
-        "examples.mimo.training.runtime.unimodal_build_distributed_models",
+        "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
         return_value=[prepared_module],
     )
 
@@ -269,16 +269,15 @@ def test_active_runtime_uses_shared_lifecycle_with_copied_role_config(
         mimo_model,
         topology,
         ddp_config=ddp_config,
+        built_with_meta_device=False,
         data_parallel_random_init=True,
         mixed_precision_wrapper=mixed_precision_wrapper,
     )
 
     shared_lifecycle.assert_called_once()
     call = shared_lifecycle.call_args
-    assert call.kwargs["build_model_func"] is None
-    assert call.kwargs["transformer_config"] is module.config
-    assert call.kwargs["pg_collection"] is pg_collection
-    assert call.kwargs["prebuilt_model_chunks"] == [module]
+    assert call.args == ([module], module.config, pg_collection)
+    assert call.kwargs["built_with_meta_device"] is False
     copied_config = call.kwargs["ddp_config"]
     assert copied_config is not ddp_config
     expected_overlap = role == "language"
@@ -316,6 +315,7 @@ class TestRuntimeDistributed:
                 mimo_model,
                 topo,
                 DistributedDataParallelConfig(use_distributed_optimizer=True),
+                built_with_meta_device=False,
             )
             # Non-colocated: each rank owns exactly one active module (language XOR encoder).
             if torch.distributed.get_rank() < 4:
@@ -338,6 +338,7 @@ class TestRuntimeDistributed:
                 mimo_model,
                 topo,
                 DistributedDataParallelConfig(use_distributed_optimizer=True),
+                built_with_meta_device=False,
             )
 
             if torch.distributed.get_rank() < 4:

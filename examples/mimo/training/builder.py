@@ -191,6 +191,7 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
             mimo_model,
             topology,
             ddp_config=ddp_config,
+            built_with_meta_device=built_with_meta_device,
             overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
             use_megatron_fsdp=use_megatron_fsdp,
             use_torch_fsdp2=use_torch_fsdp2,

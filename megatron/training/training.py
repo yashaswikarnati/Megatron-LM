@@ -2016,7 +2016,8 @@ def _resolve_local_pg_collection(
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
         if len(pg_collection) != 1:
             raise ValueError(
-                "Operation requires exactly one local module process-group collection"
+                "Colocated heterogeneous MIMO is not yet supported; expected exactly one "
+                "local module process-group collection"
             )
         ((module_name, local_pg_collection),) = pg_collection.module_pgs.items()
         return local_pg_collection, f"{module_name}."
@@ -2180,11 +2181,11 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
-            tp_group=getattr(local_pg_collection, "tp", None),
-            pp_group=getattr(local_pg_collection, "pp", None),
-            dp_cp_group=getattr(local_pg_collection, "dp_cp", None),
-            dp_group=getattr(local_pg_collection, "dp", None),
-            expt_dp_group=getattr(local_pg_collection, "expt_dp", None),
+            tp_group=local_pg_collection.tp,
+            pp_group=local_pg_collection.pp,
+            dp_cp_group=local_pg_collection.dp_cp,
+            dp_group=local_pg_collection.dp,
+            expt_dp_group=local_pg_collection.expt_dp,
             rng_state_key_prefix=rng_state_key_prefix,
         )
         timers('load-checkpoint').stop(barrier=True)
@@ -2458,6 +2459,8 @@ def train_step(
         _save_state_dict(attr_name="data", label="params")
 
     if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        # MimoOptimizer returns world-consistent success, grad norm, and zero count.
+        # Repeating the legacy per-MP-group reductions here would use only one module grid.
         if pg_collection.has_language_model():
             language_pg_collection = pg_collection.get_language_model_collection()
             dp_cp_group = language_pg_collection.dp_cp
@@ -3048,11 +3051,11 @@ def save_checkpoint_and_time(
         non_persistent_ckpt=non_persistent_ckpt,
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
-        tp_group=getattr(local_pg_collection, "tp", None),
-        pp_group=getattr(local_pg_collection, "pp", None),
-        dp_cp_group=getattr(local_pg_collection, "dp_cp", None),
-        dp_group=getattr(local_pg_collection, "dp", None),
-        expt_dp_group=getattr(local_pg_collection, "expt_dp", None),
+        tp_group=local_pg_collection.tp,
+        pp_group=local_pg_collection.pp,
+        dp_cp_group=local_pg_collection.dp_cp,
+        dp_group=local_pg_collection.dp,
+        expt_dp_group=local_pg_collection.expt_dp,
         rng_state_key_prefix=rng_state_key_prefix,
     )
 
@@ -4164,7 +4167,7 @@ def evaluate(
             forward_backward_func,
         )
 
-    if has_nvidia_modelopt and args.modelopt_enabled:
+    if has_nvidia_modelopt:
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,

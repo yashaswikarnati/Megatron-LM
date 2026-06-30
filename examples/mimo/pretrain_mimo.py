@@ -47,9 +47,17 @@ def _parse_and_validate() -> argparse.Namespace:
     """Parse stock plus MIMO arguments and validate the disjoint module grids."""
     args = parse_args(extra_args_provider)
     validate_hetero_grid_args(args, args.world_size)
-    args = validate_args(
-        args, {"dataloader_type": "external"}, data_parallel_size_override=args.llm_dp
+    physical_world_size = args.world_size
+    args.world_size = (
+        args.llm_dp
+        * args.tensor_model_parallel_size
+        * args.pipeline_model_parallel_size
+        * args.context_parallel_size
     )
+    try:
+        validate_args(args, {"dataloader_type": "external"})
+    finally:
+        args.world_size = physical_world_size
     if not args.use_distributed_optimizer:
         raise ValueError("heterogeneous MIMO training requires --use-distributed-optimizer")
 

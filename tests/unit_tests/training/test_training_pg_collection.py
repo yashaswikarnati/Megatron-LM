@@ -48,7 +48,7 @@ def test_resolve_local_pg_collection_rejects_colocated_modules():
         language_model_module_name="language",
     )
 
-    with pytest.raises(ValueError, match="exactly one local"):
+    with pytest.raises(ValueError, match="Colocated heterogeneous MIMO is not yet supported"):
         training_mod._resolve_local_pg_collection(carrier)
 
 

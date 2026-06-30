@@ -4,7 +4,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import torch
 
@@ -35,9 +35,8 @@ except ImportError:
     correct_amax_history_if_needed = None
 
 
-
 def unimodal_build_distributed_models(
-    build_model_func: Callable | None,
+    build_model_func: Callable,
     transformer_config: TransformerConfig,
     pg_collection: ProcessGroupCollection,
     ddp_config: DistributedDataParallelConfig | None = None,
@@ -49,15 +48,13 @@ def unimodal_build_distributed_models(
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     pre_wrap_hook: Callable[[list[MegatronModule]], list[MegatronModule]] | None = None,
     model_type: ModelType = ModelType.encoder_or_decoder,
-    *,
-    prebuilt_model_chunks: list[torch.nn.Module] | None = None,
-) -> list[torch.nn.Module]:
-    """Build or accept model stages and wrap for distributed training.
+) -> list[MegatronModule]:
+    """Build model stages and wrap for distributed training.
 
     Shared helper for unimodal models (GPT, Hybrid, etc.) that share the same procedure
     for distributed model initialization. Performs the following steps in order:
 
-    1. Build virtual pipeline stages, or use supplied prebuilt model chunks
+    1. Build virtual pipeline stages (one per VP rank, or a single stage if no VP)
     2. Apply ``pre_wrap_hook``
     3. Set tensor model parallel attributes on all parameters
     4. Move model to GPU (unless using FSDP2 or CPU/meta-device initialization)
@@ -66,8 +63,7 @@ def unimodal_build_distributed_models(
     7. Optionally wrap with DDP/FSDP
 
     Args:
-        build_model_func: Callable that builds a single model stage (e.g. ``ModelBuilder.build_model``),
-            or ``None`` when ``prebuilt_model_chunks`` is supplied.
+        build_model_func: Callable that builds a single model stage (e.g. ``ModelBuilder.build_model``).
         transformer_config: TransformerConfig; used for VP size, precision, and device placement.
         pg_collection: Model communication process groups.
         ddp_config: DistributedDataParallel configuration. Required when ``wrap_with_ddp=True``.
@@ -80,39 +76,24 @@ def unimodal_build_distributed_models(
             Pass ``None`` to skip.
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
         model_type: Deprecated flag, only used for backwards compatibility.
-        prebuilt_model_chunks: Already-constructed PyTorch model chunks to prepare instead of
-            calling ``build_model_func``.
 
     Returns:
-        List of model stages prepared for distributed training.
+        List of model stages, wrapped and ready for distributed training.
     """
     if wrap_with_ddp and not ddp_config:
         raise ValueError("ddp_config is required when wrap_with_ddp is True")
 
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
-    if prebuilt_model_chunks is None:
-        if not callable(build_model_func):
-            raise ValueError(
-                "build_model_func must be callable when no prebuilt model chunks are provided"
-            )
-        vp_size = transformer_config.virtual_pipeline_model_parallel_size
-        if init_model_with_meta_device:
-            with torch.device("meta"):
-                model_list = build_virtual_pipeline_stages(
-                    build_model_func, pg_collection, vp_size, model_type
-                )
-        else:
+    vp_size = transformer_config.virtual_pipeline_model_parallel_size
+    if init_model_with_meta_device:
+        with torch.device("meta"):
             model_list = build_virtual_pipeline_stages(
                 build_model_func, pg_collection, vp_size, model_type
             )
     else:
-        if build_model_func is not None:
-            raise ValueError(
-                "build_model_func must be None when prebuilt model chunks are provided"
-            )
-        model_list = prebuilt_model_chunks
-        for model_module in model_list:
-            model_module.model_type = model_type
+        model_list = build_virtual_pipeline_stages(
+            build_model_func, pg_collection, vp_size, model_type
+        )
 
     # Apply pre wrap hooks
     if pre_wrap_hook is not None:
@@ -123,6 +104,45 @@ def unimodal_build_distributed_models(
             model_list = _model
         else:
             logger.warning("Final pre wrap hook returned None, skipping pre wrap hooks.")
+
+    return cast(
+        list[MegatronModule],
+        prepare_existing_model_chunks_for_distributed_training(
+            model_list,
+            transformer_config,
+            pg_collection,
+            built_with_meta_device=init_model_with_meta_device,
+            ddp_config=ddp_config,
+            overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=use_megatron_fsdp,
+            use_torch_fsdp2=use_torch_fsdp2,
+            wrap_with_ddp=wrap_with_ddp,
+            data_parallel_random_init=data_parallel_random_init,
+            mixed_precision_wrapper=mixed_precision_wrapper,
+        ),
+    )
+
+
+def prepare_existing_model_chunks_for_distributed_training(
+    model_list: list[torch.nn.Module],
+    transformer_config: TransformerConfig,
+    pg_collection: ProcessGroupCollection,
+    built_with_meta_device: bool,
+    ddp_config: DistributedDataParallelConfig | None = None,
+    overlap_param_gather_with_optimizer_step: bool = False,
+    use_megatron_fsdp: bool = False,
+    use_torch_fsdp2: bool = False,
+    wrap_with_ddp: bool = True,
+    data_parallel_random_init: bool = False,
+    mixed_precision_wrapper: Callable[..., torch.nn.Module] | None = Float16Module,
+) -> list[torch.nn.Module]:
+    """Apply the shared post-build distributed lifecycle to existing model chunks."""
+    if wrap_with_ddp and ddp_config is None:
+        raise ValueError("ddp_config is required when wrap_with_ddp is True")
+    if transformer_config.init_model_with_meta_device != built_with_meta_device:
+        raise ValueError(
+            "Transformer config init_model_with_meta_device must match the model construction context"
+        )
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -138,14 +158,14 @@ def unimodal_build_distributed_models(
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     use_cpu_initialization = transformer_config.use_cpu_initialization
-    if not use_torch_fsdp2 and not use_cpu_initialization and not init_model_with_meta_device:
+    if not use_torch_fsdp2 and not use_cpu_initialization and not built_with_meta_device:
         for model_module in model_list:
             model_module.cuda(torch.cuda.current_device())
 
     model_list = _wrap_with_mp_wrapper(model_list, transformer_config, mixed_precision_wrapper)
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-    if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
+    if built_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         model_list = [
             to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model_list
         ]
@@ -167,7 +187,7 @@ def unimodal_build_distributed_models(
     return model_list
 
 
-def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCollection) -> None:
+def _print_num_params(model: list[torch.nn.Module], pg_collection: ProcessGroupCollection) -> None:
     """Print the number of parameters in the model on rank 0.
 
     Only prints on data parallel rank 0 to avoid duplicate output.
@@ -189,10 +209,10 @@ def _print_num_params(model: list[MegatronModule], pg_collection: ProcessGroupCo
 
 
 def _wrap_with_mp_wrapper(
-    model_list: list[MegatronModule],
+    model_list: list[torch.nn.Module],
     transformer_config: TransformerConfig,
-    mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
-) -> list[MegatronModule]:
+    mixed_precision_wrapper: Callable[..., torch.nn.Module] | None = Float16Module,
+) -> list[torch.nn.Module]:
     fp16 = transformer_config.fp16
     bf16 = transformer_config.bf16
     if (fp16 or bf16) and mixed_precision_wrapper is not None:
@@ -208,7 +228,7 @@ def _wrap_with_mp_wrapper(
 
 
 def _ddp_wrap(
-    model: list[MegatronModule],
+    model: list[torch.nn.Module],
     data_parallel_random_init: bool,
     ddp_config: DistributedDataParallelConfig,
     overlap_param_gather_with_optimizer_step: bool,
@@ -216,7 +236,7 @@ def _ddp_wrap(
     use_torch_fsdp2: bool = False,
     *,
     pg_collection: ProcessGroupCollection,
-) -> list[MegatronModule]:
+) -> list[torch.nn.Module]:
     """Wrap model with Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
     Args:
@@ -230,7 +250,7 @@ def _ddp_wrap(
         pg_collection: Model communication process groups.
 
     Returns:
-        list[MegatronModule]: List of DDP/FSDP wrapped model modules
+        List of DDP/FSDP wrapped model modules.
     """
     if use_megatron_fsdp:
         DP = FullyShardedDataParallel

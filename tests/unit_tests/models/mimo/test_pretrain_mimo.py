@@ -11,17 +11,16 @@ import pytest
 from examples.mimo import pretrain_mimo
 
 
-class _LogicalDp(int):
-    """Non-interned integer used to assert identity across validation."""
-
-
 def test_parse_and_validate_orders_grid_before_stock_and_checks_validated_optimizer(monkeypatch):
-    logical_dp = _LogicalDp(2)
     args = SimpleNamespace(
         use_distributed_optimizer=True,
         world_size=8,
-        llm_dp=logical_dp,
+        llm_dp=2,
         llm_tp=2,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        data_parallel_size=8,
         padded_vocab_size=None,
         vocab_size=511,
         make_vocab_size_divisible_by=128,
@@ -45,11 +44,12 @@ def test_parse_and_validate_orders_grid_before_stock_and_checks_validated_optimi
         assert received is args
         assert world_size == 8
 
-    def fake_validate_args(received, defaults, data_parallel_size_override=None):
+    def fake_validate_args(received, defaults):
         calls.append("stock")
         assert received is args
+        assert received.world_size == 2
         assert defaults == {"dataloader_type": "external"}
-        assert data_parallel_size_override is logical_dp
+        received.data_parallel_size = received.world_size
         if reject_after_validation:
             received.use_distributed_optimizer = False
         return received
@@ -65,11 +65,14 @@ def test_parse_and_validate_orders_grid_before_stock_and_checks_validated_optimi
     monkeypatch.setattr(pretrain_mimo, "calculate_padded_vocab_size", fake_calculate)
 
     assert pretrain_mimo._parse_and_validate() is args
+    assert args.world_size == 8
+    assert args.data_parallel_size == args.llm_dp
     assert args.padded_vocab_size == 512
     assert calls == ["parse", "grid", "stock", "vocab"]
 
     reject_after_validation = True
     args.use_distributed_optimizer = True
+    args.data_parallel_size = 8
     args.padded_vocab_size = None
     calls.clear()
     with pytest.raises(ValueError, match="--use-distributed-optimizer"):
