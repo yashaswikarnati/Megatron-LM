@@ -65,7 +65,7 @@ class HeteroTopology:
 
     grids: dict[str, HyperCommGrid]
     module_pgs: dict[str, ProcessGroupCollection]
-    schedule_pg_collection: MultiModuleProcessGroupCollection
+    pg_collection: MultiModuleProcessGroupCollection
 
     def destroy(self) -> None:
         """Destroy every process group owned by this topology."""
@@ -106,12 +106,12 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
         for name, grid in grids.items():
             module_pgs[name] = pg_collection_from_grid(grid, is_language=(name == language_name))
 
-        schedule_pg_collection = build_schedule_pg_collection(grids, module_pgs, language_name)
+        pg_collection = build_pg_collection(grids, module_pgs, language_name)
         return HeteroTopology(
-            grids=grids, module_pgs=module_pgs, schedule_pg_collection=schedule_pg_collection
+            grids=grids, module_pgs=module_pgs, pg_collection=pg_collection
         )
     except Exception:
-        HeteroTopology(grids=grids, module_pgs=module_pgs, schedule_pg_collection=None).destroy()
+        HeteroTopology(grids=grids, module_pgs=module_pgs, pg_collection=None).destroy()
         raise
 
 
@@ -198,6 +198,7 @@ def pg_collection_from_grid(
     pgc.tp_dp = grid.get_pg(["tp", "dp"])
     pgc.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
     pgc.mp = grid.get_pg(["tp", "pp"])
+    pgc.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     pgc.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
     pgc.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
     pgc.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
@@ -227,12 +228,12 @@ def _build_language_embedding_groups(grid: HyperCommGrid, pgc: ProcessGroupColle
                 pgc.pos_embd = pos_group
 
 
-def build_schedule_pg_collection(
+def build_pg_collection(
     grids: dict[str, HyperCommGrid],
     module_pgs: dict[str, ProcessGroupCollection],
     language_name: str,
 ) -> MultiModuleProcessGroupCollection:
-    """Build the schedule-facing collection of the modules this rank participates in."""
+    """Build the collection of the modules this rank participates in."""
     rank_modules = {}
     rank_language_name = None
     for name, grid in grids.items():

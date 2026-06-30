@@ -97,10 +97,9 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     grid.create_pg(["dp", "cp"])
     grid.create_pg(["ep"])
     grid.create_pg(["expt_dp"])
-    # Required by _get_pg_collection_for_optimizer
+    # Optimizer process groups stored in the per-module ProcessGroupCollection.
     grid.create_pg(["tp", "pp"])
     grid.create_pg(["tp", "ep", "pp"])
-    grid.create_pg(["dp", "ep"])
     grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
     _active_grids.append(grid)
     return grid
@@ -125,7 +124,10 @@ def get_pg_collection(grid):
     pg_collection.ep = grid.get_pg("ep")
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
+    pg_collection.mp = grid.get_pg(["tp", "pp"])
+    pg_collection.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
     pg_collection.expt_dp = grid.get_pg("expt_dp")
+    pg_collection.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
     return pg_collection
 
 

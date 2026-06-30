@@ -1,22 +1,22 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Tests for MIMO per-rank runtime setup (RNG seeding, bucket sizing, DDP wrapping)."""
+"""Tests for MIMO per-rank model construction and distributed preparation."""
 
 import argparse
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
+from examples.mimo.training.runtime import prepare_active_modules_for_distributed_training
 from examples.mimo.training.topology import ModuleGridSpec, create_topology
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.enums import ModelType
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
-from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import unwrap_model
-from megatron.training.training import resolve_ddp_bucket_size
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
     get_language_model_spec,
     get_vision_submodules_spec,
@@ -74,22 +74,228 @@ def _eight_gpu_topology():
     )
 
 
+def test_builder_seeds_meta_build_and_forwards_lifecycle(mocker):
+    """The non-colocated builder seeds and prepares the one active child."""
+    from examples.mimo.training.builder import (
+        _LANGUAGE_SEED_OFFSET,
+        MimoBuildConfig,
+        MimoModelBuilder,
+    )
+
+    args = _args(init_model_with_meta_device=True)
+    groups = mocker.Mock()
+    child = SimpleNamespace(config=SimpleNamespace(init_model_with_meta_device=True))
+    model = SimpleNamespace(language_model=child, modality_submodules={})
+    topology, ddp_config = mocker.Mock(), DistributedDataParallelConfig()
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=topology, _args=args))
+    mocker.patch(
+        "examples.mimo.training.builder._resolve_role",
+        return_value=(None, True, False, groups, None),
+    )
+    mocker.patch.object(builder, "build_model", return_value=model)
+    prepare = mocker.patch(
+        "examples.mimo.training.builder.prepare_active_modules_for_distributed_training"
+    )
+    mocker.patch("examples.mimo.training.builder.configure_grad_sync")
+    torch_device = mocker.patch(
+        "examples.mimo.training.builder.torch.device", return_value=mocker.MagicMock()
+    )
+    set_seed = mocker.patch("examples.mimo.training.runtime._set_random_seed")
+
+    assert builder.build_distributed_models(
+        mocker.Mock(), ddp_config=ddp_config, data_parallel_random_init=True
+    ) == [model]
+
+    torch_device.assert_called_once_with("meta")
+    set_seed.assert_called_once_with(
+        args.seed + _LANGUAGE_SEED_OFFSET,
+        True,
+        False,
+        False,
+        use_cudagraphable_rng=False,
+        pp_group=groups.pp,
+        dp_group=groups.dp,
+        tp_group=groups.tp,
+        ep_group=groups.ep,
+        etp_group=groups.expt_tp,
+    )
+    call = prepare.call_args
+    assert call.args == (args, model, topology)
+    assert call.kwargs["ddp_config"] is ddp_config
+    assert call.kwargs["built_with_meta_device"] is True
+    assert call.kwargs["data_parallel_random_init"] is True
+
+
+def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
+    """Outer MIMO hooks surround child preparation and preserve replacement results."""
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    events = []
+    original_model = SimpleNamespace()
+    pre_replacement = SimpleNamespace()
+    post_replacement = SimpleNamespace()
+
+    def pre_hook(model_list):
+        assert model_list == [original_model]
+        assert original_model.model_type == ModelType.encoder_or_decoder
+        events.append("pre")
+        return [pre_replacement]
+
+    def post_hook(model_list):
+        assert model_list == [pre_replacement]
+        events.append("post")
+        return [post_replacement]
+
+    topology, groups = mocker.Mock(), mocker.Mock()
+    config = MimoBuildConfig(
+        _topology=topology,
+        _args=_args(init_model_with_meta_device=False),
+        pre_wrap_hooks=[pre_hook],
+        post_wrap_hooks=[post_hook],
+    )
+    builder = MimoModelBuilder(config)
+    mocker.patch(
+        "examples.mimo.training.builder._resolve_role",
+        return_value=(None, True, False, groups, None),
+    )
+    mocker.patch("examples.mimo.training.builder._seed_module_rng")
+    mocker.patch.object(builder, "build_model", return_value=original_model)
+
+    def prepare(_args, model, _topology, **_kwargs):
+        assert model is pre_replacement
+        events.append("prepare")
+
+    def configure(_args, model, _topology):
+        assert model is pre_replacement
+        events.append("configure")
+
+    mocker.patch(
+        "examples.mimo.training.builder.prepare_active_modules_for_distributed_training",
+        side_effect=prepare,
+    )
+    mocker.patch(
+        "examples.mimo.training.builder.configure_grad_sync", side_effect=configure
+    )
+
+    result = builder.build_distributed_models(
+        mocker.Mock(), ddp_config=DistributedDataParallelConfig()
+    )
+
+    assert events == ["pre", "prepare", "configure", "post"]
+    assert result == [post_replacement]
+
+
 @pytest.mark.parametrize(
-    "config, overlap, num_params, expected",
+    ("hook_stage", "model_count"),
+    [("pre", 0), ("pre", 2), ("post", 0), ("post", 2)],
+)
+def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, model_count):
+    """MIMO outer hooks must preserve the builder's single-model contract."""
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    replacement_models = [SimpleNamespace() for _ in range(model_count)]
+    hook_kwargs = {
+        "pre_wrap_hooks": [],
+        "post_wrap_hooks": [],
+    }
+    hook_kwargs[f"{hook_stage}_wrap_hooks"] = [lambda _models: replacement_models]
+    topology, groups = mocker.Mock(), mocker.Mock()
+    builder = MimoModelBuilder(
+        MimoBuildConfig(
+            _topology=topology,
+            _args=_args(init_model_with_meta_device=False),
+            **hook_kwargs,
+        )
+    )
+    mocker.patch(
+        "examples.mimo.training.builder._resolve_role",
+        return_value=(None, True, False, groups, None),
+    )
+    mocker.patch("examples.mimo.training.builder._seed_module_rng")
+    mocker.patch.object(builder, "build_model", return_value=SimpleNamespace())
+    mocker.patch(
+        "examples.mimo.training.builder.prepare_active_modules_for_distributed_training"
+    )
+    mocker.patch("examples.mimo.training.builder.configure_grad_sync")
+
+    with pytest.raises(
+        ValueError,
+        match=f"MIMO {hook_stage}-wrap hooks must return exactly one outer model; got {model_count}",
+    ):
+        builder.build_distributed_models(
+            mocker.Mock(), ddp_config=DistributedDataParallelConfig()
+        )
+
+
+@pytest.mark.parametrize(
+    ("role", "wrapper_kind"),
     [
-        # num_buckets divides the param count.
-        (DistributedDataParallelConfig(num_buckets=4), True, 128, 128 // 4),
-        # explicit bucket_size passes through.
-        (DistributedDataParallelConfig(bucket_size=4096), True, 256, 4096),
-        # overlap off -> None, regardless of bucket_size.
-        (DistributedDataParallelConfig(bucket_size=4096), False, 256, None),
-        # no explicit size with group=None (dp size 1) -> the sane default.
-        (DistributedDataParallelConfig(), True, 256, max(40_000_000, 1_000_000)),
+        ("language", "custom"),
+        ("encoder", "default"),
     ],
 )
-def test_resolve_ddp_bucket_size(config, overlap, num_params, expected):
-    """The MIMO wrap delegates bucket sizing to this shared get_model helper."""
-    assert resolve_ddp_bucket_size(config, None, overlap, num_params) == expected
+def test_active_runtime_uses_shared_lifecycle_with_copied_role_config(
+    mocker, role, wrapper_kind
+):
+    """Each active child keeps its PGC, wrapper policy, and a role-safe DDP config copy."""
+    from examples.mimo.training.runtime import _EncoderFloat16Module
+
+    module = torch.nn.Linear(2, 2)
+    module.config = SimpleNamespace(
+        fp16=False, bf16=role == "encoder", init_model_with_meta_device=False
+    )
+    if role == "language":
+        mimo_model = SimpleNamespace(language_model=module, modality_submodules={})
+        module_name = MIMO_LANGUAGE_MODULE_KEY
+    else:
+        mimo_model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: module})
+        module_name = ENCODER
+    mixed_precision_wrapper = {
+        "default": Float16Module,
+        "custom": mocker.sentinel.mixed_precision_wrapper,
+        "none": None,
+    }[wrapper_kind]
+    pg_collection = mocker.Mock()
+    topology = SimpleNamespace(module_pgs={module_name: pg_collection})
+    ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, overlap_param_gather=True)
+    prepared_module = mocker.Mock()
+    shared_lifecycle = mocker.patch(
+        "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
+        return_value=[prepared_module],
+    )
+
+    prepare_active_modules_for_distributed_training(
+        _args(),
+        mimo_model,
+        topology,
+        ddp_config=ddp_config,
+        built_with_meta_device=False,
+        data_parallel_random_init=True,
+        mixed_precision_wrapper=mixed_precision_wrapper,
+    )
+
+    shared_lifecycle.assert_called_once()
+    call = shared_lifecycle.call_args
+    assert call.args == ([module], module.config, pg_collection)
+    assert call.kwargs["built_with_meta_device"] is False
+    copied_config = call.kwargs["ddp_config"]
+    assert copied_config is not ddp_config
+    expected_overlap = role == "language"
+    assert copied_config.overlap_grad_reduce is expected_overlap
+    assert copied_config.overlap_param_gather is expected_overlap
+    assert ddp_config.overlap_grad_reduce is True
+    assert ddp_config.overlap_param_gather is True
+    assert call.kwargs["data_parallel_random_init"] is True
+    expected_wrapper = (
+        _EncoderFloat16Module
+        if role == "encoder" and mixed_precision_wrapper is Float16Module
+        else mixed_precision_wrapper
+    )
+    assert call.kwargs["mixed_precision_wrapper"] is expected_wrapper
+    if role == "language":
+        assert mimo_model.language_model is prepared_module
+    else:
+        assert mimo_model.modality_submodules[ENCODER] is prepared_module
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
@@ -100,35 +306,17 @@ class TestRuntimeDistributed:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_distinct_offsets_give_distinct_rng_states(self):
-        # Encoder tp=2,dp=2 at 0-3; language tp=2,pp=2 at 4-7. Each rank seeds the one
-        # module it participates in; distinct role offsets must reseed every tracked state.
-        topo = create_topology(
-            [
-                ModuleGridSpec(name=ENCODER, num_ranks=4, tp=2, rank_offset=0),
-                ModuleGridSpec(
-                    name=MIMO_LANGUAGE_MODULE_KEY, num_ranks=4, tp=2, pp=2, rank_offset=4
-                ),
-            ]
-        )
-        try:
-            module = MIMO_LANGUAGE_MODULE_KEY if torch.distributed.get_rank() >= 4 else ENCODER
-            pgc = topo.module_pgs[module]
-            configure_module_rng(_args(), pgc, role_seed_offset=10)
-            states_a = get_cuda_rng_tracker().get_states()
-            configure_module_rng(_args(), pgc, role_seed_offset=20)
-            states_b = get_cuda_rng_tracker().get_states()
-            assert set(states_a) == set(states_b)
-            for name in states_a:
-                assert not torch.equal(states_a[name], states_b[name])
-        finally:
-            topo.destroy()
-
     def test_active_module_is_ddp_over_its_own_grid(self):
         topo = _eight_gpu_topology()
         try:
             mimo_model = _build_unwrapped_mimo_model(topo)
-            wrap_active_modules_with_ddp(_args(), mimo_model, topo)
+            prepare_active_modules_for_distributed_training(
+                _args(),
+                mimo_model,
+                topo,
+                DistributedDataParallelConfig(use_distributed_optimizer=True),
+                built_with_meta_device=False,
+            )
             # Non-colocated: each rank owns exactly one active module (language XOR encoder).
             if torch.distributed.get_rank() < 4:
                 active = mimo_model.modality_submodules[ENCODER]
@@ -145,7 +333,13 @@ class TestRuntimeDistributed:
         try:
             # bf16 -> Float16Module wrap; --freeze-vit freezes the encoder backbone only.
             mimo_model = _build_unwrapped_mimo_model(topo, bf16=True)
-            wrap_active_modules_with_ddp(_args(fp32=False, freeze_vit=True), mimo_model, topo)
+            prepare_active_modules_for_distributed_training(
+                _args(fp32=False, freeze_vit=True),
+                mimo_model,
+                topo,
+                DistributedDataParallelConfig(use_distributed_optimizer=True),
+                built_with_meta_device=False,
+            )
 
             if torch.distributed.get_rank() < 4:
                 active = mimo_model.modality_submodules[ENCODER]
