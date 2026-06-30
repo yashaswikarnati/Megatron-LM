@@ -4226,7 +4226,7 @@ def evaluate(
             forward_backward_func,
         )
 
-    if has_nvidia_modelopt:
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,

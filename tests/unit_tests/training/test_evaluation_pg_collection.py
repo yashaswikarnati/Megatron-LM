@@ -69,9 +69,12 @@ def _run_one_iteration(
     losses=None,
     process_non_loss_data_func=None,
     world_last=True,
+    modelopt_installed=False,
+    modelopt_enabled=False,
 ):
-    args = _eval_args()
+    args = _eval_args(modelopt_enabled=modelopt_enabled)
     payload = object()
+    shape_adjust_fn = object()
 
     def schedule_call(**kwargs):
         if kwargs.get("collect_non_loss_data"):
@@ -82,6 +85,7 @@ def _run_one_iteration(
     selector = mock.Mock(return_value=schedule)
     timers = mock.MagicMock()
     config = SimpleNamespace()
+    model = [mock.Mock()]
 
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
@@ -90,7 +94,13 @@ def _run_one_iteration(
             training_mod, "get_rerun_state_machine", return_value=_RerunState()
         ),
         mock.patch.object(training_mod, "get_forward_backward_func", selector),
-        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", modelopt_installed),
+        mock.patch.object(
+            training_mod,
+            "get_tensor_shapes_adjust_fn_for_distillation",
+            return_value=shape_adjust_fn,
+            create=True,
+        ) as get_shape_adjust_fn,
         mock.patch.object(training_mod, "is_last_rank", return_value=world_last),
         mock.patch.object(training_mod.ft_integration, "on_eval_step_start"),
         mock.patch.object(training_mod.ft_integration, "on_eval_step_end"),
@@ -98,7 +108,7 @@ def _run_one_iteration(
         result = training_mod.evaluate(
             forward_step_func=mock.Mock(),
             data_iterator=iter(()),
-            model=[mock.Mock()],
+            model=model,
             process_non_loss_data_func=process_non_loss_data_func,
             config=config,
             eval_iters=1,
@@ -107,7 +117,13 @@ def _run_one_iteration(
         )
 
     return SimpleNamespace(
-        payload=payload, result=result, schedule=schedule, selector=selector
+        payload=payload,
+        result=result,
+        schedule=schedule,
+        selector=selector,
+        model=model,
+        shape_adjust_fn=shape_adjust_fn,
+        get_shape_adjust_fn=get_shape_adjust_fn,
     )
 
 
@@ -148,6 +164,35 @@ def test_evaluate_forwards_exact_multimodule_pair_without_mpu_access():
     assert run.schedule.call_args.kwargs["pg_collection"] is carrier
     assert run.schedule.call_args.kwargs["p2p_communicator"] is communicator
     assert run.result[0] == {}
+
+
+def test_evaluate_skips_modelopt_shape_adjust_when_installed_but_disabled():
+    run = _run_one_iteration(
+        carrier=_multi_carrier(),
+        communicator=object.__new__(MultiModulePipelineCommunicator),
+        modelopt_installed=True,
+        modelopt_enabled=False,
+    )
+
+    run.get_shape_adjust_fn.assert_not_called()
+    assert run.schedule.call_args.kwargs["adjust_tensor_shapes_fn"] is None
+
+
+def test_evaluate_uses_modelopt_shape_adjust_when_enabled():
+    run = _run_one_iteration(
+        carrier=_multi_carrier(),
+        communicator=object.__new__(MultiModulePipelineCommunicator),
+        modelopt_installed=True,
+        modelopt_enabled=True,
+    )
+
+    run.get_shape_adjust_fn.assert_called_once_with(
+        run.model,
+        seq_length=8,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+    )
+    assert run.schedule.call_args.kwargs["adjust_tensor_shapes_fn"] is run.shape_adjust_fn
 
 
 def test_local_loss_child_controls_terminal_stage_and_reduction_group():
